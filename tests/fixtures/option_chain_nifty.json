@@ -1,0 +1,230 @@
+{
+  "expiry": "2026-07-14",
+  "data": {
+    "last_price": 23962.8,
+    "oc": {
+      "23850.000000": {
+        "ce": {
+          "average_price": 250.5,
+          "greeks": {
+            "delta": 0.69163,
+            "theta": -14.60541,
+            "gamma": 0.00118,
+            "vega": 10.04021
+          },
+          "implied_volatility": 10.427575071840025,
+          "last_price": 205.75,
+          "oi": 544505,
+          "previous_close_price": 203.4,
+          "previous_oi": 957905,
+          "previous_volume": 16233295,
+          "security_id": 51362,
+          "top_ask_price": 206.75,
+          "top_ask_quantity": 130,
+          "top_bid_price": 205.25,
+          "top_bid_quantity": 130,
+          "volume": 10861630
+        },
+        "pe": {
+          "average_price": 75.63,
+          "greeks": {
+            "delta": -0.34198,
+            "theta": -10.80041,
+            "gamma": 0.001,
+            "vega": 10.47503
+          },
+          "implied_volatility": 12.905585103625361,
+          "last_price": 84.65,
+          "oi": 2112110,
+          "previous_close_price": 176.1,
+          "previous_oi": 1646255,
+          "previous_volume": 68357055,
+          "security_id": 51363,
+          "top_ask_price": 85.05,
+          "top_ask_quantity": 715,
+          "top_bid_price": 84.65,
+          "top_bid_quantity": 130,
+          "volume": 50919115
+        }
+      },
+      "23900.000000": {
+        "ce": {
+          "average_price": 219.06,
+          "greeks": {
+            "delta": 0.62835,
+            "theta": -15.09834,
+            "gamma": 0.00125,
+            "vega": 10.78571
+          },
+          "implied_volatility": 10.569867320850797,
+          "last_price": 174.5,
+          "oi": 1934725,
+          "previous_close_price": 177.55,
+          "previous_oi": 3005340,
+          "previous_volume": 40946165,
+          "security_id": 51364,
+          "top_ask_price": 174.35,
+          "top_ask_quantity": 195,
+          "top_bid_price": 173.75,
+          "top_bid_quantity": 845,
+          "volume": 47122920
+        },
+        "pe": {
+          "average_price": 92.01,
+          "greeks": {
+            "delta": -0.39313,
+            "theta": -11.05308,
+            "gamma": 0.00105,
+            "vega": 10.96905
+          },
+          "implied_volatility": 12.88406486406188,
+          "last_price": 103.05,
+          "oi": 4514770,
+          "previous_close_price": 198,
+          "previous_oi": 3653780,
+          "previous_volume": 113037405,
+          "security_id": 51365,
+          "top_ask_price": 103.5,
+          "top_ask_quantity": 780,
+          "top_bid_price": 103,
+          "top_bid_quantity": 2990,
+          "volume": 110982235
+        }
+      },
+      "23950.000000": {
+        "ce": {
+          "average_price": 185.53,
+          "greeks": {
+            "delta": 0.56408,
+            "theta": -15.14473,
+            "gamma": 0.00131,
+            "vega": 11.23268
+          },
+          "implied_volatility": 10.573062105164782,
+          "last_price": 145,
+          "oi": 1406145,
+          "previous_close_price": 153.8,
+          "previous_oi": 1121575,
+          "previous_volume": 19688175,
+          "security_id": 51366,
+          "top_ask_price": 146,
+          "top_ask_quantity": 65,
+          "top_bid_price": 145.4,
+          "top_bid_quantity": 520,
+          "volume": 50144185
+        },
+        "pe": {
+          "average_price": 110.98,
+          "greeks": {
+            "delta": -0.44631,
+            "theta": -11.07147,
+            "gamma": 0.00108,
+            "vega": 11.27662
+          },
+          "implied_volatility": 12.875098126662046,
+          "last_price": 124.2,
+          "oi": 2223325,
+          "previous_close_price": 223.25,
+          "previous_oi": 1027715,
+          "previous_volume": 55429790,
+          "security_id": 51367,
+          "top_ask_price": 124.8,
+          "top_ask_quantity": 650,
+          "top_bid_price": 124.25,
+          "top_bid_quantity": 195,
+          "volume": 75811125
+        }
+      },
+      "24000.000000": {
+        "ce": {
+          "average_price": 160.9,
+          "greeks": {
+            "delta": 0.49834,
+            "theta": -15.01754,
+            "gamma": 0.00131,
+            "vega": 11.37972
+          },
+          "implied_volatility": 10.706997785735044,
+          "last_price": 120.25,
+          "oi": 8020740,
+          "previous_close_price": 131.1,
+          "previous_oi": 6192615,
+          "previous_volume": 66596920,
+          "security_id": 51370,
+          "top_ask_price": 120.7,
+          "top_ask_quantity": 845,
+          "top_bid_price": 120.25,
+          "top_bid_quantity": 2925,
+          "volume": 187106140
+        },
+        "pe": {
+          "average_price": 127.48,
+          "greeks": {
+            "delta": -0.50039,
+            "theta": -10.94553,
+            "gamma": 0.00108,
+            "vega": 11.37982
+          },
+          "implied_volatility": 12.972802929959462,
+          "last_price": 149.25,
+          "oi": 6226935,
+          "previous_close_price": 251.55,
+          "previous_oi": 3481335,
+          "previous_volume": 159880175,
+          "security_id": 51371,
+          "top_ask_price": 149.25,
+          "top_ask_quantity": 650,
+          "top_bid_price": 148.6,
+          "top_bid_quantity": 130,
+          "volume": 207905945
+        }
+      },
+      "24050.000000": {
+        "ce": {
+          "average_price": 137.81,
+          "greeks": {
+            "delta": 0.43401,
+            "theta": -14.52269,
+            "gamma": 0.00128,
+            "vega": 11.22379
+          },
+          "implied_volatility": 10.783316184663736,
+          "last_price": 98.1,
+          "oi": 2964975,
+          "previous_close_price": 111.9,
+          "previous_oi": 1141270,
+          "previous_volume": 20693010,
+          "security_id": 51373,
+          "top_ask_price": 98.45,
+          "top_ask_quantity": 130,
+          "top_bid_price": 97.95,
+          "top_bid_quantity": 260,
+          "volume": 122563805
+        },
+        "pe": {
+          "average_price": 145.3,
+          "greeks": {
+            "delta": -0.55373,
+            "theta": -10.51805,
+            "gamma": 0.00106,
+            "vega": 11.27644
+          },
+          "implied_volatility": 13.027703732933196,
+          "last_price": 176.5,
+          "oi": 1768780,
+          "previous_close_price": 280.8,
+          "previous_oi": 784095,
+          "previous_volume": 57368545,
+          "security_id": 51374,
+          "top_ask_price": 177.25,
+          "top_ask_quantity": 585,
+          "top_bid_price": 176.5,
+          "top_bid_quantity": 65,
+          "volume": 107812835
+        }
+      }
+    }
+  },
+  "status": "success",
+  "_comment": "REAL trimmed dhanhq.option_chain payload (NIFTY nearest expiry, ATM +/-2), as returned by fetch_option_chain. oc keyed by strike string; normalize_chain reads data.{last_price,oc}."
+}

@@ -1,0 +1,58 @@
+{
+  "data": {
+    "ce": {
+      "iv": [
+        21.924944,
+        21.980233,
+        22.015671
+      ],
+      "oi": [
+        3732885,
+        5386680,
+        6199180
+      ],
+      "strike": [
+        23150.0,
+        23150.0,
+        23150.0
+      ],
+      "spot": [
+        23133.35,
+        23136.65,
+        23155.5
+      ],
+      "open": [
+        196.85,
+        151.3,
+        126.6
+      ],
+      "high": [
+        196.85,
+        152.15,
+        138.9
+      ],
+      "low": [
+        116.45,
+        121.25,
+        123.65
+      ],
+      "close": [
+        125.55,
+        127.35,
+        137.0
+      ],
+      "volume": [
+        13522080,
+        8783645,
+        6687070
+      ],
+      "timestamp": [
+        1780890300,
+        1780890600,
+        1780890900
+      ]
+    },
+    "pe": null
+  },
+  "_comment": "REAL trimmed dhanhq.expired_options_data data payload (NIFTY ATM CALL, WEEK code=1, first 3 rows). Arrays under data.ce/data.pe; the requested side is populated, the other is null."
+}

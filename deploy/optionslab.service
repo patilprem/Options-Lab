@@ -1,0 +1,31 @@
+# systemd unit — run OptionsLab unattended on a VPS with a static IP.
+#   sudo cp deploy/optionslab.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now optionslab
+[Unit]
+Description=OptionsLab options strategy platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=optionslab
+WorkingDirectory=/opt/optionslab
+Environment=DHAN_CLIENT_ID=100xxxxxxx
+Environment=DHAN_API_KEY=your_app_id
+Environment=DHAN_API_SECRET=your_app_secret
+Environment=NTFY_TOPIC=optionslab-yourrandomsuffix
+Environment=BASE_URL=https://your-server.ts.net
+
+# SINGLE WORKER ONLY. MarketHub / PaperRunner / LiveRunner and the DuckDB
+# connection live IN-MEMORY in one process. A 2nd worker would run its own
+# engine and DOUBLE-TRADE, and DuckDB is single-writer. Never set --workers >1.
+ExecStart=/opt/optionslab/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --no-access-log
+
+# A crashing strategy auto-pauses in code and never kills the process; if the
+# process itself dies, bring it straight back.
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

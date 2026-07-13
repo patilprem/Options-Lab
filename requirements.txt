@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+duckdb>=0.10
+requests>=2.31
+dhanhq>=2.1

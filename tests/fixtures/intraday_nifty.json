@@ -1,0 +1,33 @@
+{
+  "open": [
+    23633.4,
+    23597.95,
+    23591.95
+  ],
+  "high": [
+    23646.05,
+    23612.4,
+    23618.7
+  ],
+  "low": [
+    23588.55,
+    23587.75,
+    23587.7
+  ],
+  "close": [
+    23598.9,
+    23592.95,
+    23609.6
+  ],
+  "volume": [
+    9773278.0,
+    7200833.0,
+    8410800.0
+  ],
+  "timestamp": [
+    1780285800.0,
+    1780286100.0,
+    1780286400.0
+  ],
+  "_comment": "REAL trimmed dhanhq.intraday_minute_data data payload (NIFTY spot, 5-min, first 3 bars). Epoch seconds; IST = UTC+5:30."
+}

@@ -1,0 +1,374 @@
+"""
+DhanHQ Data Adapter
+===================
+Populates ``marketdata.duckdb`` from DhanHQ v2 historical APIs, via the
+official ``dhanhq`` Python SDK (``pip install dhanhq``). The SDK wraps every
+HTTP response as ``{"status", "remarks", "data"}`` and shields us from raw
+endpoint churn.
+
+SDK methods used:
+  intraday_minute_data   underlying candles (1/5/15/25/60 min, up to 5 yrs,
+                         fetch <=90 days per call — loop and store locally)
+  expired_options_data   expired options: minute OHLC/IV/OI by ATM-relative
+                         strike, <=30 days per call, up to 5 yrs (NSE/BSE;
+                         verify MCX support). Arrays nest under data["ce"]
+                         and data["pe"].
+  option_chain           live chain: greeks/IV/bid-ask (1 req / 3 s)  [M3]
+
+Credentials come from the environment (never hardcode — SEBI caps access
+tokens at 24 h, so the running server refreshes them via token_manager):
+  DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN     — or —
+  DHAN_CONFIG_PATH -> {"client_id": ..., "access_token": ...}
+
+Run:
+  python -m app.data.dhan_client backfill NIFTY 2024-01-01 2025-01-01
+
+Design note: fetching (needs the SDK + a live token) is kept separate from
+parsing/upserting (pure dict -> rows). The parse helpers below are exercised
+offline by tests/test_dhan_parsing.py replaying saved sample responses, so
+the storage boundary can be verified without network or credentials.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+# IST is UTC+5:30. Dhan historical APIs return epoch seconds; we convert to
+# a naive IST datetime at this boundary so the store matches everything else
+# in the app (invariant #7: user-facing timestamps are IST).
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Friendly name -> Dhan security IDs / segments (extend from the security
+# master CSV — see dhanhq.fetch_security_list). security_id + IDX_I identify
+# the spot index; fno_segment + instrument identify its option contracts.
+UNDERLYINGS = {
+    "NIFTY":     {"security_id": 13,  "segment": "IDX_I", "fno_segment": "NSE_FNO", "instrument": "OPTIDX"},
+    "BANKNIFTY": {"security_id": 25,  "segment": "IDX_I", "fno_segment": "NSE_FNO", "instrument": "OPTIDX"},
+    "FINNIFTY":  {"security_id": 27,  "segment": "IDX_I", "fno_segment": "NSE_FNO", "instrument": "OPTIDX"},
+    "SENSEX":    {"security_id": 51,  "segment": "IDX_I", "fno_segment": "BSE_FNO", "instrument": "OPTIDX"},
+    # MCX names are injected at runtime by resolve_mcx_ids(): a commodity
+    # chain hangs off the CURRENT futures contract, whose security id rolls
+    # every month — it must be resolved from the scrip master, not hardcoded.
+}
+
+# MCX commodity name -> trading-symbol prefix in the scrip master. The big
+# contract is wanted; the mini ("...M") is filtered out by exact prefix match.
+MCX_DYNAMIC = {"CRUDEOIL": "CRUDEOIL", "GOLD": "GOLD"}
+_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+_MASTER_CACHE = Path(__file__).resolve().parents[2] / "scrip_master_mcx.csv"
+
+
+def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
+    """Resolve each MCX_DYNAMIC name to its nearest non-expired FUTCOM
+    contract via Dhan's public scrip master (cached locally; only the MCX
+    rows are kept — the full file is ~27 MB). Injects/updates UNDERLYINGS
+    entries and returns {name: security_id}. Safe to call repeatedly."""
+    import csv
+    import io
+    import urllib.request
+
+    if (not _MASTER_CACHE.exists()
+            or time.time() - _MASTER_CACHE.stat().st_mtime > max_age_h * 3600):
+        raw = urllib.request.urlopen(_SCRIP_MASTER_URL, timeout=120).read() \
+            .decode("utf-8", "replace")
+        lines = raw.splitlines()
+        keep = [lines[0]] + [ln for ln in lines[1:] if ln.startswith("MCX,")]
+        _MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+
+    rows = list(csv.DictReader(io.StringIO(
+        _MASTER_CACHE.read_text(encoding="utf-8"))))
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    out = {}
+    for name, prefix in MCX_DYNAMIC.items():
+        futs = [r for r in rows
+                if r.get("SEM_INSTRUMENT_NAME") == "FUTCOM"
+                and (r.get("SEM_TRADING_SYMBOL") or "").startswith(prefix + "-")
+                and (r.get("SEM_EXPIRY_DATE") or "") >= today]
+        if not futs:
+            continue
+        fut = min(futs, key=lambda r: r["SEM_EXPIRY_DATE"])
+        sid = int(fut["SEM_SMST_SECURITY_ID"])
+        UNDERLYINGS[name] = {"security_id": sid, "segment": "MCX_COMM",
+                             "fno_segment": "MCX_COMM", "instrument": "OPTFUT",
+                             "expiry": fut["SEM_EXPIRY_DATE"][:10]}
+        out[name] = sid
+    return out
+
+
+# ---------------------------------------------------------------------------
+# SDK client (lazy import so parsing/tests don't require dhanhq to be present)
+# ---------------------------------------------------------------------------
+
+def resolve_credentials() -> tuple[str, str]:
+    """Return (client_id, access_token) from env (DHAN_CLIENT_ID/
+    DHAN_ACCESS_TOKEN), a DHAN_CONFIG_PATH json file, or the server's managed
+    24h token (SQLite). Raises if none are found."""
+    client_id = os.environ.get("DHAN_CLIENT_ID")
+    access_token = os.environ.get("DHAN_ACCESS_TOKEN")
+    cfg_path = os.environ.get("DHAN_CONFIG_PATH")
+    if (not client_id or not access_token) and cfg_path and os.path.exists(cfg_path):
+        import json
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        client_id = client_id or cfg.get("client_id")
+        access_token = access_token or cfg.get("access_token")
+    if not access_token:
+        # Fall back to the server's managed 24h token (SQLite) so callers share
+        # the exact credential the running app uses, not a duplicate.
+        try:
+            from app.core import token_manager
+            access_token = token_manager.get_access_token()
+            client_id = client_id or token_manager.CLIENT_ID
+        except Exception:
+            pass
+    if not client_id or not access_token:
+        raise RuntimeError(
+            "Dhan credentials not found. Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN "
+            "(or DHAN_CONFIG_PATH to a json config).")
+    return client_id, access_token
+
+
+def get_dhan_context():
+    """DhanContext for SDK objects that need it directly (e.g. MarketFeed)."""
+    from dhanhq import DhanContext  # lazy: only needed for live use
+    return DhanContext(*resolve_credentials())
+
+
+def get_client():
+    """Build a dhanhq client from resolved credentials. Raises if missing."""
+    from dhanhq import dhanhq  # lazy: only needed for live fetch
+    return dhanhq(get_dhan_context())
+
+
+def _unwrap(response: dict) -> dict:
+    """Return the `data` payload of a successful SDK response, else raise."""
+    if not isinstance(response, dict):
+        raise RuntimeError(f"unexpected SDK response: {response!r}")
+    if response.get("status") != "success":
+        raise RuntimeError(response.get("remarks") or "Dhan SDK call failed")
+    return response.get("data") or {}
+
+
+def fetch_intraday(client, security_id: int, segment: str, instrument: str,
+                   interval: int, from_dt: str, to_dt: str, oi: bool = False) -> dict:
+    """Underlying candles. Returns the unwrapped data dict of parallel arrays."""
+    resp = client.intraday_minute_data(
+        security_id=str(security_id), exchange_segment=segment,
+        instrument_type=instrument, from_date=from_dt, to_date=to_dt,
+        interval=int(interval), oi=oi)
+    return _unwrap(resp)
+
+
+def fetch_expired_option(client, security_id: int, fno_segment: str, instrument: str,
+                         interval: int, expiry_flag: str, expiry_code: int,
+                         strike: str, option_type: str,
+                         from_d: str, to_d: str) -> dict:
+    """Expired option candles for one ATM-relative strike/side. `strike` is
+    'ATM', 'ATM+2', 'ATM-3'. `expiry_code` is 1-indexed (1 = nearest expiry of
+    `expiry_flag`, 2 = next, ...); 0 is rejected by the API. Returns the
+    unwrapped data dict; the live SDK nests arrays under data['data']['ce'|'pe']."""
+    resp = client.expired_options_data(
+        security_id=security_id, exchange_segment=fno_segment,
+        instrument_type=instrument, expiry_flag=expiry_flag,
+        expiry_code=expiry_code, strike=strike, drv_option_type=option_type,
+        required_data=["open", "high", "low", "close", "volume", "oi", "iv",
+                       "strike", "spot"],
+        from_date=from_d, to_date=to_d, interval=int(interval))
+    return _unwrap(resp)
+
+
+def fetch_option_chain(client, underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
+    """Live chain with greeks. Rate limit: 1 unique request per 3 seconds.
+    Returns the unwrapped data dict (spot at data['last_price'], strikes under
+    data['oc'])."""
+    resp = client.option_chain(under_security_id=underlying_scrip,
+                               under_exchange_segment=underlying_seg, expiry=expiry)
+    return _unwrap(resp)
+
+
+# ---------------------------------------------------------------------------
+# Parsing: unwrapped data dict -> rows ready for the store. Pure, testable.
+# ---------------------------------------------------------------------------
+
+def _epoch_to_ist(epoch) -> datetime:
+    """Dhan epoch seconds -> naive IST datetime (the store's convention)."""
+    return datetime.fromtimestamp(int(epoch), tz=timezone.utc).astimezone(IST).replace(tzinfo=None)
+
+
+def _at(d: dict, key: str, i: int):
+    arr = d.get(key)
+    return arr[i] if arr and i < len(arr) else None
+
+
+def parse_intraday_rows(underlying: str, data: dict) -> list[tuple]:
+    """data: parallel arrays {timestamp, open, high, low, close, volume,
+    open_interest?}. -> rows for underlying_bars
+    (underlying, ts, open, high, low, close, volume, oi)."""
+    ts_arr = data.get("timestamp") or []
+    rows = []
+    for i in range(len(ts_arr)):
+        rows.append((
+            underlying, _epoch_to_ist(ts_arr[i]),
+            _at(data, "open", i), _at(data, "high", i),
+            _at(data, "low", i), _at(data, "close", i),
+            _at(data, "volume", i) or 0, _at(data, "open_interest", i) or 0))
+    return rows
+
+
+_SIDE_FOR = {"CALL": "ce", "PUT": "pe"}
+
+
+def parse_expired_option_rows(underlying: str, strike_offset: int, option_type: str,
+                              data: dict, expiry_kind: str = "WEEKLY",
+                              expiry_offset: int = 0) -> list[tuple]:
+    """data: {'ce': {...arrays}, 'pe': {...arrays}} — or the live SDK's extra
+    wrapper {'data': {'ce': ..., 'pe': ...}}, which we descend into. Only the
+    side matching `option_type` is populated (CALL->ce, PUT->pe); the other is
+    None. Each side has parallel arrays {timestamp, open, high, low, close,
+    volume, oi, iv, strike, spot}. -> rows for option_bars (underlying, ts,
+    expiry_kind, expiry_offset, strike_offset, option_type, strike, expiry,
+    o, h, l, c, volume, oi, iv).
+
+    `expiry` (absolute date) is not returned by the rolling API, so it is
+    stored NULL; strategies key on the ATM-relative offsets, not the date."""
+    # The live expired-options payload nests ce/pe under a second 'data' key;
+    # saved fixtures may hold {ce,pe} directly. Handle both.
+    if isinstance(data.get("data"), dict) and ("ce" in data["data"] or "pe" in data["data"]):
+        data = data["data"]
+    side = data.get(_SIDE_FOR[option_type]) or {}
+    ts_arr = side.get("timestamp") or []
+    rows = []
+    for i in range(len(ts_arr)):
+        rows.append((
+            underlying, _epoch_to_ist(ts_arr[i]), expiry_kind, expiry_offset,
+            strike_offset, option_type,
+            _at(side, "strike", i), None,  # absolute strike (if present), expiry=NULL
+            _at(side, "open", i), _at(side, "high", i),
+            _at(side, "low", i), _at(side, "close", i),
+            _at(side, "volume", i) or 0, _at(side, "oi", i) or 0,
+            _at(side, "iv", i)))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Upserts (idempotent; INSERT OR REPLACE on the tables' primary keys)
+# ---------------------------------------------------------------------------
+
+def upsert_underlying_rows(store, rows: list[tuple]) -> int:
+    if rows:
+        store.con.executemany(
+            "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def upsert_option_rows(store, rows: list[tuple]) -> int:
+    if rows:
+        store.con.executemany(
+            "INSERT OR REPLACE INTO option_bars VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Backfill orchestration (chunked, rate-limited, idempotent)
+# ---------------------------------------------------------------------------
+
+def backfill(underlying: str, start: date, end: date,
+             strike_offsets=range(-5, 6), interval: int = 1,
+             expiry_flag: str = "WEEK", expiry_offset: int = 0,
+             client=None, store=None, progress=None, skip_existing: bool = True) -> None:
+    """Backfill underlying candles + ATM-relative expired-option candles.
+
+    `expiry_offset` is the store's 0-indexed expiry (0 = nearest/current);
+    it maps to the API's 1-indexed expiry_code (offset + 1). Pass an existing
+    `store` to reuse a connection (the server does this to avoid a second
+    DuckDB writer). `progress(msg)` is called per chunk for UI streaming.
+    `skip_existing` (default) skips chunks already present so an interrupted
+    backfill RESUMES on re-run instead of re-fetching everything."""
+    if store is None:
+        from app.data.store import DataStore
+        store = DataStore()
+    cfg = UNDERLYINGS[underlying]
+    client = client or get_client()
+
+    def _log(msg):
+        print(msg, flush=True)
+        if progress:
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
+    from app.core import registry  # lazy: chunk ledger lives in SQLite
+
+    def _fetch(fn, *a, tries: int = 5, **kw):
+        """Retry a single-chunk fetch through transient network/API blips
+        (connection resets, timeouts) so one hiccup doesn't abort a multi-hour
+        backfill. Exponential backoff; re-raises after the last try (the chunk
+        is left un-ledgered so a resume retries it)."""
+        for i in range(tries):
+            try:
+                return fn(*a, **kw)
+            except Exception as e:
+                if i == tries - 1:
+                    raise
+                wait = min(2 ** i, 20)
+                _log(f"  fetch error ({e!r}); retry {i + 1}/{tries - 1} in {wait}s")
+                time.sleep(wait)
+
+    kind = "WEEKLY" if expiry_flag == "WEEK" else "MONTHLY"
+
+    # Resume is driven by a LEDGER of chunks that were successfully upserted —
+    # NOT by "are there any rows in this range". Row-existence is unsafe: a
+    # partially-written chunk (interrupted, or clobbered by a concurrent run)
+    # looks 'present' and would be skipped forever, leaving silent data gaps.
+
+    # 1) underlying candles, <=89-day chunks
+    cur = start
+    while cur < end:
+        chunk_end = min(cur + timedelta(days=89), end)
+        key = registry.chunk_key(underlying, "spot", interval, cur, chunk_end)
+        if skip_existing and registry.is_chunk_done(key):
+            _log(f"underlying {cur} -> {chunk_end}: done, skip")
+        else:
+            data = _fetch(fetch_intraday, client, cfg["security_id"], cfg["segment"],
+                          "INDEX", interval, f"{cur} 09:15:00", f"{chunk_end} 15:30:00", oi=False)
+            n = upsert_underlying_rows(store, parse_intraday_rows(underlying, data))
+            registry.mark_chunk_done(key)      # only AFTER a successful upsert
+            _log(f"underlying {cur} -> {chunk_end}: {n} bars")
+            time.sleep(0.3)
+        cur = chunk_end
+
+    # 2) expired options, <=29-day chunks per (strike_offset, option_type)
+    for off in strike_offsets:
+        strike = "ATM" if off == 0 else f"ATM{'+' if off > 0 else ''}{off}"
+        for opt in ("CALL", "PUT"):
+            cur = start
+            while cur < end:
+                chunk_end = min(cur + timedelta(days=29), end)
+                key = registry.chunk_key(underlying, "opt", interval, cur, chunk_end,
+                                         off=off, opt=opt, expiry_kind=kind,
+                                         expiry_offset=expiry_offset)
+                if skip_existing and registry.is_chunk_done(key):
+                    _log(f"{strike} {opt} {cur} -> {chunk_end}: done, skip")
+                    cur = chunk_end
+                    continue
+                data = _fetch(
+                    fetch_expired_option,
+                    client, cfg["security_id"], cfg["fno_segment"], cfg["instrument"],
+                    interval, expiry_flag, expiry_offset + 1, strike, opt, str(cur), str(chunk_end))
+                n = upsert_option_rows(store, parse_expired_option_rows(
+                    underlying, off, opt, data, expiry_offset=expiry_offset, expiry_kind=kind))
+                registry.mark_chunk_done(key)  # only AFTER a successful upsert
+                _log(f"{strike} {opt} {cur} -> {chunk_end}: {n} bars")
+                cur = chunk_end
+                time.sleep(0.3)  # stay well under rate limits
+
+
+if __name__ == "__main__":
+    import sys
+    _, cmd, und, s, e = sys.argv
+    assert cmd == "backfill", "usage: python -m app.data.dhan_client backfill NIFTY 2024-01-01 2025-01-01"
+    backfill(und, date.fromisoformat(s), date.fromisoformat(e))
