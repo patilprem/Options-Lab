@@ -23,7 +23,7 @@ from app.core.contract import Action
 from app.data import dhan_client as dc
 from app.data.dhan_client import UNDERLYINGS
 from app.engines import fills as F, margin as M
-from app.engines.backtest import LOT_SIZES
+from app.engines.backtest import lot_size_on
 
 
 def _chain(client, cfg):
@@ -69,7 +69,7 @@ def _structures(oc, spot, step):
 
 def calibrate(underlying: str, client) -> float | None:
     cfg = UNDERLYINGS[underlying]
-    lot = LOT_SIZES.get(underlying, 75)
+    lot = lot_size_on(underlying)
     spot, oc = _chain(client, cfg)
     strikes = sorted(float(s) for s in oc)
     step = min((b - a for a, b in zip(strikes, strikes[1:]) if b > a), default=50)

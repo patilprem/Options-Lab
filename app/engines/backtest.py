@@ -16,7 +16,7 @@ import bisect
 import math
 import uuid
 from collections import defaultdict
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import Optional
 
 from app.core.contract import (Action, Bar, Context, LegSpec, OptionQuote,
@@ -24,7 +24,39 @@ from app.core.contract import (Action, Bar, Context, LegSpec, OptionQuote,
 from app.engines import fills as F
 from app.engines import margin as M
 
-LOT_SIZES = {"NIFTY": 75, "BANKNIFTY": 35}  # keep a dated table for long backtests!
+# Lot sizes by effective date (new-series dates from NSE/BSE circulars —
+# SEBI's contract-value band forces periodic revisions, so a flat constant
+# mis-sizes any backtest that crosses a revision). lot_size_on() picks the
+# lot in force on a given day. Transition nuance is ignored (far-month
+# contracts briefly kept old lots around each change) — irrelevant for the
+# weekly ATM trading this platform does. MCX commodities are not listed;
+# they fall back to the default of 50.
+LOT_BASE = {"NIFTY": 25, "BANKNIFTY": 15, "FINNIFTY": 25, "MIDCPNIFTY": 50,
+            "NIFTYNXT50": 10, "SENSEX": 10, "BANKEX": 15}
+LOT_HISTORY: dict[str, list[tuple[str, int]]] = {
+    # SEBI min-contract-value hike, new series from 2024-11-20
+    # NSE FAOP64625: BANKNIFTY/MIDCPNIFTY up, new contracts from 2025-04-25
+    # NSE FAOP70616: Jan-2026 series cuts, contracts created after 2025-12-30
+    "NIFTY":      [("2024-11-20", 75), ("2025-12-31", 65)],
+    "BANKNIFTY":  [("2024-11-20", 30), ("2025-04-25", 35), ("2025-12-31", 30)],
+    "FINNIFTY":   [("2024-11-20", 65), ("2025-12-31", 60)],
+    "MIDCPNIFTY": [("2024-11-20", 120), ("2025-04-25", 140), ("2025-12-31", 120)],
+    "NIFTYNXT50": [("2024-11-20", 25)],
+    "SENSEX":     [("2024-11-20", 20)],
+    "BANKEX":     [("2024-11-20", 30)],
+}
+
+
+def lot_size_on(underlying: str, on: date | None = None) -> int:
+    """Contract lot size in force on `on` (default: today)."""
+    day = (on or date.today()).isoformat()
+    lot = LOT_BASE.get(underlying, 50)
+    for eff, sz in LOT_HISTORY.get(underlying, []):
+        if eff <= day:
+            lot = sz
+    return lot
+
+
 EOD = time(15, 25)
 
 
@@ -35,7 +67,6 @@ class BacktestContext(Context):
         self.store = store
         self._capital = capital
         self.fee_cfg, self.slip_cfg = fee_cfg, slip_cfg
-        self.lot_size = LOT_SIZES.get(underlying, 50)
         self._margin_factor = M.underlying_factor(underlying)  # M5 SPAN calibration
 
         self._end: Optional[datetime] = None       # set by run_backtest; enables preload
@@ -127,6 +158,11 @@ class BacktestContext(Context):
     def now(self) -> datetime: return self._bars[-1].ts
     @property
     def spot(self) -> float: return self._bars[-1].close
+    @property
+    def lot_size(self) -> int:
+        # date-aware: a replay crossing a lot revision sizes each fill with
+        # the lot in force on that trade date
+        return lot_size_on(self.underlying, self.now.date() if self._bars else None)
 
     def option(self, leg: LegSpec) -> Optional[OptionQuote]:
         return self._quote(self.now, leg)

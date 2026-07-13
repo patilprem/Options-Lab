@@ -38,7 +38,7 @@ from app.data.dhan_client import UNDERLYINGS
 from app.engines import fills as F
 from app.engines import margin as M
 from app.engines import risk as R
-from app.engines.backtest import LOT_SIZES
+from app.engines.backtest import lot_size_on
 
 IST = timezone(timedelta(hours=5, minutes=30))
 _ORDER_TYPE = "LIMIT"
@@ -194,7 +194,6 @@ class LiveContext(Context):
         self.underlying = underlying
         self.hub = hub
         self.interval = int(interval)
-        self.lot_size = LOT_SIZES.get(underlying, 50)
         self.fee_cfg, self.slip_cfg = F.FeeConfig(), F.SlippageConfig()
         self._client = client or make_order_client()
         self.kill = KillSwitch(self._client)
@@ -237,6 +236,10 @@ class LiveContext(Context):
     @property
     def now(self) -> datetime:
         return self._bars[-1].ts if self._bars else datetime.now(IST).replace(tzinfo=None)
+
+    @property
+    def lot_size(self) -> int:
+        return lot_size_on(self.underlying, self.now.date())
 
     @property
     def spot(self) -> float:

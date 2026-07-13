@@ -154,8 +154,10 @@ the restart). Restarts are deferred during IST market hours (Mon–Fri
   ATM-relative, NSE/BSE only (record MCX chain snapshots ourselves).
 - Option Chain API rate limit: 1 unique request per 3 seconds.
 - Access tokens last 24h (SEBI); static IP must be registered with Dhan.
-- Lot sizes change over time (LOT_SIZES in backtest.py is a stub —
-  should become a dated table); expiry weekdays have changed historically.
+- Lot sizes are a DATED table (backtest.py LOT_HISTORY + lot_size_on();
+  NIFTY 25->75 Nov-2024 ->65 Jan-2026). Contexts expose date-aware
+  .lot_size. On a new exchange circular: add a row + tests/test_lots.py.
+  Expiry weekdays have changed historically.
 - STT/charges rates in fills.py are approximations — verify vs contract
   notes before trusting absolute P&L.
 
