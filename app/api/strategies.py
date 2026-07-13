@@ -274,6 +274,105 @@ def wipe_day(sid: str, day: str):
     return res
 
 
+class ManualLegReq(BaseModel):
+    option_type: str            # CE | PE
+    action: str                 # entry side: BUY | SELL
+    strike: float
+    qty: int                    # units (lots x lot size), > 0
+    entry_price: float
+    exit_price: float
+    entry_ts: str               # "09:47" or "09:47:23" (IST)
+    exit_ts: str
+    exit_reason: str = "manual"
+    margin: float = 0.0         # blocked at entry, if you want it on the blotter
+    tag: str = ""
+
+
+class ManualTradeReq(BaseModel):
+    day: str                    # YYYY-MM-DD
+    underlying: str = "NIFTY"
+    expiry: str                 # YYYY-MM-DD
+    legs: list[ManualLegReq]
+    update_daily: bool = True   # False = blotter rows only, leave daily_pnl alone
+
+
+@router.post("/{sid}/manual_trade")
+def manual_trade(sid: str, req: ManualTradeReq):
+    """Book a completed round-trip at ACTUAL prices (PAPER ledger). Companion
+    to wipe_day: after erasing a day filled off frozen/bad quotes, re-enter
+    the day's trade with the real fills. Charges come from the shared cost
+    model (engines/fills.py) so the rows stay comparable with engine fills;
+    realized is net of fees, same as Position.realized_pnl."""
+    from datetime import time as _time
+    from app.core.contract import Action as _Action
+    from app.engines import fills as F
+
+    rec = _rec_or_404(sid)
+    if not req.legs:
+        raise HTTPException(422, "at least one leg required")
+    try:
+        day = date.fromisoformat(req.day)
+        expiry = date.fromisoformat(req.expiry)
+    except ValueError as e:
+        raise HTTPException(422, f"bad date: {e}")
+
+    def _ts(hhmm: str) -> str:
+        try:
+            return datetime.combine(day, _time.fromisoformat(hhmm)) \
+                .isoformat(sep=" ", timespec="seconds")
+        except ValueError as e:
+            raise HTTPException(422, f"bad time '{hhmm}': {e}")
+
+    fee_cfg = F.FeeConfig()
+    realized = fees_total = 0.0
+    booked = []
+    for leg in req.legs:
+        side, opt = leg.action.upper(), leg.option_type.upper()
+        if side not in ("BUY", "SELL"):
+            raise HTTPException(422, "leg.action must be BUY or SELL")
+        if opt not in ("CE", "PE"):
+            raise HTTPException(422, "leg.option_type must be CE or PE")
+        if leg.qty <= 0 or leg.entry_price <= 0 or leg.exit_price < 0:
+            raise HTTPException(422, "qty and prices must be positive")
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        e_fees = F.charges(leg.entry_price * leg.qty, _Action[side], fee_cfg)
+        x_fees = F.charges(leg.exit_price * leg.qty, _Action[exit_side], fee_cfg)
+        contract = f"{req.underlying} {expiry:%d%b%y} {leg.strike:g} {opt}".upper()
+        registry.record_trade(sid, "PAPER", {
+            "ts": _ts(leg.entry_ts), "contract": contract, "side": side,
+            "qty": leg.qty, "price": round(leg.entry_price, 2),
+            "fees": round(e_fees, 2), "margin": round(leg.margin, 2),
+            "reason": "entry", "tag": leg.tag or "manual"})
+        registry.record_trade(sid, "PAPER", {
+            "ts": _ts(leg.exit_ts), "contract": contract, "side": exit_side,
+            "qty": leg.qty, "price": round(leg.exit_price, 2),
+            "fees": round(x_fees, 2), "margin": 0.0,
+            "reason": leg.exit_reason, "tag": leg.tag or "manual"})
+        signed = leg.qty if side == "BUY" else -leg.qty
+        leg_pnl = (leg.exit_price - leg.entry_price) * signed - (e_fees + x_fees)
+        realized += leg_pnl
+        fees_total += e_fees + x_fees
+        booked.append({"contract": contract, "side": side, "qty": leg.qty,
+                       "entry": leg.entry_price, "exit": leg.exit_price,
+                       "fees": round(e_fees + x_fees, 2), "pnl": round(leg_pnl, 2)})
+
+    daily = None
+    if req.update_daily:
+        prev = [r for r in registry.paper_performance(sid)
+                if r["trade_date"] < req.day]
+        base = prev[-1]["equity_eod"] if prev else rec.allocated_capital
+        daily = {"trade_date": req.day, "realized": round(realized, 2),
+                 "unrealized": 0.0, "fees": round(fees_total, 2),
+                 "equity_eod": round(base + realized, 2)}
+        registry.save_paper_day(sid, req.day, daily["realized"], 0.0,
+                                daily["fees"], daily["equity_eod"])
+    registry.record_event("info", "fill",
+                          f"manual booking {req.day}: {len(booked)} leg(s), "
+                          f"P&L {realized:+.2f} (fees {fees_total:.2f})", sid)
+    return {"booked": booked, "realized": round(realized, 2),
+            "fees": round(fees_total, 2), "daily_row": daily}
+
+
 @data_router.post("/data/purge_offhours")
 def purge_offhours():
     """Remove recorded rows stamped outside exchange sessions (weekend junk

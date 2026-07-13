@@ -103,7 +103,10 @@ user; runs on a small VPS behind Tailscale.
 - `app/core/token_manager.py` — 24h token lifecycle: 08:30 IST check,
   ntfy push of login link, /dhan/callback capture, /token/status.
 - `app/api/strategies.py` — all REST endpoints incl. /portfolio/today,
-  /activity, /data/coverage, /trades, calendar/params/montecarlo.
+  /activity, /data/coverage, /trades, calendar/params/montecarlo; incident
+  pair: POST /{sid}/wipe_day (erase a bad-quote paper day) + POST
+  /{sid}/manual_trade (re-book the day's round-trip at actual prices;
+  fees via engines/fills.py, realized net of fees).
 - `frontend/` — THE canonical React + Vite SPA (JavaScript/JSX, React 18,
   Vite 5, Chart.js). (`ui/`, a parallel TypeScript copy, is DEAD — it builds
   to `app/static/dist/` which main.py does not serve. Ignore/remove it.)
