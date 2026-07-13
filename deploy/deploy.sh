@@ -34,7 +34,8 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
 fi
 
 # 4) Restart the service if it's installed -------------------------------------
-if systemctl list-unit-files 2>/dev/null | grep -q '^optionslab.service'; then
+if [ -f /etc/systemd/system/optionslab.service ] \
+    || systemctl list-unit-files 2>/dev/null | grep -q '^optionslab.service'; then
   echo "==> restarting optionslab service"
   sudo systemctl restart optionslab
   sleep 2
