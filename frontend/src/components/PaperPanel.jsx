@@ -69,7 +69,7 @@ export default function PaperPanel({ id }) {
       <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
         <Stat label="Day P&L" value={deployed ? inr(data.day_pnl) : '—'} color={deployed ? pos(data.day_pnl) : undefined} />
         <Stat label="Day ROI" value={data.day_roi_pct != null ? `${data.day_roi_pct}%` : '—'} color={data.day_roi_pct != null ? pos(data.day_roi_pct) : undefined} />
-        <Stat label="ROI on margin" value={data.day_roi_on_margin_pct != null ? `${data.day_roi_on_margin_pct}%` : '—'} />
+        <Stat label="ROI on margin" value={data.day_roi_on_margin_pct != null ? `${data.day_roi_on_margin_pct}%` : '—'} color={data.day_roi_on_margin_pct != null ? pos(data.day_roi_on_margin_pct) : undefined} />
         <Stat label="Margin used" value={inr(data.margin_used)} />
         <Stat label="Allocated" value={inr(data.allocated_capital)} />
       </div>

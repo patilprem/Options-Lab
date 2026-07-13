@@ -689,6 +689,15 @@ button {
   color: var(--ink);
 }
 
+/* sign coloring must beat the .metric .v ink override above */
+.metric .v.pos {
+  color: var(--green);
+}
+
+.metric .v.neg {
+  color: var(--red);
+}
+
 .metric .sub {
   font-family: var(--mono);
   font-size: 11px;

@@ -13,7 +13,7 @@ export default function Summary({ alloc, equity, growth, live }) {
       </div>
       <div>
         <div className="lbl">Growth</div>
-        <div className="val num">{fmt(growth)}</div>
+        <div className="val num" style={growth ? { color: growth > 0 ? 'var(--green)' : 'var(--red)' } : undefined}>{fmt(growth)}</div>
       </div>
       <div>
         <div className="lbl">Strategies live</div>
