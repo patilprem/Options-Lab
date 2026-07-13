@@ -209,7 +209,19 @@ class MarketHub:
 
     def _on_tick(self, underlying: str, price: float, ts: datetime) -> None:
         """Called on the app loop for each parsed tick; rolls candles and emits
-        completed bars per registered timeframe."""
+        completed bars per registered timeframe.
+
+        TICK GATE: only regular-session, plausibly-timed ticks build candles.
+        Dhan's feed also delivers pre-open auction prints (09:00-09:08) and
+        stale snapshot ticks on (re)subscribe — observed producing a 09:00 bar,
+        future-stamped bars (which tripped the 15:25 EOD branch mid-day), and
+        weekend bars. All junk dies here, at the single choke point."""
+        if ts.weekday() >= 5 or not (dtime(9, 15) <= ts.time() <= dtime(15, 30)):
+            return
+        if self.TICK_FRESHNESS_S:          # None in tests/replays (fixed clocks)
+            now = datetime.now(IST).replace(tzinfo=None)
+            if abs((ts - now).total_seconds()) > self.TICK_FRESHNESS_S:
+                return
         for interval in tuple(self._wanted.get(underlying, ())):
             builder = self._builders.get((underlying, interval))
             if builder is None:
@@ -264,21 +276,19 @@ class MarketHub:
         client = None
         warned: set[str] = set()
         while True:
-            try:
-                if client is None:
-                    client = await loop.run_in_executor(None, dhan_client.get_client)
-            except Exception as e:
-                registry.record_event("warn", "feed", f"chain poll client error: {e!r}")
-                await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
-                continue
             for u in list(set(self._wanted) | self._chain_only):
                 cfg = UNDERLYINGS.get(u)
                 if not cfg:
                     continue
-                # Per-underlying isolation: an unverified/failing chain (e.g.
-                # MCX) must never break the others' polling. Repeated failures
-                # warn once, not every cycle.
+                # Per-underlying isolation: a failing chain (e.g. MCX) must
+                # never break the others' polling. On ANY failure the client is
+                # dropped and rebuilt for the next name — Dhan's error payloads
+                # don't reliably say "token", and after the 24h token rotated a
+                # keyword-gated rebuild kept a dead client all session, freezing
+                # the quote cache at Friday's prices (2026-07-13).
                 try:
+                    if client is None:
+                        client = await loop.run_in_executor(None, dhan_client.get_client)
                     expiries = await self._get_expiries(client, u, cfg, loop)
                     for kind, off in self.CHAIN_TARGETS:
                         exp = chainmod.resolve_expiry(expiries, kind, off)
@@ -301,9 +311,8 @@ class MarketHub:
                         warned.add(u)
                         registry.record_event("warn", "feed",
                                               f"chain poll error [{u}]: {e!r}")
-                    if "token" in repr(e).lower() or "401" in repr(e):
-                        client = None      # token rotated — rebuild next cycle
-                        break
+                    client = None          # rebuild for the next name/cycle
+                    await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
             await asyncio.sleep(1.0)
 
     async def _get_expiries(self, client, underlying, cfg, loop) -> list:
@@ -416,17 +425,28 @@ class MarketHub:
                 self._margin_client = None
         return self._margin_client
 
+    QUOTE_MAX_AGE_S = 600.0   # a cached quote older than this is FROZEN, not live
+    TICK_FRESHNESS_S: Optional[float] = 600.0   # tick wall-clock sanity (None = off)
+
     def quote(self, underlying: str, ts: datetime, leg: LegSpec) -> Optional[OptionQuote]:
         """Real bid/ask/greeks from the live chain cache when available, else
         the store (backfill / synthetic) so backtests and dev keep working.
         NOTE: keyed ATM-relative — correct for NEW entries only. Marking or
-        exiting an OPEN position must go through quote_position()."""
+        exiting an OPEN position must go through quote_position().
+
+        STALENESS GUARD: if a live cache exists but its quote is old, return
+        None — refusing to price beats pricing at a frozen chain (a dead
+        poller once served Friday's closes as 'live' and a paper entry filled
+        ~25% off the real market). No store fallback in that case: on a live
+        trading day the store is even staler."""
         cache = self._chain_cache.get(underlying)
         if cache:
             key = (leg.expiry_kind.value, leg.expiry_offset,
                    leg.strike_offset, leg.option_type.value)
             q = cache.get(key)
             if q is not None:
+                if (ts - q.ts).total_seconds() > self.QUOTE_MAX_AGE_S:
+                    return None
                 return replace(q, ts=ts)
         return self.store.option_close(underlying, ts, leg)
 

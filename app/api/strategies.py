@@ -264,6 +264,16 @@ def data_footprint(underlying: str = "NIFTY", date: str | None = None):
     return _store.day_footprint(underlying, date or _dt.now().date().isoformat())
 
 
+@router.post("/{sid}/wipe_day")
+def wipe_day(sid: str, day: str):
+    """Incident cleanup: erase one strategy's PAPER trades/P&L/state for one
+    day (fills produced by bad quotes must not poison calibration data)."""
+    _rec_or_404(sid)
+    res = registry.wipe_paper_day(sid, day)
+    registry.record_event("warn", "engine", f"paper day {day} wiped: {res}", sid)
+    return res
+
+
 @data_router.post("/data/purge_offhours")
 def purge_offhours():
     """Remove recorded rows stamped outside exchange sessions (weekend junk

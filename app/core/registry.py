@@ -387,6 +387,20 @@ def purge_phantom_days() -> int:
         return cur.rowcount
 
 
+def wipe_paper_day(strategy_id: str, day: str) -> dict:
+    """Remove one strategy's PAPER records for one day (trades + daily row +
+    state snapshot) — incident cleanup for fills produced by bad quotes
+    (e.g. the frozen-chain fills of 2026-07-13). LIVE rows are never touched."""
+    with _conn() as c:
+        t = c.execute("""DELETE FROM trades WHERE strategy_id=? AND mode='PAPER'
+                         AND payload_json LIKE ?""", (strategy_id, f'%"{day}%')).rowcount
+        d = c.execute("DELETE FROM daily_pnl WHERE strategy_id=? AND mode='PAPER' "
+                      "AND trade_date=?", (strategy_id, day)).rowcount
+        s = c.execute("DELETE FROM paper_state WHERE strategy_id=?",
+                      (strategy_id,)).rowcount
+    return {"trades_deleted": t, "daily_rows_deleted": d, "state_cleared": s}
+
+
 def count_trades(mode: str = "PAPER") -> int:
     """Total blotter fills for a ledger (experience counter for /data/maturity)."""
     with _conn() as c:

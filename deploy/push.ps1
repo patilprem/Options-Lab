@@ -1,4 +1,4 @@
-# push.ps1 — build the dashboard and deploy code + UI to the VPS in one shot.
+# push.ps1 - build the dashboard and deploy code + UI to the VPS in one shot.
 # Run from anywhere:  powershell -File deploy\push.ps1
 # Databases live at the repo ROOT on the server (/opt/optionslab/*.duckdb, *.db),
 # NOT inside app/, so syncing app/ never touches your data.
@@ -7,11 +7,14 @@
 # carries real IPs/paths. Create it once, next to this file:
 #   $Key    = "C:\path\to\your-ssh-key.key"
 #   $Server = "ubuntu@<your-vps-ip>"
+#
+# ASCII ONLY in this file: PowerShell 5.1 reads BOM-less files as ANSI, and a
+# multi-byte dash/quote decodes into a quote terminator -> parse error.
 
 $ErrorActionPreference = "Stop"
 $local = Join-Path $PSScriptRoot "push.local.ps1"
 if (-not (Test-Path $local)) {
-    Write-Error "Missing deploy\push.local.ps1 — create it with `$Key and `$Server (see header)."
+    Write-Error "Missing deploy\push.local.ps1 - create it with `$Key and `$Server (see header)."
     exit 1
 }
 . $local

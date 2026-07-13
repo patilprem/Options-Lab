@@ -4,7 +4,7 @@ MarketHub live-quote cache. Replays a REAL trimmed chain fixture; no network."""
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from app.core.contract import Action, ExpiryKind, LegSpec, OptionQuote, OptionType
@@ -92,10 +92,18 @@ def test_quote_uses_chain_cache_then_falls_back():
 
     leg = LegSpec(OptionType.CALL, Action.SELL, strike_offset=0,
                   expiry_kind=ExpiryKind.WEEKLY, lots=1)
-    q = hub.quote("NIFTY", TS.replace(hour=11), leg)
+    fresh_ts = TS + timedelta(minutes=5)         # within QUOTE_MAX_AGE_S
+    q = hub.quote("NIFTY", fresh_ts, leg)
     assert isinstance(q, OptionQuote) and q.strike == 23950.0
-    assert q.ts == TS.replace(hour=11)   # ts refreshed to the query time
+    assert q.ts == fresh_ts               # ts refreshed to the query time
     assert store.calls == 0               # served from cache, no store hit
+
+    # STALENESS GUARD: a cache that stopped updating must refuse to price new
+    # entries (frozen-chain fills, 2026-07-13) — None, not a stale quote, and
+    # NOT the (even staler) store.
+    stale_ts = TS + timedelta(hours=1)
+    assert hub.quote("NIFTY", stale_ts, leg) is None
+    assert store.calls == 0
 
     # a strike we didn't cache -> store fallback
     leg_far = LegSpec(OptionType.CALL, Action.SELL, strike_offset=10,

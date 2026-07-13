@@ -249,6 +249,18 @@ class DataStore:
         out = {}
         mcx = list(mcx_names)
         with self._lock:
+            # spot bars: junk ticks produced pre-open (09:00 auction) and
+            # future-stamped bars (stale feed snapshots) — NSE session only
+            before = self.con.execute("SELECT count(*) FROM underlying_bars").fetchone()[0]
+            self.con.execute(f"""
+                DELETE FROM underlying_bars WHERE
+                  underlying NOT IN ({','.join('?' * len(mcx))})
+                  AND (dayofweek(ts) IN (0, 6)
+                       OR CAST(ts AS TIME) < TIME '09:15'
+                       OR CAST(ts AS TIME) > TIME '15:30')
+            """, mcx)
+            after = self.con.execute("SELECT count(*) FROM underlying_bars").fetchone()[0]
+            out["underlying_bars"] = {"deleted": before - after, "remaining": after}
             for table in ("option_bars", "chain_snapshots"):
                 before = self.con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                 self.con.execute(f"""

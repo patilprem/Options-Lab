@@ -83,6 +83,7 @@ def test_register_and_instrument_mapping():
 
 def test_on_tick_emits_completed_bars_per_interval():
     hub = MarketHub(_FakeStore())
+    hub.TICK_FRESHNESS_S = None      # fixed historical clock in this test
     hub.register("NIFTY", 5)
     q = hub.subscribe()
 
@@ -98,6 +99,34 @@ def test_on_tick_emits_completed_bars_per_interval():
     # ticks for an unregistered underlying are ignored
     hub._on_tick("SENSEX", 200.0, _dt(9, 22))
     assert q.empty()
+
+
+def test_tick_gate_drops_offsession_and_stale_ticks():
+    """Pre-open auction prints, weekend snapshot ticks and future/stale-stamped
+    ticks must never build candles (they produced 09:00 bars, weekend bars and
+    a future bar that tripped the 15:25 EOD branch mid-day on 2026-07-13)."""
+    from datetime import datetime as _d
+    hub = MarketHub(_FakeStore())
+    hub.TICK_FRESHNESS_S = None          # isolate the session-window checks
+    hub.register("NIFTY", 5)
+    q = hub.subscribe()
+    hub._on_tick("NIFTY", 100.0, _d(2026, 7, 9, 9, 0))    # pre-open auction
+    hub._on_tick("NIFTY", 100.0, _d(2026, 7, 9, 15, 45))  # after close
+    hub._on_tick("NIFTY", 100.0, _d(2026, 7, 12, 11, 0))  # Sunday
+    hub._on_tick("NIFTY", 100.0, _d(2026, 7, 9, 9, 16))   # ok - opens bucket
+    hub._on_tick("NIFTY", 101.0, _d(2026, 7, 9, 9, 21))   # rolls -> 1 bar
+    kind, u, iv, bar = q.get_nowait()
+    assert bar.ts == _d(2026, 7, 9, 9, 15)
+    assert bar.open == 100.0                # junk ticks never entered the bar
+    assert q.empty()
+
+    # wall-clock freshness: a tick stamped far from 'now' is dropped
+    hub2 = MarketHub(_FakeStore())
+    hub2.register("NIFTY", 5)
+    q2 = hub2.subscribe()
+    hub2._on_tick("NIFTY", 100.0, _d(2026, 7, 9, 12, 0))  # in-session but stale vs now
+    hub2._on_tick("NIFTY", 100.0, _d(2026, 7, 9, 12, 6))
+    assert q2.empty()
 
 
 def test_use_synthetic_env_flag(monkeypatch):
