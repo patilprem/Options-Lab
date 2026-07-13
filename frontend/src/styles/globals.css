@@ -80,11 +80,21 @@ button {
 }
 
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--disp);
   font-weight: 700;
   font-size: 17px;
   letter-spacing: 0.05em;
   color: var(--ink);
+}
+
+.brand-mark {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  flex-shrink: 0;
 }
 
 .brand em {

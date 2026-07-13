@@ -152,7 +152,10 @@ export default function App() {
   return (
     <div className="app">
       <aside className="side">
-        <div className="brand">OPTIONS<em>LAB</em></div>
+        <div className="brand">
+          <img src="/favicon-96x96.png" alt="" className="brand-mark" />
+          <span>OPTIONS<em>LAB</em></span>
+        </div>
         <div className="side-label">Menu</div>
         {/* Nav only — the strategy list lives on its own page so it scales
             past a handful of strategies. */}
