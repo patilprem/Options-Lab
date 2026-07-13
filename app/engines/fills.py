@@ -7,15 +7,15 @@ Paper/live: fill BUY at ask, SELL at bid (plus optional extra slippage).
 Backtest:   minute data has no quotes, so fill at close +/- a spread model
             that widens with distance from ATM (far OTM options are thin).
 
-Charges are configurable — VERIFY the current rates against your Dhan
-contract note before trusting absolute P&L numbers. Defaults below are
-approximately the NSE options structure (per side unless noted):
+Charges are configurable. Defaults CALIBRATED against Dhan's Transaction
+Estimator on 2026-07-13 (NSE index option, turnover 6,734: buy 26.63 /
+sell 36.53 — reproduced to the paisa). Per side unless noted:
   brokerage        flat Rs 20 per executed order
-  STT              % of premium on SELL side only
-  exchange txn     % of premium
-  GST              18% on (brokerage + exchange txn + SEBI fee)
+  STT              0.15% of premium on SELL side only
+  exchange txn     0.0355% of premium (NSE txn + IPFT, as Dhan bills it)
+  GST              18% on (brokerage + exchange txn)
   SEBI fee         Rs 10 per crore of premium turnover
-  stamp duty       % of premium on BUY side only
+  stamp duty       0.003% of premium on BUY side only
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from app.core.contract import Action, OptionQuote
 @dataclass
 class FeeConfig:
     brokerage_per_order: float = 20.0
-    stt_sell_pct: float = 0.001        # 0.1% of sell premium
-    exchange_txn_pct: float = 0.0003503
+    stt_sell_pct: float = 0.0015       # 0.15% of sell premium (Dhan, 2026-07)
+    exchange_txn_pct: float = 0.000355  # NSE txn + IPFT bundled, Dhan's rate
     gst_pct: float = 0.18
     sebi_per_crore: float = 10.0
     stamp_buy_pct: float = 0.00003     # 0.003% on buy
@@ -51,12 +51,15 @@ class FillResult:
 
 
 def charges(premium_turnover: float, action: Action, cfg: FeeConfig) -> float:
-    """Total statutory + brokerage cost for ONE order of given turnover."""
-    exch = premium_turnover * cfg.exchange_txn_pct
-    sebi = premium_turnover / 1e7 * cfg.sebi_per_crore
-    stt = premium_turnover * cfg.stt_sell_pct if action == Action.SELL else 0.0
-    stamp = premium_turnover * cfg.stamp_buy_pct if action == Action.BUY else 0.0
-    gst = (cfg.brokerage_per_order + exch + sebi) * cfg.gst_pct
+    """Total statutory + brokerage cost for ONE order of given turnover.
+    Components round to the paisa before summing and GST applies to
+    brokerage + exchange txn only — matching how Dhan's estimator computes,
+    so totals reproduce their buy/sell numbers exactly."""
+    exch = round(premium_turnover * cfg.exchange_txn_pct, 2)
+    sebi = round(premium_turnover / 1e7 * cfg.sebi_per_crore, 2)
+    stt = round(premium_turnover * cfg.stt_sell_pct, 2) if action == Action.SELL else 0.0
+    stamp = round(premium_turnover * cfg.stamp_buy_pct, 2) if action == Action.BUY else 0.0
+    gst = round((cfg.brokerage_per_order + exch) * cfg.gst_pct, 2)
     return cfg.brokerage_per_order + exch + sebi + stt + stamp + gst
 
 
