@@ -1,0 +1,13 @@
+# Runs one autopull check (see autopull.sh). Started by the matching .timer.
+[Unit]
+Description=OptionsLab auto-update from GitHub main
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=optionslab
+WorkingDirectory=/opt/optionslab
+ExecStart=/usr/bin/bash /opt/optionslab/deploy/autopull.sh
+# npm ci + frontend build + test suite can take a few minutes on a small VPS
+TimeoutStartSec=15min

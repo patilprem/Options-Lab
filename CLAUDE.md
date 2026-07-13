@@ -19,6 +19,14 @@ user; runs on a small VPS behind Tailscale.
 - `cd frontend && npm run dev` → Vite at http://localhost:5173 (proxies /strategies etc to :8000)
 - Run backend in another terminal
 
+**Deploy:** pushing to GitHub `main` IS the deploy. The VPS runs
+`optionslab-autopull.timer` (deploy/autopull.sh, installed once via
+deploy/install_autopull.sh): every 5 min it fetches origin/main and, when it
+changed, redeploys via deploy/deploy.sh (deps + UI build + offline tests gate
+the restart). Restarts are deferred during IST market hours (Mon–Fri
+09:00–15:35); `FORCE=1 bash deploy/autopull.sh` overrides. So: land changes on
+`main` only when they should go live at the next off-hours window.
+
 ## Run / test
 - **Backend:** `python3 -m venv venv && venv/bin/pip install -r requirements.txt && venv/bin/uvicorn app.main:app --reload` → API at `http://localhost:8000/docs`
 - **Frontend (dev):** `cd frontend && npm install && npm run dev` → dashboard at `http://localhost:5173`, proxied to backend

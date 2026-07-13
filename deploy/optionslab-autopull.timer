@@ -1,0 +1,12 @@
+# Checks GitHub main every 5 minutes (autopull.sh no-ops when up to date and
+# defers restarts during IST market hours). install_autopull.sh enables this.
+[Unit]
+Description=OptionsLab autopull schedule
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

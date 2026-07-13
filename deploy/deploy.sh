@@ -38,7 +38,8 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^optionslab.service'; then
   echo "==> restarting optionslab service"
   sudo systemctl restart optionslab
   sleep 2
-  sudo systemctl --no-pager --lines=0 status optionslab | head -4
+  # status needs no root — keeps the autopull sudoers grant restart-only
+  systemctl --no-pager --lines=0 status optionslab | head -4
   curl -fsS http://localhost:8000/token/status >/dev/null && echo "==> app responding on :8000" \
     || echo "!! app not responding yet — check: journalctl -u optionslab -n 50"
 else

@@ -84,8 +84,14 @@ And on your phone: install the **ntfy** app, subscribe to your
 
 ## Operational notes
 
-- **Updates:** `scp` the new zip, unzip over `/opt/optionslab`, then
-  `bash deploy/deploy.sh` (rebuilds the UI, runs the offline tests, restarts).
+- **Updates are automatic** once you run `bash deploy/install_autopull.sh`
+  (one time, as your sudo user): a systemd timer checks GitHub `main` every
+  5 minutes and redeploys via `deploy.sh` (deps + UI build + offline tests +
+  restart). Restarts are DEFERRED during IST market hours so a deploy never
+  bounces the live feed; force one with
+  `sudo -u optionslab FORCE=1 bash /opt/optionslab/deploy/autopull.sh`.
+  Watch runs: `journalctl -u optionslab-autopull -f`. Manual fallback still
+  works: `git pull && bash deploy/deploy.sh` from `/opt/optionslab`.
 - **Backups:** both databases are single files. A nightly cron
   `cp optionslab.db marketdata.duckdb /home/optionslab/backup/ && keep last 7`
   is enough; copy them off-box weekly if you're paranoid. `optionslab.db`

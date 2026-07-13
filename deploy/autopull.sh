@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Keep the VPS on the latest origin/main automatically. Run by the
+# optionslab-autopull.timer every 5 minutes; safe to run by hand too.
+#
+#   * no-op when already at origin/main (cheap: one git fetch)
+#   * DEFERS updates during IST market hours (Mon-Fri 09:00-15:35) so a
+#     deploy can never bounce the feed mid-session — FORCE=1 overrides
+#   * bootstraps git in place on a non-git /opt/optionslab (scp-era installs):
+#     tracked files are replaced, untracked files (*.db, *.duckdb, venv/,
+#     node_modules/, push.local.ps1) are never touched
+#   * hands off to deploy/deploy.sh (deps + frontend build + tests + restart);
+#     failing tests abort before the restart, leaving the old code running
+set -euo pipefail
+
+# main() so bash parses the whole body BEFORE git replaces this very file
+main() {
+  local ROOT="${OPTIONSLAB_ROOT:-/opt/optionslab}"
+  local REPO_URL="${OPTIONSLAB_REPO:-https://github.com/patilprem/Options-Lab.git}"
+  local BRANCH="${OPTIONSLAB_BRANCH:-main}"
+  cd "$ROOT"
+
+  if [ ! -d .git ]; then
+    echo "[autopull] no git repo in $ROOT — bootstrapping from $REPO_URL"
+    git init -q
+    git remote add origin "$REPO_URL"
+  fi
+
+  git fetch -q origin "$BRANCH"
+  local local_sha remote_sha
+  local_sha=$(git rev-parse HEAD 2>/dev/null || echo "none")
+  remote_sha=$(git rev-parse "origin/$BRANCH")
+  if [ "$local_sha" = "$remote_sha" ]; then
+    echo "[autopull] up to date at ${local_sha:0:7}"
+    return 0
+  fi
+
+  local now dow hm
+  now=$(TZ=Asia/Kolkata date +%u%H%M)   # e.g. 21012 = Tue 10:12
+  dow=${now:0:1}
+  hm=$((10#${now:1}))
+  if [ "${FORCE:-0}" != "1" ] && [ "$dow" -le 5 ] \
+      && [ "$hm" -ge 900 ] && [ "$hm" -le 1535 ]; then
+    echo "[autopull] ${local_sha:0:7} -> ${remote_sha:0:7} available but it is" \
+         "IST market hours — deferring (FORCE=1 bash deploy/autopull.sh to override)"
+    return 0
+  fi
+
+  echo "[autopull] updating ${local_sha:0:7} -> ${remote_sha:0:7}"
+  # -B resets the branch to origin even from an unborn HEAD (fresh bootstrap);
+  # -f overwrites the old scp-era copies of tracked files
+  git checkout -qf -B "$BRANCH" "origin/$BRANCH"
+  bash deploy/deploy.sh
+  echo "[autopull] now at $(git rev-parse --short HEAD)"
+}
+
+main "$@"
+exit 0
