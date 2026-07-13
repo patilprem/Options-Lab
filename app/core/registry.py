@@ -249,7 +249,7 @@ def events_for(day: str) -> list[dict]:
         rows = c.execute(
             "SELECT e.ts, e.strategy_id, s.name AS strategy, e.level, e.kind, e.message "
             "FROM events e LEFT JOIN strategies s ON s.id = e.strategy_id "
-            "WHERE e.ts LIKE ? ORDER BY e.ts", (day + "%",)).fetchall()
+            "WHERE e.ts LIKE ? ORDER BY e.ts DESC", (day + "%",)).fetchall()
     return [dict(r) for r in rows]
 
 
