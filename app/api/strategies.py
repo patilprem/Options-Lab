@@ -181,6 +181,12 @@ def activity(date: str = ""):
     return {"date": day, "events": registry.events_for(day)}
 
 
+@activity_router.get("/feed/status")
+def feed_status():
+    """Market-data feed health for the dashboard's Feed pill."""
+    return hub.feed_status()
+
+
 data_router = APIRouter(tags=["data"])
 
 

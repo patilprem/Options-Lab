@@ -114,6 +114,9 @@ class LiveFeed:
         self._app_loop: Optional[asyncio.AbstractEventLoop] = None
         self._feed = None
         self._feed_loop: Optional[asyncio.AbstractEventLoop] = None
+        # health surface for the dashboard's Feed pill
+        self.connected = False
+        self.last_tick: Optional[datetime] = None
 
     def start(self, app_loop: asyncio.AbstractEventLoop) -> None:
         if self._running:
@@ -157,6 +160,7 @@ class LiveFeed:
                 feed = MarketFeed(self._context_factory(), instruments, "v2")
                 self._feed = feed
                 await feed.connect()
+                self.connected = True
                 names = sorted({self._sec_to_underlying().get(int(sid), sid)
                                 for _seg, sid, *_ in instruments})
                 self._event("info", f"live feed connected: {', '.join(map(str, names))}")
@@ -173,6 +177,7 @@ class LiveFeed:
                     except Exception:
                         pass
                 self._feed = None
+                self.connected = False
             if not self._running:
                 break
             self._event("warn", f"live feed disconnected; reconnecting in {backoff}s")
@@ -199,6 +204,7 @@ class LiveFeed:
         if price <= 0:
             return
         ts = datetime.now(IST).replace(tzinfo=None)  # bucket by IST arrival time
+        self.last_tick = ts
         vol = pkt.get("volume") or 0.0
         if self._app_loop is not None:
             self._app_loop.call_soon_threadsafe(self._on_tick, underlying, price, ts)

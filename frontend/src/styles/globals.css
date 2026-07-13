@@ -130,6 +130,29 @@ button {
   box-shadow: 0 0 8px rgba(240, 113, 107, 0.6);
 }
 
+/* intentional/neutral inactive — no alarm glow */
+.dot.off {
+  background: var(--faint);
+}
+
+/* labeled pill categories in the topbar */
+.chip-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 10px;
+  border: 1px dashed var(--line-2);
+  border-radius: 999px;
+}
+
+.chip-group-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+
 .chip button {
   color: var(--lime);
   font-family: var(--mono);

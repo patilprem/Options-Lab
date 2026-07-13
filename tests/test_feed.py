@@ -137,3 +137,23 @@ def test_use_synthetic_env_flag(monkeypatch):
 def test_use_synthetic_true_for_synthetic_store():
     from app.data.store import SyntheticStore
     assert MarketHub(SyntheticStore())._use_synthetic() is True
+
+
+# --- feed status surface (dashboard Feed pill) -------------------------------
+
+def test_hub_feed_status_off_then_synthetic(tmp_path, monkeypatch):
+    from app.core import registry
+    from app.data.store import SyntheticStore
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "t.db")
+    registry.init_db()
+    hub = MarketHub(SyntheticStore())
+    st = hub.feed_status()
+    assert st == {"mode": "off", "connected": False, "last_tick": None,
+                  "tick_age_sec": None}
+
+    async def run():
+        await hub.ensure_started()
+        st = hub.feed_status()
+        assert st["mode"] == "synthetic" and st["connected"] is True
+        await hub.stop()
+    asyncio.run(run())

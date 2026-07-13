@@ -150,6 +150,22 @@ class MarketHub:
         started and `underlying` present in dhan_client.UNDERLYINGS."""
         self._chain_only.add(underlying)
 
+    def feed_status(self) -> dict:
+        """Health surface for the dashboard's Feed pill: driver mode, socket
+        state, and how fresh the last tick is."""
+        if not self._started:
+            return {"mode": "off", "connected": False, "last_tick": None,
+                    "tick_age_sec": None}
+        if self._livefeed is None:
+            return {"mode": "synthetic", "connected": True, "last_tick": None,
+                    "tick_age_sec": None}
+        lt = self._livefeed.last_tick
+        age = ((datetime.now(IST).replace(tzinfo=None) - lt).total_seconds()
+               if lt else None)
+        return {"mode": "live", "connected": self._livefeed.connected,
+                "last_tick": lt.isoformat(sep=" ", timespec="seconds") if lt else None,
+                "tick_age_sec": round(age, 1) if age is not None else None}
+
     def _use_synthetic(self) -> bool:
         from app.data.store import SyntheticStore
         if os.environ.get("OPTIONSLAB_SYNTHETIC") == "1":
