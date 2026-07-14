@@ -73,7 +73,11 @@ export default function Header({ title, showToast }) {
 
   const eqOpen = open(ist, EQUITY)
   const mcxOpen = open(ist, MCX)
-  const fp = feedPill(feed, eqOpen || mcxOpen)
+  // judge the feed only against sessions it actually subscribes to
+  const segs = feed?.segments || ['NSE', 'MCX']
+  const feedMarketOpen = (segs.includes('NSE') && eqOpen)
+    || (segs.includes('MCX') && mcxOpen)
+  const fp = feedPill(feed, feedMarketOpen)
 
   return (
     <header className="topbar">

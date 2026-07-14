@@ -164,7 +164,11 @@ class MarketHub:
                if lt else None)
         return {"mode": "live", "connected": self._livefeed.connected,
                 "last_tick": lt.isoformat(sep=" ", timespec="seconds") if lt else None,
-                "tick_age_sec": round(age, 1) if age is not None else None}
+                "tick_age_sec": round(age, 1) if age is not None else None,
+                # which exchange sessions this feed actually covers, so the
+                # UI pill can say Off-hours (not Quiet) when only OTHER
+                # exchanges are open (e.g. MCX evenings on an NSE-only feed)
+                "segments": sorted(self._watch_segments())}
 
     def _watch_segments(self) -> set[str]:
         """Exchanges whose sessions the watchdog should police — derived from
