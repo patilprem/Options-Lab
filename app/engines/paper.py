@@ -166,6 +166,37 @@ class MarketHub:
                 "last_tick": lt.isoformat(sep=" ", timespec="seconds") if lt else None,
                 "tick_age_sec": round(age, 1) if age is not None else None}
 
+    def _watch_segments(self) -> set[str]:
+        """Exchanges whose sessions the watchdog should police — derived from
+        the WS-subscribed underlyings only (chain-only MCX recording produces
+        no spot ticks, so it must not trigger quiet alerts)."""
+        segs = set()
+        for u in self._wanted:
+            cfg = UNDERLYINGS.get(u)
+            if cfg:
+                segs.add("MCX" if "MCX" in str(cfg.get("fno_segment", "")) else "NSE")
+        return segs
+
+    async def _watchdog_loop(self) -> None:
+        """Once a minute: if the feed is down/silent during market hours,
+        push an ntfy alert (same channel as token refresh). See watchdog.py."""
+        from app.engines.watchdog import FeedWatchdog, session_open_for
+        wd = FeedWatchdog()
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(60)
+            try:
+                now = datetime.now(IST).replace(tzinfo=None)
+                is_open = session_open_for(self._watch_segments(), now)
+                status = self.feed_status()
+                # step() may push over HTTP — keep it off the event loop
+                kind = await loop.run_in_executor(None, wd.step, status, is_open, now)
+                if kind:
+                    lvl = "info" if kind == "recovered" else "warn"
+                    registry.record_event(lvl, "feed", f"watchdog: feed {kind}")
+            except Exception as e:
+                registry.record_event("warn", "feed", f"watchdog error: {e!r}")
+
     def _use_synthetic(self) -> bool:
         from app.data.store import SyntheticStore
         if os.environ.get("OPTIONSLAB_SYNTHETIC") == "1":
@@ -198,6 +229,7 @@ class MarketHub:
             self._livefeed.start(loop)
             self._tasks.append(asyncio.create_task(self._eod_clock()))
             self._tasks.append(asyncio.create_task(self._chain_poll_loop()))
+            self._tasks.append(asyncio.create_task(self._watchdog_loop()))
 
     async def stop(self) -> None:
         if self._livefeed:
