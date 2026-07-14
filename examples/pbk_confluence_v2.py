@@ -34,7 +34,8 @@ class PBKConfluenceV2(Strategy):
                        "sl_pct": 0.45, "lots": 1,
                        "ext_max_atr": 0.0,     # 0 = off
                        "backstop_pts": 0.0,    # 0 = off
-                       "min_align": 6}
+                       "min_align": 6,
+                       "max_recross_11": 0}    # 0 = off (chop-day gate)
         self.e9 = None
         self.e21 = None
         self.atr = None
@@ -53,6 +54,11 @@ class PBKConfluenceV2(Strategy):
         self._traded = False
         self._entry_spot = None
         self._side = None
+        # chop detector (study 2026-07: >=3 pivot recrosses by 11:00 ->
+        # median trend efficiency 0.38 vs 0.48 — the one hypothesis that
+        # survived; gate is OFF by default pending walk-forward)
+        self._recross_11 = 0
+        self._pivot_side = None
 
     def meta(self) -> StrategyMeta:
         return StrategyMeta(
@@ -96,6 +102,8 @@ class PBKConfluenceV2(Strategy):
         self._day_h = self._day_l = self._day_c = None
         self._pv = self._v = 0.0
         self._traded = False
+        self._recross_11 = 0
+        self._pivot_side = None
         self.prev_bar = None       # no overnight-gap resumption signals
         self.touch_up = self.touch_dn = 99
 
@@ -132,6 +140,11 @@ class PBKConfluenceV2(Strategy):
         w = bar.volume if bar.volume and bar.volume > 0 else 1.0
         self._pv += w * (bar.high + bar.low + bar.close) / 3.0
         self._v += w
+        if self.pivot is not None and hm <= (11, 0):
+            side_now = bar.close >= self.pivot
+            if self._pivot_side is not None and side_now != self._pivot_side:
+                self._recross_11 += 1
+            self._pivot_side = side_now
 
         # ---- manage open position (uses last completed-bar state) -----------
         if ctx.positions:
@@ -163,6 +176,11 @@ class PBKConfluenceV2(Strategy):
                 side = None
             if side and not self._has_backstop(bar.close, side):
                 ctx.log(f"skip {side}: no wall within {self.params['backstop_pts']} pts")
+                side = None
+            mrc = int(self.params["max_recross_11"])
+            if side and mrc and self._recross_11 >= mrc:
+                ctx.log(f"skip {side}: chop day ({self._recross_11} pivot "
+                        f"recrosses by 11:00)")
                 side = None
             if side:
                 ot = OptionType.CALL if side == "up" else OptionType.PUT
