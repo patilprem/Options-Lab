@@ -408,10 +408,14 @@ class LiveContext(Context):
         if not self._bars:
             return
         unreal = sum(p.unrealized_pnl for p in self.positions)
-        registry.save_day(self.rec.id, "LIVE", self.now.date().isoformat(),
+        day = self.now.date().isoformat()
+        base = registry.prev_equity(self.rec.id, day, "LIVE")
+        if base is None:
+            base = self.rec.allocated_capital
+        registry.save_day(self.rec.id, "LIVE", day,
                           round(self._realized_today, 2), round(unreal, 2),
                           round(self._fees_today, 2),
-                          round(self.rec.allocated_capital + self._realized_today + unreal, 2))
+                          round(base + self._realized_today + unreal, 2))
 
 
 # ---------------------------------------------------------------------------

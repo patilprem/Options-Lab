@@ -189,3 +189,23 @@ def test_restore_all_skipped_when_store_is_synthetic(db):
     asyncio.run(scenario())
     evs = registry.events_for(datetime.now(IST).date().isoformat())
     assert any("restore skipped" in e["message"] for e in evs)
+
+
+def test_margin_releases_on_close_and_never_restores_stuck(db):
+    """2026-07-16 dashboard bug: margin stayed 'used' after the day's trade
+    closed, and the stuck value survived restarts via the state snapshot."""
+    rec = _running_record()
+    hub = MarketHub(SyntheticStore())
+    ctx = PaperContext(rec, "NIFTY", hub, "5")
+    _enter_straddle(ctx)
+    assert ctx._margin_used > 0
+    ctx.exit_all()
+    assert ctx._margin_used == 0.0          # released the moment we're flat
+
+    # simulate the historical stuck snapshot: flat but margin persisted
+    registry.save_paper_state(rec.id, {
+        "date": _today_ist().date().isoformat(), "margin_used": 3146.0,
+        "realized_today": 0.0, "fees_today": 0.0, "positions": []})
+    ctx2 = PaperContext(rec, "NIFTY", hub, "5")
+    ctx2.restore_state()
+    assert ctx2._margin_used == 0.0         # flat book restores clean

@@ -50,12 +50,18 @@ export default function App() {
     try {
       const data = await API.call('/strategies')
       setStrategies(data)
-      let alloc = 0, eq = 0, live = 0
+      let alloc = 0, live = 0
       data.forEach(s => {
         alloc += s.allocated_capital || 0
         if (s.state === 'RUNNING') live++
       })
-      setSummary({ alloc, equity: eq, growth: 0, live })
+      let equity = 0, growth = 0
+      try {
+        const pf = await API.call('/portfolio/today')
+        equity = pf.totals?.equity ?? 0
+        growth = pf.totals?.growth ?? 0
+      } catch (e) { /* summary cards degrade gracefully */ }
+      setSummary({ alloc, equity, growth, live })
     } catch (e) {
       showToast('Failed to load strategies')
     }

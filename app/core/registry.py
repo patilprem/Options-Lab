@@ -228,6 +228,27 @@ def save_paper_day(strategy_id: str, trade_date: str, realized: float,
     save_day(strategy_id, "PAPER", trade_date, realized, unrealized, fees, equity_eod)
 
 
+def prev_equity(strategy_id: str, before_date: str,
+                mode: str = "PAPER") -> Optional[float]:
+    """Last equity_eod strictly before `before_date` (None on day 1)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT equity_eod FROM daily_pnl WHERE strategy_id=? AND mode=? "
+            "AND trade_date<? ORDER BY trade_date DESC LIMIT 1",
+            (strategy_id, mode.upper(), before_date)).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def cum_pnl(strategy_id: str, mode: str = "PAPER") -> float:
+    """Lifetime realized P&L (net of fees) across all daily rows."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(SUM(realized), 0) FROM daily_pnl "
+            "WHERE strategy_id=? AND mode=?",
+            (strategy_id, mode.upper())).fetchone()
+    return row[0] or 0.0
+
+
 def performance_rows(strategy_id: str, mode: str = "PAPER") -> list[dict]:
     with _conn() as c:
         rows = c.execute(

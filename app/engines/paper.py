@@ -716,6 +716,11 @@ class PaperContext(Context):
         self._realized_today += p.realized_pnl
         self.closed_today.append(p)
         self._open.remove(p)
+        # release the closed leg's margin share (all released when flat —
+        # a stuck _margin_used survived restarts via the state snapshot)
+        self._margin_used = max(0.0, self._margin_used - (p.margin_blocked or 0.0))
+        if not self._open:
+            self._margin_used = 0.0
         self._blotter(p, action.value, p.exit_price, fees, 0.0, reason)
         self.persist_state()  # M4: durable on every close
 
@@ -749,6 +754,8 @@ class PaperContext(Context):
             return 0
         self._open = [_pos_from_dict(d) for d in snap.get("positions", [])]
         self._margin_used = snap.get("margin_used", 0.0)
+        if not self._open:
+            self._margin_used = 0.0   # flat book: never restore stuck margin
         self._realized_today = snap.get("realized_today", 0.0)
         self._fees_today = snap.get("fees_today", 0.0)
         self._day = date.fromisoformat(snap["date"])   # counters belong to this day
@@ -767,11 +774,17 @@ class PaperContext(Context):
         if not self._bars:
             return
         unreal = sum(p.unrealized_pnl for p in self.positions)
+        day = self.now.date().isoformat()
+        # equity chains from the previous session's close (falls back to
+        # allocated capital on day 1) — else the curve forgets every past day
+        base = registry.prev_equity(self.rec.id, day, "PAPER")
+        if base is None:
+            base = self.rec.allocated_capital
         registry.save_paper_day(
-            self.rec.id, self.now.date().isoformat(),
+            self.rec.id, day,
             round(self._realized_today, 2), round(unreal, 2),
             round(self._fees_today, 2),
-            round(self.rec.allocated_capital + self._realized_today + unreal, 2))
+            round(base + self._realized_today + unreal, 2))
         self.persist_state()
 
 

@@ -567,11 +567,28 @@ def portfolio_today():
             "open_positions": len(open_rows), "trades_today": len(t_rows),
         })
     trades.sort(key=lambda t: t.get("ts", ""))
+    # Portfolio equity: EVERY strategy's allocation + its lifetime realized
+    # P&L (daily rows carry today's realized too once written), plus live
+    # unrealized on open positions. Spans all strategies incl. stopped ones
+    # so past losses never vanish from the equity card.
+    equity = 0.0
+    alloc_all = 0.0
+    for rec in registry.list_all():
+        cap_i = rec.allocated_capital or 0.0
+        if cap_i <= 0:
+            continue
+        alloc_all += cap_i
+        equity += cap_i + registry.cum_pnl(rec.id, "PAPER")
+    equity += sum(p["unrealized"] for p in positions)
+    trades_sorted = trades
     return {
         "date": today,
         "mode": "PAPER",
         "totals": {
             "allocated_capital": round(total_alloc, 2),
+            "allocated_capital_all": round(alloc_all, 2),
+            "equity": round(equity, 2),
+            "growth": round(equity - alloc_all, 2),
             "day_pnl": round(total_day, 2),
             "day_roi_pct": round(100 * total_day / total_alloc, 2) if total_alloc > 0 else 0.0,
             "margin_used": round(total_margin, 2),
