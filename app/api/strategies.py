@@ -531,7 +531,11 @@ def portfolio_today():
                           if r["trade_date"] == today), None)
         if not deployed and ctx is None and not t_rows and not today_row:
             continue
-        if ctx:
+        # ctx.day_pnl rolls on the FIRST BAR of a new session, so pre-open it
+        # still carries yesterday's total — only trust it once the engine's
+        # clock is actually on today (else the dashboard shows yesterday's
+        # P&L under today's date until 09:15).
+        if ctx and ctx.now.date().isoformat() == today:
             day_pnl = round(ctx.day_pnl, 2)
         elif today_row:
             day_pnl = round((today_row["realized"] or 0.0) + (today_row["unrealized"] or 0.0), 2)
