@@ -180,3 +180,60 @@ def test_instruments_include_mcx_chain_names_segment_aware(tmp_path, monkeypatch
     assert (P._FEED_MCX, "428414", P._FEED_TICKER) in inst
     assert hub._sec_to_underlying()[428414] == "CRUDEOIL"
     assert hub._watch_segments() == {"NSE", "MCX"}
+
+
+def test_stalled_socket_forces_reconnect(monkeypatch):
+    """Zombie-socket regression (2026-07-15): connected=true but no packets
+    for 3h during MCX hours. A read that produces nothing for STALL_S during
+    market hours must tear down and reconnect, not wait forever."""
+    import sys
+    import types
+    from app.engines.feed import LiveFeed
+
+    connects = []
+
+    class FakeFeed:
+        def __init__(self, ctx, instruments, version):
+            connects.append(instruments)
+
+        async def connect(self):
+            return None
+
+        async def get_instrument_data(self):
+            await asyncio.sleep(3600)   # silent forever — the zombie
+
+        def _is_ws_closed(self):
+            return False
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "dhanhq",
+                        types.SimpleNamespace(MarketFeed=FakeFeed))
+
+    events = []
+    lf = LiveFeed(context_factory=lambda: None,
+                  instruments=lambda: [(0, "13", 15)],
+                  sec_to_underlying=lambda: {13: "NIFTY"},
+                  on_tick=lambda *a: None,
+                  on_event=lambda lvl, msg: events.append((lvl, msg)),
+                  watch_open=lambda: True)          # market open -> stall = dead
+    lf.STALL_S = 0.05
+    lf._running = True
+
+    async def run():
+        task = asyncio.get_running_loop().create_task(lf._driver())
+        for _ in range(200):                        # wait for 2nd connect
+            if len(connects) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        lf._running = False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    asyncio.run(run())
+
+    assert len(connects) >= 2, "stalled socket must reconnect"
+    assert any("socket presumed dead" in m for _, m in events)

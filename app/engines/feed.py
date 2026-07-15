@@ -99,16 +99,21 @@ class LiveFeed:
     on_event(level, message) mirrors registry.record_event for feed lifecycle.
     """
 
+    STALL_S = 120       # no packets this long DURING market hours = dead socket
+    IDLE_POLL_S = 600   # off-hours: wake periodically to re-check the clock
+
     def __init__(self, context_factory: Callable[[], object],
                  instruments: Callable[[], list],
                  sec_to_underlying: Callable[[], dict],
                  on_tick: Callable[[str, float, datetime], None],
-                 on_event: Callable[[str, str], None]):
+                 on_event: Callable[[str, str], None],
+                 watch_open: Optional[Callable[[], bool]] = None):
         self._context_factory = context_factory
         self._instruments = instruments
         self._sec_to_underlying = sec_to_underlying
         self._on_tick = on_tick
         self._on_event = on_event
+        self._watch_open = watch_open   # 'should packets be flowing right now?'
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._app_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -166,7 +171,22 @@ class LiveFeed:
                 self._event("info", f"live feed connected: {', '.join(map(str, names))}")
                 backoff = 1
                 while self._running and not feed._is_ws_closed():
-                    pkt = await feed.get_instrument_data()
+                    # A half-open TCP socket dies SILENTLY: recv blocks
+                    # forever, no error, 'connected' forever true (observed
+                    # 2026-07-15: last tick 18:32, silence for 3h while MCX
+                    # traded). Bound every read; silence during market hours
+                    # means the socket is dead -> force a reconnect.
+                    open_now = self._watch_open() if self._watch_open else True
+                    try:
+                        pkt = await asyncio.wait_for(
+                            feed.get_instrument_data(),
+                            timeout=self.STALL_S if open_now else self.IDLE_POLL_S)
+                    except asyncio.TimeoutError:
+                        if open_now:
+                            raise RuntimeError(
+                                f"no packets for {self.STALL_S}s during market "
+                                "hours — socket presumed dead")
+                        continue    # off-hours lull is normal; keep listening
                     self._handle_packet(pkt)
             except Exception as e:  # network/auth/parse — reconnect
                 self._event("warn", f"live feed error: {e!r}")

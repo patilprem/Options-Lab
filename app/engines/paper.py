@@ -225,12 +225,16 @@ class MarketHub:
         else:
             from app.data import dhan_client
             loop = asyncio.get_running_loop()
+            from app.engines.watchdog import session_open_for
             self._livefeed = LiveFeed(
                 context_factory=dhan_client.get_dhan_context,
                 instruments=self._instruments,
                 sec_to_underlying=self._sec_to_underlying,
                 on_tick=self._on_tick,
-                on_event=lambda lvl, msg: registry.record_event(lvl, "feed", msg))
+                on_event=lambda lvl, msg: registry.record_event(lvl, "feed", msg),
+                watch_open=lambda: session_open_for(
+                    self._watch_segments(),
+                    datetime.now(IST).replace(tzinfo=None), grace_min=10))
             self._livefeed.start(loop)
             self._tasks.append(asyncio.create_task(self._eod_clock()))
             self._tasks.append(asyncio.create_task(self._chain_poll_loop()))
