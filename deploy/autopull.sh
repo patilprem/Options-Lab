@@ -34,11 +34,20 @@ main() {
     return 0
   fi
 
-  local now dow hm
+  local now dow hm force
   now=$(TZ=Asia/Kolkata date +%u%H%M)   # e.g. 21012 = Tue 10:12
   dow=${now:0:1}
   hm=$((10#${now:1}))
-  if [ "${FORCE:-0}" != "1" ] && [ "$dow" -le 5 ] \
+  force="${FORCE:-0}"
+  # An incoming commit tagged [force-deploy] overrides the market-hours
+  # deferral — urgent fixes go live within one timer tick with no human on
+  # the VPS. The offline test suite in deploy.sh still gates the restart.
+  if [ "$force" != "1" ] && git log "${local_sha}..origin/${BRANCH}" \
+      --format=%B 2>/dev/null | grep -q "\[force-deploy\]"; then
+    echo "[autopull] incoming [force-deploy] marker — overriding market-hours deferral"
+    force=1
+  fi
+  if [ "$force" != "1" ] && [ "$dow" -le 5 ] \
       && [ "$hm" -ge 900 ] && [ "$hm" -le 1535 ]; then
     echo "[autopull] ${local_sha:0:7} -> ${remote_sha:0:7} available but it is" \
          "IST market hours — deferring (FORCE=1 bash deploy/autopull.sh to override)"

@@ -24,8 +24,10 @@ user; runs on a small VPS behind Tailscale.
 deploy/install_autopull.sh): every 5 min it fetches origin/main and, when it
 changed, redeploys via deploy/deploy.sh (deps + UI build + offline tests gate
 the restart). Restarts are deferred during IST market hours (Mon–Fri
-09:00–15:35); `FORCE=1 bash deploy/autopull.sh` overrides. So: land changes on
-`main` only when they should go live at the next off-hours window.
+09:00–15:35); `FORCE=1 bash deploy/autopull.sh` overrides, and a commit
+message containing `[force-deploy]` overrides remotely (tests still gate the
+restart). So: ordinary changes land on `main` and go live at the next
+off-hours window; genuinely urgent fixes get the marker.
 
 ## Run / test
 - **Backend:** `python3 -m venv venv && venv/bin/pip install -r requirements.txt && venv/bin/uvicorn app.main:app --reload` → API at `http://localhost:8000/docs`
