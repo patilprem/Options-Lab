@@ -140,11 +140,56 @@ async def _spot_bar_recorder():
         except Exception as e:
             registry.record_event("warn", "feed", f"spot recorder error: {e!r}")
 
+async def _nightly_gap_repair():
+    """Self-healing dataset: every weekday at 16:10 IST, re-backfill the
+    trailing week for the NSE record list. The chunk ledger makes this
+    cheap — completed chunks are skipped, so only holes (restart windows,
+    incident days like 2026-07-13's frozen chain, expired-option data that
+    only becomes available after expiry) are actually fetched. Research
+    data should not depend on a human remembering to patch it."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz, date as _date
+    from app.data.dhan_client import UNDERLYINGS, MCX_DYNAMIC
+    ist = _tz(_td(hours=5, minutes=30))
+    while True:
+        now = _dt.now(ist)
+        target = now.replace(hour=16, minute=10, second=0, microsecond=0)
+        if now >= target:
+            target += _td(days=1)
+        while target.weekday() >= 5:          # skip weekends
+            target += _td(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        if registry.setting("gap_repair", "on") != "on":
+            continue
+        if not hasattr(hub.store, "con"):
+            continue                          # synthetic store
+        if registry.get_backfill_status().get("running"):
+            registry.record_event("info", "data",
+                                  "gap repair skipped: a backfill is running")
+            continue
+        end = _date.today()
+        start = end - _td(days=7)
+        names = [u for u in _record_list()
+                 if u in UNDERLYINGS and u not in MCX_DYNAMIC]  # NSE/BSE only
+        for u in names:
+            try:
+                from app.data import backfill_job
+                view = type("V", (), {"con": hub.store.con.cursor()})()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda u=u: backfill_job.run(
+                    u, start, end, strike_offsets=2, interval=5, store=view))
+                registry.record_event("info", "data",
+                                      f"gap repair: {u} {start} .. {end} done")
+            except Exception as e:
+                registry.record_event("warn", "data",
+                                      f"gap repair failed [{u}]: {e!r}")
+
+
 @app.on_event("startup")
 async def startup_event():
     token_task = asyncio.create_task(token_manager.daily_refresh_loop())
     rec_task = asyncio.create_task(_market_recorder())
     spot_task = asyncio.create_task(_spot_bar_recorder())
+    repair_task = asyncio.create_task(_nightly_gap_repair())
     registry.record_event("info", "engine", "OptionsLab started")
     # M4: recover any paper strategies that were live before a restart.
     try:
