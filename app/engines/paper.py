@@ -149,7 +149,14 @@ class MarketHub:
         """Poll `underlying`'s option chain for snapshots even without a
         deployed strategy (used by the MCX recorder). Requires the hub to be
         started and `underlying` present in dhan_client.UNDERLYINGS."""
+        first_time = underlying not in self._chain_only
         self._chain_only.add(underlying)
+        # a name added AFTER the socket connected needs a resubscribe, same
+        # as register() — else the WS carries the old instrument list until
+        # some unrelated reconnect (observed: MCX canary missing post-boot)
+        if (self._started and self._livefeed and first_time
+                and underlying in UNDERLYINGS):
+            self._livefeed.refresh()
 
     def feed_status(self) -> dict:
         """Health surface for the dashboard's Feed pill: driver mode, socket

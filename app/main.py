@@ -78,8 +78,10 @@ async def _market_recorder():
     ticks don't restamp stale prices. Needs a real DataStore + valid token;
     MCX names also need MCX security ids in dhan_client.UNDERLYINGS."""
     loop = asyncio.get_running_loop()
-    while True:
-        await asyncio.sleep(300)
+    delay = 15    # first pass right after boot: registers MCX names with the
+    while True:   # feed (canary + recorder) instead of waiting out a full tick
+        await asyncio.sleep(delay)
+        delay = 300
         if registry.setting("recording", "on") != "on":
             continue
         store = hub.store

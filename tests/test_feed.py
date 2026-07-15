@@ -237,3 +237,26 @@ def test_stalled_socket_forces_reconnect(monkeypatch):
 
     assert len(connects) >= 2, "stalled socket must reconnect"
     assert any("socket presumed dead" in m for _, m in events)
+
+
+def test_enable_chain_resubscribes_live_socket(tmp_path, monkeypatch):
+    """An MCX name enabled AFTER the WS connected must force a resubscribe
+    (observed 2026-07-15: canary missing until an unrelated reconnect)."""
+    from app.core import registry
+    from app.data.store import SyntheticStore
+    from app.data import dhan_client as dc
+    from app.engines import paper as P
+
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "t.db")
+    registry.init_db()
+    monkeypatch.setitem(dc.UNDERLYINGS, "CRUDEOIL",
+                        {"security_id": 428414, "segment": "MCX_COMM",
+                         "fno_segment": "MCX_COMM", "instrument": "OPTFUT"})
+    hub = P.MarketHub(SyntheticStore())
+    refreshes = []
+    hub._started = True
+    hub._livefeed = type("F", (), {"refresh": lambda self: refreshes.append(1)})()
+    hub.enable_chain("CRUDEOIL")
+    hub.enable_chain("CRUDEOIL")          # idempotent: no second refresh
+    hub.enable_chain("NOSUCHNAME")        # not in UNDERLYINGS: no refresh
+    assert refreshes == [1]
