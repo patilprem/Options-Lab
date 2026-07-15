@@ -157,3 +157,26 @@ def test_hub_feed_status_off_then_synthetic(tmp_path, monkeypatch):
         assert st["mode"] == "synthetic" and st["connected"] is True
         await hub.stop()
     asyncio.run(run())
+
+
+def test_instruments_include_mcx_chain_names_segment_aware(tmp_path, monkeypatch):
+    """Chain-only MCX names ride the WS as commodity-segment instruments
+    (the 09:00 feed canary); index underlyings stay on the IDX segment."""
+    from app.core import registry
+    from app.data.store import SyntheticStore
+    from app.data import dhan_client as dc
+    from app.engines import paper as P
+
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "t.db")
+    registry.init_db()
+    monkeypatch.setitem(dc.UNDERLYINGS, "CRUDEOIL",
+                        {"security_id": 428414, "segment": "MCX_COMM",
+                         "fno_segment": "MCX_COMM", "instrument": "OPTFUT"})
+    hub = P.MarketHub(SyntheticStore())
+    hub.register("NIFTY", 5)
+    hub.enable_chain("CRUDEOIL")
+    inst = sorted(hub._instruments())
+    assert (P._FEED_IDX, "13", P._FEED_TICKER) in inst
+    assert (P._FEED_MCX, "428414", P._FEED_TICKER) in inst
+    assert hub._sec_to_underlying()[428414] == "CRUDEOIL"
+    assert hub._watch_segments() == {"NSE", "MCX"}

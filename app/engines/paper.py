@@ -45,6 +45,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # MarketFeed subscription constants (avoid importing the SDK at module load).
 _FEED_IDX = 0      # MarketFeed.IDX  — index spot segment
+_FEED_MCX = 5      # MarketFeed.MCX  — commodity segment (FUTCOM contracts)
 _FEED_TICKER = 15  # MarketFeed.Ticker — LTP-only packets (enough for candles)
 
 
@@ -171,14 +172,14 @@ class MarketHub:
                 "segments": sorted(self._watch_segments())}
 
     def _watch_segments(self) -> set[str]:
-        """Exchanges whose sessions the watchdog should police — derived from
-        the WS-subscribed underlyings only (chain-only MCX recording produces
-        no spot ticks, so it must not trigger quiet alerts)."""
+        """Exchanges whose sessions the watchdog/pill should judge — all
+        WS-subscribed underlyings, incl. chain-only MCX names (their futures
+        tick 09:00-23:30, so they legitimately extend the watched window)."""
         segs = set()
-        for u in self._wanted:
+        for u in set(self._wanted) | self._chain_only:
             cfg = UNDERLYINGS.get(u)
             if cfg:
-                segs.add("MCX" if "MCX" in str(cfg.get("fno_segment", "")) else "NSE")
+                segs.add("MCX" if "MCX" in str(cfg.get("segment", "")) else "NSE")
         return segs
 
     async def _watchdog_loop(self) -> None:
@@ -245,15 +246,22 @@ class MarketHub:
 
     # -- live wiring ---------------------------------------------------------
     def _instruments(self) -> list:
+        """Everything the WS should carry: strategy underlyings (index spot)
+        plus chain-only MCX names (their FUTCOM future ticks 09:00-23:30 —
+        both the recorder's spot reference and the feed's early-morning
+        canary: proof the pipe is alive 15 min before equity opens)."""
         out = []
-        for u in self._wanted:
+        for u in set(self._wanted) | self._chain_only:
             cfg = UNDERLYINGS.get(u)
             if cfg:
-                out.append((_FEED_IDX, str(cfg["security_id"]), _FEED_TICKER))
+                seg = _FEED_MCX if cfg.get("segment") == "MCX_COMM" else _FEED_IDX
+                out.append((seg, str(cfg["security_id"]), _FEED_TICKER))
         return out
 
     def _sec_to_underlying(self) -> dict:
-        return {UNDERLYINGS[u]["security_id"]: u for u in self._wanted if u in UNDERLYINGS}
+        return {UNDERLYINGS[u]["security_id"]: u
+                for u in set(self._wanted) | self._chain_only
+                if u in UNDERLYINGS}
 
     def _emit(self, msg: tuple) -> None:
         for q in self.subscribers:
