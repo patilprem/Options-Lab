@@ -43,6 +43,8 @@ hub = MarketHub(_store)
 runner = PaperRunner(hub)
 live_runner = LiveRunner(hub)   # M8: LIVE ledgers only; paper is untouched
 scanner_engine = StockScanner(_store)   # F2/F3 FNO stock scanner (shared store)
+from app.engines import signals as _signals
+_signals.register(scanner_engine)       # F6: ctx.signal() reads from the scanner
 
 
 class CreateReq(BaseModel):
@@ -1025,6 +1027,54 @@ def scanner_index_bias():
                          if hasattr(_store, "index_bias_accuracy") else []),
         }
     return out
+
+
+@scanner_router.get("/scanner/validation")
+def scanner_validation(days: int = 21, horizon_min: int = 30):
+    """Measured forward-return hit-rate of flagged setups over the last `days`,
+    bucketed by score band — the evidence the scanner must earn BEFORE any
+    signal is traded. Empty until enough sessions are recorded."""
+    from datetime import date as _date, timedelta as _td
+    since = _date.today() - _td(days=max(1, days))
+    return scanner_engine.validate(since, horizon_min)
+
+
+@scanner_router.post("/scanner/backfill/{symbol}")
+def scanner_backfill(symbol: str, days: int = 30):
+    """On-demand expired-options backfill for ONE flagged stock (full-universe
+    options backfill is prohibitively slow — F6 backfills only flagged names).
+    Kicks a background thread; needs live creds + a real store."""
+    symbol = symbol.upper()
+    if not hasattr(_store, "con"):
+        raise HTTPException(400, "backfill needs a real DataStore")
+
+    import threading
+    from datetime import date as _date, timedelta as _td
+
+    def _job():
+        try:
+            from app.data import dhan_client
+            uni = dhan_client.resolve_fno_universe(store=_store)
+            u = uni.get(symbol)
+            if not u or u.get("spot_security_id") is None:
+                registry.record_event("warn", "scanner",
+                                      f"backfill: {symbol} not in FNO universe")
+                return
+            dhan_client.UNDERLYINGS[symbol] = {
+                "security_id": int(u["spot_security_id"]), "segment": "NSE_EQ",
+                "fno_segment": u.get("fno_segment", "NSE_FNO"), "instrument": "OPTSTK"}
+            end = _date.today()
+            start = end - _td(days=max(1, days))
+            view = type("V", (), {"con": _store.con.cursor()})()
+            dhan_client.backfill(symbol, start, end, strike_offsets=range(-3, 4),
+                                 interval=5, expiry_flag="MONTH", store=view)
+            registry.record_event("info", "scanner",
+                                  f"backfill {symbol} {start}..{end} done")
+        except Exception as e:
+            registry.record_event("warn", "scanner", f"backfill {symbol} failed: {e!r}")
+
+    threading.Thread(target=_job, daemon=True).start()
+    return {"status": "started", "symbol": symbol, "days": days}
 
 
 @scanner_router.get("/scanner/{symbol}")

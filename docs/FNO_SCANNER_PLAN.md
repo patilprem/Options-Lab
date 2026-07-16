@@ -4,6 +4,24 @@ Goal: pull options / OI / volume / price data for the ~190 NSE FNO stocks,
 scan for good **options-buying setups**, and aggregate the same data into a
 **NIFTY / BANKNIFTY directional bias** signal.
 
+## Implementation status (F1–F6 built)
+
+All six phases are implemented on `claude/fno-options-data-plan-ggr16e`, gated
+OFF by default (`scanner` setting) — inert until turned on with live Dhan creds
+on the VPS during market hours. Offline unit tests cover every pure layer
+(universe parse, buildup/volume, ranking, chain metrics, scoring, index bias +
+accuracy, hit-rate, signal routing). Still pending real-market verification on
+the VPS: quote-API batch limits/quotas, chain-gate contention under the full
+shortlist, and the on-demand expired-options backfill for flagged names.
+
+- **F1** `resolve_fno_universe()` + dated `fno_universe` table
+- **F2** `app/engines/scanner.py` Tier-1 sweep + `stock_snapshots`
+- **F3** Tier-2 shortlist deep-dive via the shared chain gate (deployed-first)
+- **F4** `setup_score()` + `/scanner*` endpoints + Scanner UI
+- **F5** `index_bias()` + accuracy scoring + `/scanner/index-bias` + bias cards
+- **F6** `ctx.signal()` in all contexts + provider + `/scanner/validation` +
+  on-demand backfill; example `examples/index_momentum_with_bias.py`
+
 ## Verdict: feasible on the current stack
 
 The VPS, FastAPI+asyncio process, and DuckDB are NOT the constraint — Dhan's

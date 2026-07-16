@@ -63,14 +63,18 @@ export default function ScannerView({ showToast }) {
   const [expanded, setExpanded] = useState(null)   // symbol whose detail is open
   const [detail, setDetail] = useState(null)
 
+  const [valid, setValid] = useState(null)
+
   const load = useCallback(async () => {
     try {
-      const [d, b] = await Promise.all([
+      const [d, b, v] = await Promise.all([
         fetch('/scanner').then(r => r.json()),
         fetch('/scanner/index-bias').then(r => r.json()).catch(() => null),
+        fetch('/scanner/validation').then(r => r.json()).catch(() => null),
       ])
       setData(d)
       setBias(b)
+      setValid(v)
     } catch { showToast && showToast('Failed to load scanner') }
   }, [showToast])
 
@@ -127,6 +131,18 @@ export default function ScannerView({ showToast }) {
       {bias && (
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
           {Object.keys(bias).map(name => <BiasCard key={name} name={name} bias={bias[name]} />)}
+        </div>
+      )}
+
+      {/* validation: measured forward-return hit-rate of flagged setups */}
+      {valid?.overall?.n > 0 && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)', border: '1px solid var(--line)', borderRadius: 8, padding: '8px 12px' }}>
+          <b style={{ color: 'var(--ink)' }}>Validation</b> · {valid.overall.n} flagged setups @ {valid.horizon_min}min ·
+          hit-rate {valid.overall.hit_rate == null ? '—' : Math.round(valid.overall.hit_rate * 100) + '%'} ·
+          avg {valid.overall.avg_return_pct == null ? '—' : valid.overall.avg_return_pct + '%'}
+          {valid.by_score?.['70-100']?.n > 0 && (
+            <span> · high-score band {Math.round((valid.by_score['70-100'].hit_rate || 0) * 100)}% ({valid.by_score['70-100'].n})</span>
+          )}
         </div>
       )}
 

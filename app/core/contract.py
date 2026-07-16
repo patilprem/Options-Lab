@@ -165,6 +165,20 @@ class Context(abc.ABC):
     def history(self, n: int) -> list[Bar]:
         """Last n underlying bars, oldest first."""
 
+    def signal(self, name: str) -> Optional[dict]:
+        """Live FNO-scanner read for THIS strategy's underlying (F6), or None.
+
+        Names: "index_bias" (NIFTY/BANKNIFTY constituent-weighted bias),
+        "setup" (this name's composite setup score), "tier1" (buildup / volume
+        surge / price change), "tier2" (chain PCR / IV / skew / liquidity).
+
+        LIVE-ONLY by design: paper and live contexts return the current read;
+        the backtest context ALWAYS returns None — the scanner reflects the
+        market now and has no historical series to replay, so strategies must
+        treat a None signal as "unknown" and never depend on one to trade.
+        Default here is None so a context without scanner wiring is safe."""
+        return None
+
     # ---- portfolio -------------------------------------------------------
     @property
     @abc.abstractmethod

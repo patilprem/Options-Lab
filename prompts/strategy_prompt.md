@@ -49,7 +49,16 @@ Read:  `ctx.now`, `ctx.spot`, `ctx.history(n) -> list[Bar]`,
         — greeks may be None in backtests),
        `ctx.positions -> list[Position]` (only YOUR open positions;
         Position has entry_price, mtm_price, unrealized_pnl, tag, id),
-       `ctx.allocated_capital`, `ctx.available_capital`, `ctx.day_pnl`.
+       `ctx.allocated_capital`, `ctx.available_capital`, `ctx.day_pnl`,
+       `ctx.signal(name) -> dict | None` — LIVE FNO-scanner read for your
+        underlying. Names: "index_bias" (NIFTY/BANKNIFTY weighted breadth,
+        dict has score in [-1,1] + label), "setup" (this name's composite
+        setup score + bias CE/PE), "tier1" (buildup / volume_surge /
+        price_change_pct), "tier2" (chain pcr_oi / atm_iv / iv_skew /
+        liquidity). LIVE/PAPER ONLY — it returns None in every backtest (the
+        scanner is a now-signal with no history to replay), so use it ONLY as
+        an optional filter and always handle None; never make a trade depend
+        on it if you want the strategy to be backtestable.
 
 Act:   `ctx.enter(legs, tag="", sl_pct=None, target_pct=None) -> bool`
        (multi-leg atomic; returns False if paused / not enough capital;

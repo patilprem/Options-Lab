@@ -118,6 +118,7 @@ class _SmokeContext(C.Context):
                              0.5, -5.0, 10.0, 0.001)
 
     def history(self, n): return self._bars[-n:]
+    def signal(self, name): return None   # no scanner in the smoke harness (F6)
     @property
     def positions(self): return []
     @property

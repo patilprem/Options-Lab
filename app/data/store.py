@@ -101,6 +101,15 @@ CREATE TABLE IF NOT EXISTS index_bias_accuracy (
     n INTEGER, hits INTEGER, hit_rate DOUBLE, avg_forward_move DOUBLE,
     PRIMARY KEY (day, index_name, horizon_min)
 );
+-- Setup flags (F6 validation): every above-threshold scored setup, with the
+-- bias-side ATM premium at flag time, so forward option returns (did buying it
+-- pay?) can be measured against later chain_snapshots. This is how the scanner
+-- earns trust BEFORE any capital — measured hit-rate, not a faked backtest.
+CREATE TABLE IF NOT EXISTS setup_flags (
+    ts TIMESTAMP, symbol VARCHAR,
+    bias VARCHAR, score DOUBLE, spot DOUBLE, atm_premium DOUBLE,
+    PRIMARY KEY (ts, symbol)
+);
 """
 
 
@@ -485,6 +494,36 @@ class DataStore:
                WHERE underlying=? AND CAST(ts AS DATE)=CAST(? AS DATE)
                ORDER BY ts""", [underlying, str(day)])
 
+    # -- Setup flags / validation (F6) ---------------------------------------
+    def record_setup_flag(self, ts, symbol: str, bias: str, score: float,
+                          spot, atm_premium) -> None:
+        with self._lock:
+            self.con.execute(
+                "INSERT OR REPLACE INTO setup_flags VALUES (?,?,?,?,?,?)",
+                [ts, symbol, bias, score, spot, atm_premium])
+
+    def setup_flags_since(self, since_day) -> list[dict]:
+        rows = self._q(
+            """SELECT ts, symbol, bias, score, spot, atm_premium
+               FROM setup_flags WHERE CAST(ts AS DATE) >= CAST(? AS DATE)
+               ORDER BY ts""", [str(since_day)])
+        cols = ("ts", "symbol", "bias", "score", "spot", "atm_premium")
+        return [dict(zip(cols, r)) for r in rows]
+
+    def atm_premium_at(self, symbol: str, ts, side: str, window_min: int = 20):
+        """LTP of the ~ATM option (`side` = CALL/PUT) for `symbol` at the
+        chain snapshot nearest `ts` within `window_min`. Backs forward-return
+        scoring of a flagged setup. None if nothing recorded near then."""
+        row = self._q1(
+            """SELECT ltp FROM chain_snapshots
+               WHERE underlying=? AND option_type=?
+                 AND ts BETWEEN ? - INTERVAL (? || ' minutes')
+                             AND ? + INTERVAL (? || ' minutes')
+               ORDER BY abs(strike_offset),
+                        abs(date_diff('second', ts, ?)) LIMIT 1""",
+            [symbol, side, ts, str(window_min), ts, str(window_min), ts])
+        return row[0] if row and row[0] is not None else None
+
     def recording_status(self) -> list[dict]:
         """Per-underlying live-recording counters for the Data tab: what's been
         captured today (IST) in chain_snapshots + live spot bars."""
@@ -587,6 +626,9 @@ SyntheticStore.upsert_index_bias = lambda self, ts, name, bias: None
 SyntheticStore.recent_index_bias = lambda self, name, limit=60: []
 SyntheticStore.index_bias_accuracy = lambda self, name, limit=30: []
 SyntheticStore.latest_spot = lambda self, u, day=None: None
+SyntheticStore.record_setup_flag = lambda self, ts, s, b, sc, sp, ap: None
+SyntheticStore.setup_flags_since = lambda self, since_day: []
+SyntheticStore.atm_premium_at = lambda self, s, ts, side, window_min=20: None
 
 
 def get_store(prefer_real: bool = True):

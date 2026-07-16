@@ -362,6 +362,38 @@ def setup_score(t1: dict, t2: dict | None = None) -> dict:
             "deep_dived": bool(t2)}
 
 
+def hitrate_stats(rows: list[dict]) -> dict:
+    """Forward-return hit-rate of flagged setups (F6 validation). Each row:
+    {score, entry, exit} — entry/exit are the bias-side ATM premiums at flag
+    time and at the horizon. A 'hit' is exit > entry (buying the option paid).
+    Bucketed by score band so we can see whether higher scores actually predict
+    better outcomes. Pure — the store/job assembles rows; a test feeds literals."""
+    buckets = {"70-100": [], "55-70": [], "40-55": [], "<40": []}
+
+    def _band(s):
+        return ("70-100" if s >= 70 else "55-70" if s >= 55
+                else "40-55" if s >= 40 else "<40")
+
+    usable = []
+    for r in rows:
+        e, x = r.get("entry"), r.get("exit")
+        if e in (None, 0) or x is None:
+            continue
+        ret = (x - e) / e * 100.0
+        usable.append(ret)
+        buckets[_band(r.get("score") or 0)].append(ret)
+
+    def _summ(rets):
+        n = len(rets)
+        hits = sum(1 for r in rets if r > 0)
+        return {"n": n, "hits": hits,
+                "hit_rate": round(hits / n, 3) if n else None,
+                "avg_return_pct": round(sum(rets) / n, 2) if n else None}
+
+    return {"overall": _summ(usable),
+            "by_score": {k: _summ(v) for k, v in buckets.items()}}
+
+
 def alert_setup(symbol: str, scored: dict) -> None:
     """Push an ntfy alert + log a registry event for a high-scoring setup.
     Reuses the token-manager ntfy channel; best-effort, never raises."""
@@ -686,12 +718,21 @@ class StockScanner:
             threshold = float(registry.setting("scanner_alert_score", "70"))
         except (TypeError, ValueError):
             threshold = 70.0
+        try:
+            flag_at = float(registry.setting("scanner_flag_score", "55"))
+        except (TypeError, ValueError):
+            flag_at = 55.0
         today = datetime.now(IST).date().isoformat()
+        ts_now = datetime.now(IST).replace(tzinfo=None)
         for d in self.shortlist:
             sym = d["symbol"]
             sc = setup_score(self.metrics.get(sym, {"symbol": sym}),
                              self.tier2.get(sym))
             self.scores[sym] = sc
+            # record every above-flag setup with its entry premium so its
+            # forward return can be measured later (validation, not trading).
+            if sc["score"] >= flag_at and sc.get("bias"):
+                self._record_flag(hub, sym, sc, ts_now)
             if sc["score"] >= threshold and self._alerted.get(sym) != today:
                 self._alerted[sym] = today
                 alert_setup(sym, sc)
@@ -723,6 +764,54 @@ class StockScanner:
             "tier2": self.tier2.get(symbol),
             "universe": self._universe.get(symbol),
         }
+
+    def _record_flag(self, hub, sym: str, sc: dict, ts) -> None:
+        """Persist a flagged setup + the bias-side ATM premium at flag time."""
+        side = "CALL" if sc.get("bias") == "CE" else "PUT"
+        cache = hub._chain_cache.get(sym) or {}
+        entry = None
+        for (kind, off, soff, otype), q in cache.items():
+            if soff == 0 and otype == side:
+                entry = q.ltp
+                break
+        try:
+            self.store.record_setup_flag(
+                ts, sym, sc.get("bias"), sc.get("score"),
+                self.metrics.get(sym, {}).get("spot"), entry)
+        except Exception:
+            pass
+
+    def validate(self, since_day, horizon_min: int = 30) -> dict:
+        """Forward-return hit-rate of setups flagged since `since_day`. For each
+        flag, read the bias-side ATM premium `horizon_min` later from
+        chain_snapshots and compare to entry. Needs a real store."""
+        if not hasattr(self.store, "con"):
+            return {"overall": {"n": 0}, "by_score": {}, "horizon_min": horizon_min}
+        rows = []
+        for f in self.store.setup_flags_since(since_day):
+            entry = f.get("atm_premium")
+            if entry in (None, 0):
+                continue
+            side = "CALL" if f.get("bias") == "CE" else "PUT"
+            exit_ts = f["ts"] + timedelta(minutes=horizon_min)
+            exit_px = self.store.atm_premium_at(f["symbol"], exit_ts, side)
+            rows.append({"score": f.get("score"), "entry": entry, "exit": exit_px})
+        return {**hitrate_stats(rows), "horizon_min": horizon_min,
+                "flags": len(rows)}
+
+    # -- signal provider (F6): the door strategies reach via ctx.signal() -----
+    def signal_for(self, underlying: str, name: str):
+        """Current scanner read of `name` for `underlying`. Returns None when
+        unavailable so a strategy treats it as 'unknown'."""
+        if name == "index_bias":
+            return self.index_bias.get(underlying)
+        if name == "setup":
+            return self.scores.get(underlying)
+        if name in ("tier1", "metrics"):
+            return self.metrics.get(underlying)
+        if name in ("tier2", "chain"):
+            return self.tier2.get(underlying)
+        return None
 
     async def run_tier2(self, hub) -> None:
         """Long-lived Tier-2 loop: every TIER2_INTERVAL, re-rank and deep-dive

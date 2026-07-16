@@ -638,6 +638,11 @@ class PaperContext(Context):
     def history(self, n: int) -> list[Bar]:
         return self._bars[-n:]
 
+    def signal(self, name: str):
+        """Live FNO-scanner read for this underlying (F6)."""
+        from app.engines import signals
+        return signals.get_signal(self.underlying, name)
+
     @property
     def positions(self) -> list[Position]:
         return [p for p in self._open if p.is_open]

@@ -169,6 +169,13 @@ class BacktestContext(Context):
 
     def history(self, n: int) -> list[Bar]: return self._bars[-n:]
 
+    def signal(self, name: str):
+        """Always None in a backtest (F6): the FNO scanner is a live-time
+        engine with no historical intraday series to replay, so a backtest
+        must not pretend to have seen its signals. Strategies treat None as
+        'unknown' — see docs/FNO_SCANNER_PLAN 'Backtesting honesty'."""
+        return None
+
     @property
     def positions(self) -> list[Position]:
         return [p for p in self._positions if p.is_open]
