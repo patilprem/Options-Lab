@@ -1,0 +1,131 @@
+# FNO Stock Scanner — feasibility + plan
+
+Goal: pull options / OI / volume / price data for the ~190 NSE FNO stocks,
+scan for good **options-buying setups**, and aggregate the same data into a
+**NIFTY / BANKNIFTY directional bias** signal.
+
+## Verdict: feasible on the current stack
+
+The VPS, FastAPI+asyncio process, and DuckDB are NOT the constraint — Dhan's
+API rate limits are. Sized honestly:
+
+| Resource | Load | Verdict |
+|---|---|---|
+| CPU/RAM | ~190 quote rows/min parsed + DuckDB SQL aggregates | trivial |
+| Disk | ~5–15 MB/day of snapshots (see estimates below) | years of headroom |
+| Option Chain API | 1 unique req / 3 s (already globally gated in MarketHub) | **binding** — full-universe sweep = ~10 min |
+| Market Quote REST | batch quotes, ~1 req/s (`quote_data` in the SDK) | one call covers the whole universe |
+| WS feed | Dhan MarketFeed allows thousands of instruments/connection | plenty (verify exact cap in docs) |
+
+The trap to avoid: polling 190 option chains continuously. At 1 req/3 s a full
+sweep takes ~9.5 min and would starve the existing chain poller that paper
+fills depend on. The design below never does that.
+
+## Design: two-tier scanner
+
+**Tier 1 — broad & cheap (whole universe, every minute).**
+One batched Market Quote call for all FNO stock **futures** (+ spot) returns
+LTP, OHLC, volume, and futures OI for ~190 names in a single request.
+From consecutive snapshots compute, per stock:
+- price %change, range expansion, distance from day high/low
+- volume surge vs trailing N-day same-time-of-day baseline (DuckDB SQL)
+- futures OI delta → classic buildup classification:
+  price↑ OI↑ long buildup · price↓ OI↑ short buildup ·
+  price↑ OI↓ short covering · price↓ OI↓ long unwinding
+
+Rank and keep a **shortlist of ~10–20 movers**.
+
+**Tier 2 — deep & narrow (shortlist only, every ~5 min).**
+Poll the option chain ONLY for shortlisted stocks, through the existing
+`MarketHub._chain_gate` (3 s global spacing), with deployed-strategy
+underlyings taking priority in the queue. Per shortlisted stock derive:
+- PCR (OI + volume), ATM IV and IV percentile vs recorded history
+- strike-level OI concentration and intraday OI shift (support/resistance walls)
+- IV skew (call vs put wing), delta-adjusted option volume
+- **liquidity screen**: bid-ask spread % and OI floor — stock options outside
+  the top ~40 names are illiquid; a "great setup" you can't exit isn't one.
+
+**Setup score** (options-buying bias): e.g. long buildup + volume surge +
+rising ATM/OTM call OI with price confirming + IV not already spiked +
+spread below threshold → CE-buy candidate (mirror for PE). Scores land in an
+API endpoint + UI table + ntfy alert above a threshold.
+
+**Index bias (NIFTY / BANKNIFTY).**
+Aggregate Tier-1/Tier-2 signals into breadth metrics:
+- % of FNO universe (and of index constituents, weighted) in long vs short buildup
+- advance/decline + volume-weighted breadth of constituents
+- aggregate stock-level PCR and cumulative futures OI flow, sector-bucketed
+  (bank names → BANKNIFTY bias)
+→ a bias score with its inputs, recorded every cycle. Framed honestly: it is a
+**regime/bias indicator to be validated against recorded outcomes first**, not
+a prediction oracle. We record bias vs realized index move from day one so its
+hit-rate is measurable before anyone trades on it.
+
+## Daily API + storage budget
+
+- Tier 1: 1–2 batched quote calls/min ≈ 400–750 calls/day.
+- Tier 2: 15 chains × (1 req/3 s shared gate) = ~45 s per sweep, every 5 min.
+- Optional full-universe chain sweeps (~10 min each) 2–3× daily at fixed times
+  (post-open, mid-session, pre-close) for the EOD footprint dataset.
+- Storage: futures snapshots 190 × 375 min ≈ 71k rows/day; shortlist chain rows
+  ≈ 40–60k/day → single-digit MB/day in DuckDB. `chain_snapshots` schema
+  already fits stock chains as-is (underlying = stock symbol).
+
+## Phases (each sized for one focused session)
+
+### F1 — FNO universe + instrument master
+> Extend app/data/dhan_client.py with resolve_fno_universe(): from the cached
+> scrip master, build {symbol → spot security_id, current-month future id,
+> fno_segment, lot_size, expiry dates} for all NSE FNO stocks; cache like
+> resolve_mcx_ids does. Persist to a DuckDB `fno_universe` table (dated, so
+> lot-size history accumulates — same concern as LOT_HISTORY). Offline test
+> replays a trimmed scrip-master fixture.
+
+### F2 — Tier-1 bulk quote poller
+> New app/engines/scanner.py: an asyncio task (started like the chain poller)
+> that batch-fetches futures+spot quotes for the whole universe once a minute
+> via the SDK quote API, market-hours gated, persisting to a new
+> `stock_snapshots` DuckDB table. Pure functions for buildup classification and
+> volume-surge vs N-day baseline (DuckDB window SQL). Offline tests replay a
+> saved quote response. Verify actual batch-size/rate limits against Dhan docs
+> during implementation.
+
+### F3 — Tier-2 shortlist chain deep-dive
+> Shortlist ranker (pure) + chain polling for shortlisted stocks through the
+> EXISTING MarketHub chain gate with deployed underlyings prioritized — never
+> starve paper fills. Persist to chain_snapshots. Derive PCR/IV/OI-shift/skew
+> and the liquidity screen. Optional scheduled full-universe sweeps 2–3×/day.
+
+### F4 — Setup scoring + Scanner UI
+> Composite setup score with per-component reasons; GET /scanner (ranked
+> table), GET /scanner/{symbol} (detail); frontend Scanner nav view; ntfy
+> alert + registry event when a score crosses threshold. Thresholds in
+> settings.
+
+### F5 — Index bias panel
+> Breadth aggregation (constituent-weighted for NIFTY/BANKNIFTY) → bias score
+> recorded every cycle with its inputs; GET /scanner/index-bias + UI panel on
+> the Scanner view; nightly job scores yesterday's bias vs realized index move
+> so accuracy is tracked from day one.
+
+### F6 — Validation before trading
+> Only after 3–4 weeks of recorded scanner data: measure setup-score hit-rates
+> (forward returns of flagged options at 15/30/60 min), backfill expired
+> option data ON DEMAND for flagged names only (full-universe options backfill
+> is prohibitively slow), and only then expose scanner signals to strategies
+> via Context — a new ctx.scanner read API, updated in all three contexts +
+> loader smoke context + prompts/strategy_prompt.md (invariant #5).
+
+## Risks / gotchas
+- **Chain-gate contention** is the real engineering risk — priority queue for
+  deployed underlyings is non-negotiable.
+- Stock option **liquidity**: hard spread/OI screens before any buy signal.
+- Frozen-chain problem already solved for indexes (fingerprint dedup) applies
+  to stocks too — reuse it.
+- Lot sizes per stock change via exchange circulars — the dated
+  `fno_universe` table mirrors the LOT_HISTORY approach.
+- Corporate actions distort stock price/volume baselines; flag symbols with
+  overnight gaps > X% and reset their baselines.
+- Verify Dhan quote-API batch limits and any daily quota on the option-chain
+  endpoint against current docs before F2/F3 — numbers here are from docs as
+  of writing, and Dhan has churned limits before.
