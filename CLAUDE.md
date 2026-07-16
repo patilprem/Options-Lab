@@ -24,9 +24,12 @@ user; runs on a small VPS behind Tailscale.
 deploy/install_autopull.sh): every 5 min it fetches origin/main and, when it
 changed, redeploys via deploy/deploy.sh (deps + UI build + offline tests gate
 the restart). Restarts are deferred during IST market hours (Mon–Fri
-09:00–15:35); `FORCE=1 bash deploy/autopull.sh` overrides, and a commit
-message containing `[force-deploy]` overrides remotely (tests still gate the
-restart). So: ordinary changes land on `main` and go live at the next
+09:00–23:30, covering NSE/BSE close at 15:35 AND MCX's later close — a
+restart mid-session drops the live feed/chain recording, and MCX chain data
+can't be re-fetched afterward); `FORCE=1 bash deploy/autopull.sh` overrides,
+and a commit message containing `[force-deploy]` overrides remotely (tests
+still gate the restart). So: ordinary changes land on `main` and go live at
+the next
 off-hours window; genuinely urgent fixes get the marker.
 
 ## Run / test
