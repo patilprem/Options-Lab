@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS fno_universe (
     near_expiry DATE, expiries VARCHAR,
     PRIMARY KEY (as_of, symbol)
 );
+-- Tier-1 scanner snapshots (F2): one batched market-quote row per FNO stock
+-- per poll — future LTP + day OHLC + cumulative volume + futures OI, and the
+-- cash-equity spot. Buildup/volume-surge are derived from consecutive rows;
+-- volume baselines from the trailing-N-day rows at the same time-of-day.
+CREATE TABLE IF NOT EXISTS stock_snapshots (
+    symbol VARCHAR, ts TIMESTAMP,
+    spot DOUBLE, fut_ltp DOUBLE,
+    day_open DOUBLE, day_high DOUBLE, day_low DOUBLE, prev_close DOUBLE,
+    volume DOUBLE, oi DOUBLE,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_snap ON stock_snapshots (symbol, ts);
 """
 
 
@@ -325,6 +337,72 @@ class DataStore:
              "expiries": (r[6].split(",") if r[6] else [])}
             for r in rows]
 
+    # -- Tier-1 scanner snapshots (F2) ---------------------------------------
+    def upsert_stock_snapshots(self, rows: list[dict]) -> int:
+        """Persist Tier-1 stock snapshots. `rows` are dicts as built by
+        scanner.parse_stock_quote_rows. Idempotent per (symbol, ts)."""
+        tup = [
+            (r["symbol"], r["ts"], r.get("spot"), r.get("fut_ltp"),
+             r.get("day_open"), r.get("day_high"), r.get("day_low"),
+             r.get("prev_close"), r.get("volume"), r.get("oi"))
+            for r in rows]
+        if not tup:
+            return 0
+        with self._lock:
+            self.con.executemany(
+                "INSERT OR REPLACE INTO stock_snapshots VALUES (?,?,?,?,?,?,?,?,?,?)", tup)
+        return len(tup)
+
+    def stock_day_open_oi(self, symbol: str, day) -> tuple:
+        """(first_oi, first_fut_ltp) of `day` for `symbol` — the start-of-day
+        baseline OI/price the intraday buildup delta is measured against.
+        (None, None) if the day has no rows yet."""
+        row = self._q1(
+            """SELECT first(oi ORDER BY ts), first(fut_ltp ORDER BY ts)
+               FROM stock_snapshots
+               WHERE symbol=? AND CAST(ts AS DATE)=CAST(? AS DATE)""",
+            [symbol, str(day)])
+        return (row[0], row[1]) if row else (None, None)
+
+    def stock_volume_baseline(self, symbol: str, ref_tod_seconds: int,
+                              before_day, days: int = 10):
+        """Average cumulative day-volume at ~`ref_tod_seconds` past midnight,
+        over the most recent `days` sessions strictly before `before_day`.
+        The surge ratio is today's volume divided by this. None if no history."""
+        row = self._q1(
+            """WITH per_day AS (
+                   SELECT CAST(ts AS DATE) AS d, volume,
+                          row_number() OVER (
+                              PARTITION BY CAST(ts AS DATE)
+                              ORDER BY abs(hour(ts)*3600 + minute(ts)*60
+                                           + second(ts) - ?)) AS rn
+                   FROM stock_snapshots
+                   WHERE symbol=? AND CAST(ts AS DATE) < CAST(? AS DATE))
+               SELECT avg(volume) FROM (
+                   SELECT volume FROM per_day WHERE rn=1 ORDER BY d DESC LIMIT ?)""",
+            [ref_tod_seconds, symbol, str(before_day), days])
+        return row[0] if row and row[0] is not None else None
+
+    def latest_stock_snapshots(self, day=None) -> list[dict]:
+        """Most recent snapshot per symbol for `day` (default: latest day with
+        data). Feeds the scanner ranker."""
+        if day is None:
+            r = self._q1("SELECT max(CAST(ts AS DATE)) FROM stock_snapshots")
+            day = r[0] if r and r[0] is not None else None
+        if day is None:
+            return []
+        rows = self._q(
+            """SELECT symbol, last(ts ORDER BY ts), last(spot ORDER BY ts),
+                      last(fut_ltp ORDER BY ts), last(day_open ORDER BY ts),
+                      last(day_high ORDER BY ts), last(day_low ORDER BY ts),
+                      last(prev_close ORDER BY ts), last(volume ORDER BY ts),
+                      last(oi ORDER BY ts)
+               FROM stock_snapshots WHERE CAST(ts AS DATE)=CAST(? AS DATE)
+               GROUP BY symbol ORDER BY symbol""", [str(day)])
+        cols = ("symbol", "ts", "spot", "fut_ltp", "day_open", "day_high",
+                "day_low", "prev_close", "volume", "oi")
+        return [dict(zip(cols, r)) for r in rows]
+
     def recording_status(self) -> list[dict]:
         """Per-underlying live-recording counters for the Data tab: what's been
         captured today (IST) in chain_snapshots + live spot bars."""
@@ -419,6 +497,10 @@ SyntheticStore.learning_stats = lambda self: {
     "underlyings": [], "learning_days": 0, "chain_rows_total": 0}
 SyntheticStore.upsert_fno_universe = lambda self, as_of, universe: 0
 SyntheticStore.fno_universe = lambda self, as_of=None: []
+SyntheticStore.upsert_stock_snapshots = lambda self, rows: 0
+SyntheticStore.stock_day_open_oi = lambda self, symbol, day: (None, None)
+SyntheticStore.stock_volume_baseline = lambda self, s, r, b, days=10: None
+SyntheticStore.latest_stock_snapshots = lambda self, day=None: []
 
 
 def get_store(prefer_real: bool = True):

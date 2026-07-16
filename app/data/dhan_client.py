@@ -296,6 +296,21 @@ def fetch_expired_option(client, security_id: int, fno_segment: str, instrument:
     return _unwrap(resp)
 
 
+def fetch_quotes(client, securities: dict) -> dict:
+    """Batched market quote for many instruments in ONE call (Tier-1 scanner).
+    `securities` is {exchange_segment: [security_id, ...]}, e.g.
+    {"NSE_FNO": [46376, 46801], "NSE_EQ": [2885]}. Returns {segment:
+    {sid_str: node}} — descends the SDK's double-nested payload. Each node
+    carries last_price, volume, oi and an `ohlc` sub-dict (open/high/low/close,
+    where close is the PREVIOUS session's close). Dhan caps instruments per
+    quote call (~1000); the caller chunks and stays ~1 req/s."""
+    resp = client.quote_data(securities)
+    data = _unwrap(resp)
+    if isinstance(data.get("data"), dict):
+        data = data["data"]
+    return data
+
+
 def fetch_option_chain(client, underlying_scrip: int, underlying_seg: str, expiry: str) -> dict:
     """Live chain with greeks. Rate limit: 1 unique request per 3 seconds.
     Returns the unwrapped data dict (spot at data['last_price'], strikes under

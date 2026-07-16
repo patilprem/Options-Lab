@@ -29,6 +29,11 @@ from app.api.strategies import (router, portfolio_router, activity_router,
 registry.init_db()
 app = FastAPI(title="OptionsLab", version="1.0.0")
 
+# Tier-1 FNO stock scanner (F2). Shares the hub's DataStore; its poll loop is a
+# no-op until the `scanner` setting is turned "on" (needs live creds on the VPS).
+from app.engines.scanner import StockScanner
+scanner_engine = StockScanner(hub.store)
+
 # Include all routers
 app.include_router(router)
 app.include_router(portfolio_router)
@@ -190,6 +195,7 @@ async def startup_event():
     rec_task = asyncio.create_task(_market_recorder())
     spot_task = asyncio.create_task(_spot_bar_recorder())
     repair_task = asyncio.create_task(_nightly_gap_repair())
+    scanner_task = asyncio.create_task(scanner_engine.run())
     registry.record_event("info", "engine", "OptionsLab started")
     # M4: recover any paper strategies that were live before a restart.
     try:
