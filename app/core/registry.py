@@ -419,7 +419,43 @@ def wipe_paper_day(strategy_id: str, day: str) -> dict:
                       "AND trade_date=?", (strategy_id, day)).rowcount
         s = c.execute("DELETE FROM paper_state WHERE strategy_id=?",
                       (strategy_id,)).rowcount
+    recompute_equity_chain(strategy_id, "PAPER", day)
     return {"trades_deleted": t, "daily_rows_deleted": d, "state_cleared": s}
+
+
+def recompute_equity_chain(strategy_id: str, mode: str = "PAPER",
+                           from_date: Optional[str] = None) -> int:
+    """Rebuild equity_eod for every daily_pnl row on/after `from_date` (the
+    whole ledger when omitted) by re-chaining stored realized+unrealized day
+    over day from the last untouched close (or allocated_capital on day 1).
+
+    wipe_paper_day/manual_trade only rewrite the one day they touch; any
+    later row was chained off that day's *old* equity_eod and goes stale.
+    Call this after either to keep the curve consistent, or directly as a
+    one-off repair for drift left over from before this existed."""
+    with _conn() as c:
+        cap_row = c.execute("SELECT allocated_capital FROM strategies WHERE id=?",
+                            (strategy_id,)).fetchone()
+        cap = cap_row[0] if cap_row else 0.0
+        if from_date is None:
+            base, start = cap, ""
+        else:
+            prev = c.execute(
+                "SELECT equity_eod FROM daily_pnl WHERE strategy_id=? AND mode=? "
+                "AND trade_date<? ORDER BY trade_date DESC LIMIT 1",
+                (strategy_id, mode.upper(), from_date)).fetchone()
+            base = prev[0] if prev and prev[0] is not None else cap
+            start = from_date
+        rows = c.execute(
+            "SELECT trade_date, realized, unrealized FROM daily_pnl "
+            "WHERE strategy_id=? AND mode=? AND trade_date>=? ORDER BY trade_date",
+            (strategy_id, mode.upper(), start)).fetchall()
+        for trade_date, realized, unrealized in rows:
+            base = round(base + (realized or 0.0) + (unrealized or 0.0), 2)
+            c.execute("UPDATE daily_pnl SET equity_eod=? WHERE strategy_id=? "
+                      "AND mode=? AND trade_date=?",
+                      (base, strategy_id, mode.upper(), trade_date))
+        return len(rows)
 
 
 def count_trades(mode: str = "PAPER") -> int:

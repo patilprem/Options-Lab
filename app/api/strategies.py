@@ -280,6 +280,21 @@ def wipe_day(sid: str, day: str):
     return res
 
 
+@router.post("/{sid}/recompute_equity")
+def recompute_equity(sid: str, mode: str = "PAPER", from_date: str | None = None):
+    """Rebuild equity_eod for daily_pnl rows (mode) from from_date onward (the
+    whole ledger if omitted), re-chaining each day's stored realized+unrealized
+    forward. wipe_day/manual_trade now do this automatically for days after the
+    one they touch; use this to repair drift left over from before that, or
+    after any other manual edit to daily_pnl."""
+    _rec_or_404(sid)
+    n = registry.recompute_equity_chain(sid, mode, from_date)
+    registry.record_event("info", "engine",
+                          f"equity chain recomputed ({mode}) from "
+                          f"{from_date or 'day 1'}: {n} row(s)", sid)
+    return {"rows_updated": n}
+
+
 class ManualLegReq(BaseModel):
     option_type: str            # CE | PE
     action: str                 # entry side: BUY | SELL
@@ -372,6 +387,10 @@ def manual_trade(sid: str, req: ManualTradeReq):
                  "equity_eod": round(base + realized, 2)}
         registry.save_paper_day(sid, req.day, daily["realized"], 0.0,
                                 daily["fees"], daily["equity_eod"])
+        # any day after req.day was chained off its OLD equity_eod — refresh
+        # the curve forward so a wipe_day+manual_trade correction doesn't
+        # leave later days stale.
+        registry.recompute_equity_chain(sid, "PAPER", req.day)
     registry.record_event("info", "fill",
                           f"manual booking {req.day}: {len(booked)} leg(s), "
                           f"P&L {realized:+.2f} (fees {fees_total:.2f})", sid)

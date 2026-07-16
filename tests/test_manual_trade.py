@@ -11,7 +11,8 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from app.api.strategies import ManualLegReq, ManualTradeReq, manual_trade, wipe_day
+from app.api.strategies import (ManualLegReq, ManualTradeReq, manual_trade,
+                                wipe_day, recompute_equity)
 from app.core import registry
 from app.core.contract import Action
 from app.engines import fills as F
@@ -96,6 +97,57 @@ def test_wipe_then_rebook_round_trip(rec):
     res = manual_trade(rec.id, _straddle_req())         # re-book actuals
     assert len(registry.trades_for(rec.id, "2026-07-13")) == 4
     assert registry.paper_performance(rec.id)[0]["realized"] == res["realized"]
+
+
+def test_manual_trade_cascades_equity_to_later_days(rec):
+    """A later day's equity_eod was chained off day X's OLD close — re-booking
+    day X with different (real) fills must refresh every day after it too,
+    not just X itself."""
+    manual_trade(rec.id, _straddle_req())                       # 2026-07-13
+    day13_old_equity = registry.paper_performance(rec.id)[0]["equity_eod"]
+    # a flat day that chained off the (soon to be stale) 07-13 close
+    registry.save_paper_day(rec.id, "2026-07-14", 0.0, 0.0, 0.0, day13_old_equity)
+
+    wipe_day(rec.id, "2026-07-13")
+    req = _straddle_req()
+    req.legs[0].exit_price = 60.0                                # different real fill
+    res = manual_trade(rec.id, req)
+
+    perf = {r["trade_date"]: r for r in registry.paper_performance(rec.id)}
+    assert perf["2026-07-13"]["equity_eod"] == res["daily_row"]["equity_eod"]
+    assert perf["2026-07-13"]["equity_eod"] != day13_old_equity
+    assert perf["2026-07-14"]["equity_eod"] == perf["2026-07-13"]["equity_eod"]
+
+
+def test_wipe_day_cascades_equity_to_later_days(rec):
+    """Wiping a day removes it entirely — any later day must re-chain from
+    whatever now precedes it (or allocated_capital, if nothing does)."""
+    manual_trade(rec.id, _straddle_req())                        # 2026-07-13
+    day13 = registry.paper_performance(rec.id)[0]
+    registry.save_paper_day(rec.id, "2026-07-14", 0.0, 0.0, 0.0, day13["equity_eod"])
+
+    wipe_day(rec.id, "2026-07-13")
+
+    day14 = [r for r in registry.paper_performance(rec.id)
+             if r["trade_date"] == "2026-07-14"][0]
+    assert day14["equity_eod"] == 500_000.0
+
+
+def test_recompute_equity_repairs_stale_chain(rec):
+    """Drift left over from before the cascade fix existed: rebuild the whole
+    ledger (from_date omitted) and every day's equity_eod re-chains from
+    allocated_capital using its own already-stored realized/unrealized."""
+    registry.save_paper_day(rec.id, "2026-07-13", -1206.0, 0.0, 52.0, 498794.0)
+    registry.save_paper_day(rec.id, "2026-07-14", 0.0, 0.0, 0.0, 500_000.0)  # stale
+    registry.save_paper_day(rec.id, "2026-07-15", -1087.0, 0.0, 66.0, 498913.0)  # stale
+
+    res = recompute_equity(rec.id)
+    assert res["rows_updated"] == 3
+
+    perf = {r["trade_date"]: r["equity_eod"] for r in registry.paper_performance(rec.id)}
+    assert perf["2026-07-13"] == 498794.0
+    assert perf["2026-07-14"] == 498794.0
+    assert perf["2026-07-15"] == round(498794.0 - 1087.0, 2)
 
 
 def test_validation_errors(rec):
