@@ -1010,6 +1010,23 @@ def scanner_view():
     }
 
 
+@scanner_router.get("/scanner/index-bias")
+def scanner_index_bias():
+    """Current NIFTY/BANKNIFTY constituent-weighted bias + recent history and
+    the recorded accuracy (hit-rate vs realized move) so the signal is judged,
+    not trusted."""
+    out = {}
+    for index in scanner.INDEX_CONSTITUENTS:
+        out[index] = {
+            "current": scanner_engine.index_bias.get(index),
+            "history": (_store.recent_index_bias(index)
+                        if hasattr(_store, "recent_index_bias") else []),
+            "accuracy": (_store.index_bias_accuracy(index)
+                         if hasattr(_store, "index_bias_accuracy") else []),
+        }
+    return out
+
+
 @scanner_router.get("/scanner/{symbol}")
 def scanner_detail(symbol: str):
     """Tier-1 + Tier-2 detail for one symbol."""

@@ -29,15 +29,48 @@ function BiasTag({ bias }) {
   )
 }
 
+function BiasCard({ name, bias }) {
+  const cur = bias?.current
+  const score = cur?.score
+  const acc = (bias?.accuracy || [])[0]
+  const color = score == null ? 'var(--muted)' : score > 0.3 ? 'var(--green)' : score < -0.3 ? 'var(--red)' : 'var(--amber)'
+  const label = score == null ? 'no read' : score > 0.3 ? 'BULLISH' : score < -0.3 ? 'BEARISH' : 'NEUTRAL'
+  const pos = score == null ? 50 : (score + 1) / 2 * 100   // -1..1 -> 0..100
+  return (
+    <div style={{ flex: '1 1 240px', border: '1px solid var(--line)', borderRadius: 8, padding: '12px 14px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <b>{name}</b>
+        <span style={{ color, fontWeight: 700, fontSize: 13 }}>{label}</span>
+      </div>
+      {/* bias meter: bearish (left) .. bullish (right) */}
+      <div style={{ position: 'relative', height: 6, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 4, margin: '10px 0 6px' }}>
+        <div style={{ position: 'absolute', left: '50%', top: -2, bottom: -2, width: 1, background: 'var(--line)' }} />
+        <div style={{ position: 'absolute', left: `calc(${pos}% - 4px)`, top: -3, width: 8, height: 10, borderRadius: 2, background: color }} />
+      </div>
+      <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)' }}>
+        score {score == null ? '—' : score.toFixed(2)} · {cur?.n || 0} members · cov {cur?.coverage?.toFixed(0) ?? '—'}%
+      </div>
+      <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
+        {acc ? `accuracy ${Math.round((acc.hit_rate || 0) * 100)}% (${acc.hits}/${acc.n} @ ${acc.horizon_min}m)` : 'accuracy: not yet scored'}
+      </div>
+    </div>
+  )
+}
+
 export default function ScannerView({ showToast }) {
   const [data, setData] = useState(null)
+  const [bias, setBias] = useState(null)
   const [expanded, setExpanded] = useState(null)   // symbol whose detail is open
   const [detail, setDetail] = useState(null)
 
   const load = useCallback(async () => {
     try {
-      const d = await fetch('/scanner').then(r => r.json())
+      const [d, b] = await Promise.all([
+        fetch('/scanner').then(r => r.json()),
+        fetch('/scanner/index-bias').then(r => r.json()).catch(() => null),
+      ])
       setData(d)
+      setBias(b)
     } catch { showToast && showToast('Failed to load scanner') }
   }, [showToast])
 
@@ -87,6 +120,13 @@ export default function ScannerView({ showToast }) {
       {!data.enabled && (
         <div style={{ background: 'var(--amber-tint, rgba(200,150,0,.08))', border: '1px solid var(--line)', color: 'var(--muted)', padding: '10px 12px', borderRadius: 8, fontSize: 13 }}>
           The scanner needs live Dhan credentials and runs only during market hours. Turn it on to begin the whole-universe sweep; Tier-2 chain deep-dives follow on the shortlist.
+        </div>
+      )}
+
+      {/* index bias cards */}
+      {bias && (
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+          {Object.keys(bias).map(name => <BiasCard key={name} name={name} bias={bias[name]} />)}
         </div>
       )}
 

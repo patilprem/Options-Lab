@@ -187,6 +187,13 @@ async def _nightly_gap_repair():
             except Exception as e:
                 registry.record_event("warn", "data",
                                       f"gap repair failed [{u}]: {e!r}")
+        # F5: score today's recorded index bias vs the realized move now that
+        # the session (and its spot bars) is complete.
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, scanner_engine.score_yesterday_bias, end)
+        except Exception as e:
+            registry.record_event("warn", "scanner", f"bias scoring failed: {e!r}")
 
 
 @app.on_event("startup")

@@ -86,6 +86,21 @@ CREATE TABLE IF NOT EXISTS stock_snapshots (
     PRIMARY KEY (symbol, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_stock_snap ON stock_snapshots (symbol, ts);
+-- Index bias (F5): a recorded time series of the constituent-weighted breadth
+-- read for NIFTY/BANKNIFTY, with its inputs, so the signal's accuracy vs the
+-- realized index move can be measured from day one (never trusted un-tested).
+CREATE TABLE IF NOT EXISTS index_bias_history (
+    ts TIMESTAMP, index_name VARCHAR,
+    score DOUBLE, buildup_breadth DOUBLE, price_breadth DOUBLE,
+    bull_weight DOUBLE, bear_weight DOUBLE, coverage DOUBLE, n INTEGER,
+    spot DOUBLE,
+    PRIMARY KEY (ts, index_name)
+);
+CREATE TABLE IF NOT EXISTS index_bias_accuracy (
+    day DATE, index_name VARCHAR, horizon_min INTEGER,
+    n INTEGER, hits INTEGER, hit_rate DOUBLE, avg_forward_move DOUBLE,
+    PRIMARY KEY (day, index_name, horizon_min)
+);
 """
 
 
@@ -403,6 +418,73 @@ class DataStore:
                 "day_low", "prev_close", "volume", "oi")
         return [dict(zip(cols, r)) for r in rows]
 
+    # -- Index bias (F5) -----------------------------------------------------
+    def upsert_index_bias(self, ts, index_name: str, bias: dict) -> None:
+        """Record one bias reading. `bias` is scanner.index_bias() output."""
+        with self._lock:
+            self.con.execute(
+                "INSERT OR REPLACE INTO index_bias_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [ts, index_name, bias.get("score"), bias.get("buildup_breadth"),
+                 bias.get("price_breadth"), bias.get("bull_weight"),
+                 bias.get("bear_weight"), bias.get("coverage"), bias.get("n"),
+                 bias.get("spot")])
+
+    def recent_index_bias(self, index_name: str, limit: int = 60) -> list[dict]:
+        """Most recent bias readings for one index, oldest-first (for a spark
+        line). Returns dicts of ts/score/breadth/spot."""
+        rows = self._q(
+            """SELECT ts, score, buildup_breadth, price_breadth, coverage, n, spot
+               FROM index_bias_history WHERE index_name=?
+               ORDER BY ts DESC LIMIT ?""", [index_name, limit])
+        cols = ("ts", "score", "buildup_breadth", "price_breadth", "coverage", "n", "spot")
+        return [dict(zip(cols, r)) for r in reversed(rows)]
+
+    def index_bias_on(self, day, index_name: str) -> list[tuple]:
+        """(ts, score, spot) rows recorded on `day` for accuracy scoring."""
+        return self._q(
+            """SELECT ts, score, spot FROM index_bias_history
+               WHERE index_name=? AND CAST(ts AS DATE)=CAST(? AS DATE)
+               ORDER BY ts""", [index_name, str(day)])
+
+    def upsert_index_bias_accuracy(self, day, index_name: str, horizon_min: int,
+                                   n: int, hits: int, avg_move: float) -> None:
+        hit_rate = (hits / n) if n else None
+        with self._lock:
+            self.con.execute(
+                "INSERT OR REPLACE INTO index_bias_accuracy VALUES (?,?,?,?,?,?,?)",
+                [str(day), index_name, horizon_min, n, hits, hit_rate, avg_move])
+
+    def index_bias_accuracy(self, index_name: str, limit: int = 30) -> list[dict]:
+        rows = self._q(
+            """SELECT day, horizon_min, n, hits, hit_rate, avg_forward_move
+               FROM index_bias_accuracy WHERE index_name=?
+               ORDER BY day DESC LIMIT ?""", [index_name, limit])
+        cols = ("day", "horizon_min", "n", "hits", "hit_rate", "avg_forward_move")
+        return [dict(zip(cols, [str(r[0]) if i == 0 else r[i]
+                                for i, _ in enumerate(cols)])) for r in rows]
+
+    def latest_spot(self, underlying: str, day=None):
+        """Last recorded spot close for `underlying` (default: latest day).
+        Used to stamp the index price alongside a bias reading."""
+        if day is None:
+            row = self._q1(
+                """SELECT last(close ORDER BY ts) FROM underlying_bars
+                   WHERE underlying=?""", [underlying])
+        else:
+            row = self._q1(
+                """SELECT last(close ORDER BY ts) FROM underlying_bars
+                   WHERE underlying=? AND CAST(ts AS DATE)=CAST(? AS DATE)""",
+                [underlying, str(day)])
+        return row[0] if row and row[0] is not None else None
+
+    def spot_bars_on(self, underlying: str, day) -> list[tuple]:
+        """(ts, close) spot bars for `underlying` on `day`, ascending — for
+        computing the realized forward move behind bias accuracy."""
+        return self._q(
+            """SELECT ts, close FROM underlying_bars
+               WHERE underlying=? AND CAST(ts AS DATE)=CAST(? AS DATE)
+               ORDER BY ts""", [underlying, str(day)])
+
     def recording_status(self) -> list[dict]:
         """Per-underlying live-recording counters for the Data tab: what's been
         captured today (IST) in chain_snapshots + live spot bars."""
@@ -501,6 +583,10 @@ SyntheticStore.upsert_stock_snapshots = lambda self, rows: 0
 SyntheticStore.stock_day_open_oi = lambda self, symbol, day: (None, None)
 SyntheticStore.stock_volume_baseline = lambda self, s, r, b, days=10: None
 SyntheticStore.latest_stock_snapshots = lambda self, day=None: []
+SyntheticStore.upsert_index_bias = lambda self, ts, name, bias: None
+SyntheticStore.recent_index_bias = lambda self, name, limit=60: []
+SyntheticStore.index_bias_accuracy = lambda self, name, limit=30: []
+SyntheticStore.latest_spot = lambda self, u, day=None: None
 
 
 def get_store(prefer_real: bool = True):

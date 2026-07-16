@@ -41,6 +41,30 @@ STOCK_CHAIN_TARGETS = (("MONTHLY", 0),)
 _BIAS = {"long_buildup": "CE", "short_covering": "CE",
          "short_buildup": "PE", "long_unwinding": "PE"}
 
+# Approximate constituent weights (%), as of 2026 — a bias indicator, not an
+# index-replication basket, so approximate is fine. Refresh from NSE factsheets
+# periodically; a symbol absent from the Tier-1 sweep is simply skipped (its
+# weight drops out of the coverage denominator). BANKNIFTY is the bank subset.
+INDEX_CONSTITUENTS = {
+    "BANKNIFTY": {
+        "HDFCBANK": 28.0, "ICICIBANK": 24.0, "SBIN": 9.5, "AXISBANK": 9.0,
+        "KOTAKBANK": 8.0, "PNB": 3.0, "BANKBARODA": 2.7, "INDUSINDBK": 2.5,
+        "AUBANK": 2.2, "FEDERALBNK": 2.0, "IDFCFIRSTB": 1.6, "CANBK": 1.5,
+    },
+    "NIFTY": {
+        "HDFCBANK": 12.0, "ICICIBANK": 8.5, "RELIANCE": 8.0, "INFY": 5.0,
+        "TCS": 4.0, "ITC": 3.8, "LT": 3.6, "AXISBANK": 3.2, "SBIN": 3.0,
+        "BHARTIARTL": 3.0, "KOTAKBANK": 2.8, "HINDUNILVR": 2.5, "BAJFINANCE": 2.2,
+        "M&M": 2.0, "MARUTI": 1.9, "SUNPHARMA": 1.8, "TATAMOTORS": 1.7,
+        "NTPC": 1.6, "HCLTECH": 1.5, "TITAN": 1.3,
+    },
+}
+
+# Which index each bank/sector maps to for sector-bucketed flow (extendable).
+_bias_label = lambda s: ("bullish" if s is not None and s > 0.3
+                         else "bearish" if s is not None and s < -0.3
+                         else "neutral")
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -368,6 +392,85 @@ def alert_setup(symbol: str, scored: dict) -> None:
         pass
 
 
+def index_bias(metrics: dict, constituents: dict) -> dict:
+    """Constituent-weighted directional bias for an index from its members'
+    Tier-1 reads. Two weighted breadth signals, averaged into [-1, 1]:
+      * buildup_breadth — net weighted positioning (long buildup / short
+        covering = +1 per member; short buildup / long unwinding = -1)
+      * price_breadth  — weighted momentum (clamped % move, ±3% = full weight)
+    Positive = bullish. Only members present in `metrics` count; `coverage` is
+    the summed weight actually seen, so a thin sweep is visible, not hidden."""
+    total_w = bull_w = bear_w = 0.0
+    buildup_acc = price_acc = 0.0
+    contributors = []
+    for sym, w in constituents.items():
+        m = metrics.get(sym)
+        if not m:
+            continue
+        b = m.get("buildup")
+        direction = (1 if b in ("long_buildup", "short_covering")
+                     else -1 if b in ("short_buildup", "long_unwinding") else 0)
+        pc = m.get("price_change_pct") or 0.0
+        total_w += w
+        if direction > 0:
+            bull_w += w
+        elif direction < 0:
+            bear_w += w
+        buildup_acc += w * direction
+        price_acc += w * max(-1.0, min(1.0, pc / 3.0))
+        contributors.append({"symbol": sym, "weight": w, "buildup": b,
+                             "price_change_pct": pc})
+    if total_w == 0:
+        return {"score": None, "buildup_breadth": None, "price_breadth": None,
+                "bull_weight": 0.0, "bear_weight": 0.0, "coverage": 0.0, "n": 0,
+                "label": "neutral", "contributors": []}
+    buildup_breadth = buildup_acc / total_w
+    price_breadth = price_acc / total_w
+    score = round((buildup_breadth + price_breadth) / 2.0, 3)
+    contributors.sort(key=lambda c: c["weight"], reverse=True)
+    return {
+        "score": score,
+        "buildup_breadth": round(buildup_breadth, 3),
+        "price_breadth": round(price_breadth, 3),
+        "bull_weight": round(bull_w, 1), "bear_weight": round(bear_w, 1),
+        "coverage": round(total_w, 1), "n": len(contributors),
+        "label": _bias_label(score),
+        "contributors": contributors[:8],
+    }
+
+
+def score_bias_day(bias_rows: list, spot_bars: list, horizon_min: int = 30):
+    """Accuracy of a day's recorded bias vs the realized index move.
+    For each bias reading, find the index spot `horizon_min` later and check
+    whether the move's sign matched the bias sign (neutral readings skipped).
+    `bias_rows`: (ts, score, spot); `spot_bars`: (ts, close) ascending.
+    Returns (n, hits, avg_forward_move_pct). Pure — the nightly job feeds it
+    from the store, a test feeds it literals."""
+    if not bias_rows or not spot_bars:
+        return (0, 0, 0.0)
+    bars = [(t, c) for t, c in spot_bars if c is not None]
+    if not bars:
+        return (0, 0, 0.0)
+    n = hits = 0
+    move_sum = 0.0
+    for ts, score, spot in bias_rows:
+        if score is None or abs(score) < 0.3:
+            continue                       # only score directional calls
+        base = spot
+        if base is None:                   # fall back to the nearest spot bar
+            base = min(bars, key=lambda b: abs((b[0] - ts).total_seconds()))[1]
+        target_t = ts + timedelta(minutes=horizon_min)
+        future = [b for b in bars if b[0] >= target_t]
+        if not future or not base:
+            continue
+        fwd = (future[0][1] - base) / base * 100.0
+        n += 1
+        move_sum += fwd
+        if (score > 0 and fwd > 0) or (score < 0 and fwd < 0):
+            hits += 1
+    return (n, hits, round(move_sum / n, 3) if n else 0.0)
+
+
 def oi_shift(prev_cache: dict, cur_cache: dict, top: int = 6) -> list[dict]:
     """Per-strike OI change between two chain snapshots of the same name —
     where positioning is building or unwinding (support/resistance walls
@@ -415,6 +518,7 @@ class StockScanner:
         self.scores: dict[str, dict] = {}      # symbol -> latest setup_score()
         self._prev_chain: dict[str, dict] = {} # symbol -> last chain cache (OI shift)
         self._alerted: dict[str, str] = {}     # symbol -> day already alerted
+        self.index_bias: dict[str, dict] = {}  # index -> latest bias reading
 
     def _securities(self) -> dict:
         """{segment: [security_id...]} for the whole universe — futures under
@@ -480,7 +584,44 @@ class StockScanner:
             self.metrics[sym] = compute_metrics(
                 snap, day_open_oi, day_open_price, baseline)
         self._last_sweep_ts = ts
+        self._record_index_bias(ts)
         return len(snaps)
+
+    def _record_index_bias(self, ts) -> None:
+        """Aggregate the fresh Tier-1 metrics into NIFTY/BANKNIFTY bias and
+        persist a reading (with the index spot for later accuracy scoring)."""
+        for index, weights in INDEX_CONSTITUENTS.items():
+            bias = index_bias(self.metrics, weights)
+            if bias.get("score") is None:
+                continue
+            try:
+                bias["spot"] = self.store.latest_spot(index, ts.date())
+            except Exception:
+                bias["spot"] = None
+            self.index_bias[index] = {**bias, "ts": str(ts)}
+            try:
+                self.store.upsert_index_bias(ts, index, bias)
+            except Exception:
+                pass
+
+    def score_yesterday_bias(self, day, horizon_min: int = 30) -> None:
+        """Nightly: score each index's recorded bias for `day` vs the realized
+        index move `horizon_min` later, and persist the hit-rate. Needs a real
+        store with index spot bars."""
+        if not hasattr(self.store, "con"):
+            return
+        from app.core import registry
+        for index in INDEX_CONSTITUENTS:
+            bias_rows = self.store.index_bias_on(day, index)
+            spot_bars = self.store.spot_bars_on(index, day)
+            n, hits, avg_move = score_bias_day(bias_rows, spot_bars, horizon_min)
+            if n:
+                self.store.upsert_index_bias_accuracy(
+                    day, index, horizon_min, n, hits, avg_move)
+                registry.record_event(
+                    "info", "scanner",
+                    f"bias accuracy {index} {day}: {hits}/{n} "
+                    f"({round(100 * hits / n)}%) @ {horizon_min}min")
 
     # -- Tier 2: shortlist chain deep-dive -----------------------------------
     def _register_chain_cfgs(self, symbols) -> list[str]:
