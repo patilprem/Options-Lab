@@ -64,19 +64,31 @@ export default function ScannerView({ showToast }) {
   const [detail, setDetail] = useState(null)
 
   const [valid, setValid] = useState(null)
+  const [book, setBook] = useState(null)
 
   const load = useCallback(async () => {
     try {
-      const [d, b, v] = await Promise.all([
+      const [d, b, v, tb] = await Promise.all([
         fetch('/scanner').then(r => r.json()),
         fetch('/scanner/index-bias').then(r => r.json()).catch(() => null),
         fetch('/scanner/validation').then(r => r.json()).catch(() => null),
+        fetch('/scanner/trades').then(r => r.json()).catch(() => null),
       ])
       setData(d)
       setBias(b)
       setValid(v)
+      setBook(tb)
     } catch { showToast && showToast('Failed to load scanner') }
   }, [showToast])
+
+  const setTrading = async (on) => {
+    await fetch('/scanner/trade-settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: on }),
+    })
+    showToast && showToast(`Auto-trading ${on ? 'ON (paper)' : 'off'}`)
+    load()
+  }
 
   useEffect(() => {
     load()
@@ -142,6 +154,57 @@ export default function ScannerView({ showToast }) {
           avg {valid.overall.avg_return_pct == null ? '—' : valid.overall.avg_return_pct + '%'}
           {valid.by_score?.['70-100']?.n > 0 && (
             <span> · high-score band {Math.round((valid.by_score['70-100'].hit_rate || 0) * 100)}% ({valid.by_score['70-100'].n})</span>
+          )}
+        </div>
+      )}
+
+      {/* positional paper trading book */}
+      {book && (
+        <div style={{ border: '1px solid var(--line)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <b>Auto-trader <span style={{ color: 'var(--muted)', fontWeight: 400, fontSize: 12 }}>(paper)</span></b>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: book.enabled ? 'var(--green)' : 'var(--muted)' }} />
+              {book.enabled ? 'trading' : 'off'}
+            </span>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)' }}>
+              {book.open}/{book.max_positions} open · realized ₹{Math.round(book.realized).toLocaleString('en-IN')} ·
+              unrealized <span style={{ color: book.unrealized >= 0 ? 'var(--green)' : 'var(--red)' }}>₹{Math.round(book.unrealized).toLocaleString('en-IN')}</span>
+            </span>
+            <button className="btn" style={{ marginLeft: 'auto' }} onClick={() => setTrading(!book.enabled)}>
+              {book.enabled ? 'Stop' : 'Start (paper)'}
+            </button>
+          </div>
+          {book.positions?.length > 0 && (
+            <div style={{ overflowX: 'auto', marginTop: 8 }}>
+              <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 560 }}>
+                <thead>
+                  <tr>
+                    <th style={th}>Symbol</th><th style={th}>Side</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Lots</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Entry</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Mark</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Stop</th>
+                    <th style={{ ...th, textAlign: 'right' }}>P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {book.positions.map(p => (
+                    <tr key={p.symbol}>
+                      <td style={{ ...cell, fontWeight: 700 }}>{p.symbol}</td>
+                      <td style={cell}><BiasTag bias={p.bias} /></td>
+                      <td style={num}>{p.lots}</td>
+                      <td style={num}>{p.entry?.toFixed(2)}</td>
+                      <td style={num}>{p.mtm?.toFixed(2)}</td>
+                      <td style={{ ...num, color: 'var(--muted)' }}>{p.stop?.toFixed(2)}</td>
+                      <td style={{ ...num, color: p.unrealized >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                        {p.unrealized >= 0 ? '+' : ''}{Math.round(p.unrealized).toLocaleString('en-IN')}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}

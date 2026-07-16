@@ -21,6 +21,19 @@ shortlist, and the on-demand expired-options backfill for flagged names.
 - **F5** `index_bias()` + accuracy scoring + `/scanner/index-bias` + bias cards
 - **F6** `ctx.signal()` in all contexts + provider + `/scanner/validation` +
   on-demand backfill; example `examples/index_momentum_with_bias.py`
+- **Auto-trader** (Route 2, `app/engines/scanner_trader.py`) — a positional
+  PAPER book that trades the screener's own picks: buys the ATM option of the
+  bias side on setups scoring ≥ entry_score, sizes to risk a fixed % of
+  capital, holds across days with a ratcheting trailing stop, and exits on
+  hard stop / trail / target / max-hold / setup-decay (score < exit_score or
+  bias flip). Reuses `engines/fills.py` (cost model, invariant #2) and the
+  registry ledger (mode PAPER, id "SCANNER"); runs each Tier-2 cycle, parallel
+  to the Strategy/paper engine and never touching it. Endpoints
+  `/scanner/trades` + `/scanner/trade-settings`; Scanner UI shows the live
+  book. Gated OFF (`scanner_trade` setting). This is the honest home for
+  "trade whatever high-probability stock the screener finds" — a single
+  Strategy can't hop between underlyings, so the multi-symbol book is a
+  dedicated engine, not a Strategy subclass.
 
 ## Verdict: feasible on the current stack
 

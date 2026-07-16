@@ -45,6 +45,8 @@ live_runner = LiveRunner(hub)   # M8: LIVE ledgers only; paper is untouched
 scanner_engine = StockScanner(_store)   # F2/F3 FNO stock scanner (shared store)
 from app.engines import signals as _signals
 _signals.register(scanner_engine)       # F6: ctx.signal() reads from the scanner
+from app.engines.scanner_trader import ScannerTrader
+scanner_engine.trader = ScannerTrader(_store)   # positional paper book on screener picks
 
 
 class CreateReq(BaseModel):
@@ -1077,6 +1079,13 @@ def scanner_backfill(symbol: str, days: int = 30):
     return {"status": "started", "symbol": symbol, "days": days}
 
 
+@scanner_router.get("/scanner/trades")
+def scanner_trades():
+    """The positional paper book the scanner is trading: open positions with
+    live MTM + trailing stop, plus realized/unrealized P&L."""
+    return scanner_engine.trader.snapshot()
+
+
 @scanner_router.get("/scanner/{symbol}")
 def scanner_detail(symbol: str):
     """Tier-1 + Tier-2 detail for one symbol."""
@@ -1092,3 +1101,35 @@ def set_scanner(req: ScannerSettingsReq):
                              str(max(0.0, min(100.0, req.alert_score))))
     registry.record_event("info", "scanner", "Scanner settings updated")
     return scanner_view()
+
+
+class TraderSettingsReq(BaseModel):
+    enabled: bool | None = None
+    entry_score: float | None = None
+    exit_score: float | None = None
+    trail_pct: float | None = None
+    hard_stop_pct: float | None = None
+    target_pct: float | None = None
+    risk_pct: float | None = None
+    max_positions: int | None = None
+    capital: float | None = None
+
+
+@scanner_router.post("/scanner/trade-settings")
+def set_trader(req: TraderSettingsReq):
+    if req.enabled is not None:
+        registry.set_setting("scanner_trade", "on" if req.enabled else "off")
+    for key, val, lo, hi in [
+        ("scanner_trade_entry_score", req.entry_score, 0, 100),
+        ("scanner_trade_exit_score", req.exit_score, 0, 100),
+        ("scanner_trade_trail_pct", req.trail_pct, 0.01, 0.9),
+        ("scanner_trade_hard_stop_pct", req.hard_stop_pct, 0.01, 0.9),
+        ("scanner_trade_target_pct", req.target_pct, 0.0, 10.0),
+        ("scanner_trade_risk_pct", req.risk_pct, 0.001, 0.2),
+        ("scanner_trade_max_positions", req.max_positions, 1, 50),
+        ("scanner_trade_capital", req.capital, 0.0, 1e9),
+    ]:
+        if val is not None:
+            registry.set_setting(key, str(max(lo, min(hi, val))))
+    registry.record_event("info", "scanner", "Scanner trader settings updated")
+    return scanner_engine.trader.snapshot()

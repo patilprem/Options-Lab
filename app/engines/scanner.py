@@ -551,6 +551,7 @@ class StockScanner:
         self._prev_chain: dict[str, dict] = {} # symbol -> last chain cache (OI shift)
         self._alerted: dict[str, str] = {}     # symbol -> day already alerted
         self.index_bias: dict[str, dict] = {}  # index -> latest bias reading
+        self.trader = None                     # optional ScannerTrader (positional book)
 
     def _securities(self) -> dict:
         """{segment: [security_id...]} for the whole universe — futures under
@@ -683,7 +684,11 @@ class StockScanner:
         from app.core import registry
         from app.data import dhan_client
         self.shortlist = rank_shortlist(self.metrics)
-        symbols = self._register_chain_cfgs(d["symbol"] for d in self.shortlist)
+        # Poll shortlisted names AND any open-position names (their chains must
+        # stay live for MTM/exit even after they drop off the shortlist).
+        held = self.trader.held_symbols() if self.trader else []
+        want = list(dict.fromkeys([d["symbol"] for d in self.shortlist] + held))
+        symbols = self._register_chain_cfgs(want)
         if not symbols:
             return 0
         from app.data.dhan_client import UNDERLYINGS
@@ -736,6 +741,12 @@ class StockScanner:
             if sc["score"] >= threshold and self._alerted.get(sym) != today:
                 self._alerted[sym] = today
                 alert_setup(sym, sc)
+        # positional paper trader acts on the fresh scores + live chains
+        if self.trader:
+            try:
+                self.trader.step(hub, self)
+            except Exception as e:
+                registry.record_event("warn", "scanner", f"trader step: {e!r}")
         if done:
             registry.record_event("info", "scanner", f"tier-2 deep-dive: {done} names")
         return done
