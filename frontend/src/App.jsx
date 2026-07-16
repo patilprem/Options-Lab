@@ -7,6 +7,7 @@ import PositionsView from './pages/PositionsView'
 import RiskView from './pages/RiskView'
 import ActivityView from './pages/ActivityView'
 import DataView from './pages/DataView'
+import ScannerView from './pages/ScannerView'
 import HistoryView from './pages/HistoryView'
 import StrategyDetail from './pages/StrategyDetail'
 import NewStrategyModal from './components/NewStrategyModal'
@@ -16,7 +17,7 @@ import Toast from './components/Toast'
 
 const TITLES = {
   positions: 'Dashboard', strategies: 'Strategies', risk: 'Risk',
-  activity: 'Activity', data: 'Data', history: 'Trade history',
+  activity: 'Activity', data: 'Data', scanner: 'Scanner', history: 'Trade history',
 }
 
 const API = {
@@ -145,6 +146,8 @@ export default function App() {
         return <ActivityView />
       case 'data':
         return <DataView showToast={showToast} />
+      case 'scanner':
+        return <ScannerView showToast={showToast} />
       case 'history':
         return <HistoryView strategies={strategies} />
       default:

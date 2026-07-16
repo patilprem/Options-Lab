@@ -1,5 +1,5 @@
 import {
-  LayoutDashboard, Boxes, ShieldAlert, Activity, Database, History,
+  LayoutDashboard, Boxes, ShieldAlert, Activity, Database, Radar, History,
 } from 'lucide-react'
 
 const ITEMS = [
@@ -8,6 +8,7 @@ const ITEMS = [
   { view: 'risk', label: 'Risk', Icon: ShieldAlert },
   { view: 'activity', label: 'Activity', Icon: Activity },
   { view: 'data', label: 'Data', Icon: Database },
+  { view: 'scanner', label: 'Scanner', Icon: Radar },
   { view: 'history', label: 'Trade history', short: 'History', Icon: History },
 ]
 

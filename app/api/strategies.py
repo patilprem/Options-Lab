@@ -32,6 +32,8 @@ from app.engines import walkforward as wf
 from app.engines import live as L
 from app.engines.paper import MarketHub, PaperRunner
 from app.engines.live import LiveRunner
+from app.engines import scanner
+from app.engines.scanner import StockScanner
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
@@ -40,6 +42,7 @@ _store = get_store()
 hub = MarketHub(_store)
 runner = PaperRunner(hub)
 live_runner = LiveRunner(hub)   # M8: LIVE ledgers only; paper is untouched
+scanner_engine = StockScanner(_store)   # F2/F3 FNO stock scanner (shared store)
 
 
 class CreateReq(BaseModel):
@@ -979,3 +982,46 @@ def performance(sid: str):
             "open_positions": open_positions,
             "trades_today": registry.trades_for(sid, today, "PAPER"),
             "daily": registry.performance_rows(sid, "PAPER")}
+
+
+# --- FNO stock scanner (F4) -------------------------------------------------
+
+scanner_router = APIRouter(tags=["scanner"])
+
+
+class ScannerSettingsReq(BaseModel):
+    enabled: bool | None = None          # master on/off (needs live creds)
+    alert_score: float | None = None     # ntfy alert threshold (0-100)
+
+
+@scanner_router.get("/scanner")
+def scanner_view():
+    """Ranked setup table: every scanned FNO stock with its composite score,
+    bias, and the shortlist that got a Tier-2 chain deep-dive."""
+    return {
+        "enabled": registry.setting("scanner", "off") == "on",
+        "alert_score": float(registry.setting("scanner_alert_score", "70")),
+        "session": scanner._session_open(),
+        "universe_size": len(scanner_engine._universe),
+        "last_sweep": (str(scanner_engine._last_sweep_ts)
+                       if scanner_engine._last_sweep_ts else None),
+        "shortlist": scanner_engine.shortlist,
+        "scores": scanner_engine.ranked_scores(),
+    }
+
+
+@scanner_router.get("/scanner/{symbol}")
+def scanner_detail(symbol: str):
+    """Tier-1 + Tier-2 detail for one symbol."""
+    return scanner_engine.detail(symbol.upper())
+
+
+@scanner_router.post("/scanner/settings")
+def set_scanner(req: ScannerSettingsReq):
+    if req.enabled is not None:
+        registry.set_setting("scanner", "on" if req.enabled else "off")
+    if req.alert_score is not None:
+        registry.set_setting("scanner_alert_score",
+                             str(max(0.0, min(100.0, req.alert_score))))
+    registry.record_event("info", "scanner", "Scanner settings updated")
+    return scanner_view()

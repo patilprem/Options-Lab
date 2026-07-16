@@ -24,15 +24,14 @@ class SPAStaticFiles(StaticFiles):
 from app.core import registry, token_manager
 from app.api.strategies import (router, portfolio_router, activity_router,
                                 data_router, trades_router, risk_router,
-                                live_router, hub, runner, _instantiate)
+                                live_router, scanner_router, hub, runner,
+                                scanner_engine, _instantiate)
 
 registry.init_db()
 app = FastAPI(title="OptionsLab", version="1.0.0")
-
-# Tier-1 FNO stock scanner (F2). Shares the hub's DataStore; its poll loop is a
-# no-op until the `scanner` setting is turned "on" (needs live creds on the VPS).
-from app.engines.scanner import StockScanner
-scanner_engine = StockScanner(hub.store)
+# scanner_engine (FNO stock scanner, F2/F3/F4) is created in app.api.strategies
+# alongside hub/runner and imported above; its poll loops are no-ops until the
+# `scanner` setting is turned "on" (needs live creds on the VPS).
 
 # Include all routers
 app.include_router(router)
@@ -42,6 +41,7 @@ app.include_router(data_router)
 app.include_router(trades_router)
 app.include_router(risk_router)
 app.include_router(live_router)
+app.include_router(scanner_router)
 app.include_router(token_manager.router)
 
 # Static files + SPA fallback

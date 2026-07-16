@@ -264,6 +264,110 @@ def liquidity_screen(cache: dict, atm_window: int = 2,
             "reason": "" if bad == 0 else f"{bad}/{checked} strikes illiquid"}
 
 
+def setup_score(t1: dict, t2: dict | None = None) -> dict:
+    """Composite option-BUYING setup score (0-100) with per-component reasons.
+    Combines the Tier-1 read (move size, buildup confirmation, volume surge,
+    range position) with Tier-2 chain quality (IV not already spiked, liquidity
+    passable, OI shift confirming). Every component appends a human reason so
+    the UI/alert explains WHY — a score with no reasons is not actionable.
+
+    `t1` is a compute_metrics() dict; `t2` is a chain_metrics() dict (+
+    'liquidity'/'oi_shift') or None if the name wasn't deep-dived yet."""
+    reasons: list[str] = []
+    pc = t1.get("price_change_pct") or 0.0
+    buildup = t1.get("buildup")
+    bias = _BIAS.get(buildup)
+    score = 0.0
+
+    # 1) move magnitude (up to 25) — needs a real move to buy momentum
+    move_pts = min(abs(pc) / 3.0, 1.0) * 25
+    score += move_pts
+    if abs(pc) >= 0.3:
+        reasons.append(f"moved {pc:+.1f}%")
+
+    # 2) buildup confirmation (up to 30) — fresh positioning is the thesis
+    if buildup in ("long_buildup", "short_buildup"):
+        score += 30
+        reasons.append(f"{buildup.replace('_', ' ')} (fresh OI)")
+    elif buildup in ("short_covering", "long_unwinding"):
+        score += 15
+        reasons.append(buildup.replace("_", " "))
+
+    # 3) volume surge (up to 20)
+    surge = t1.get("volume_surge")
+    if surge:
+        score += min(surge / 3.0, 1.0) * 20
+        if surge >= 1.5:
+            reasons.append(f"{surge:.1f}x volume")
+
+    # 4) range position aligned with bias (up to 10)
+    rp = t1.get("range_pos")
+    if rp is not None and bias:
+        aligned = rp if bias == "CE" else (1 - rp)
+        score += aligned * 10
+        if aligned >= 0.7:
+            reasons.append("pressing the day's " + ("high" if bias == "CE" else "low"))
+
+    # 5) Tier-2 chain quality (up to 15, and a hard liquidity veto)
+    if t2:
+        liq = t2.get("liquidity") or {}
+        if liq.get("ok"):
+            score += 8
+            reasons.append("liquid chain")
+        elif liq.get("checked"):
+            # illiquid stock options you can't exit — cap the score hard
+            score = min(score, 35)
+            reasons.append("ILLIQUID: " + (liq.get("reason") or "wide spreads"))
+        skew = t2.get("iv_skew")
+        if skew is not None and bias:
+            # downside fear (skew>0) helps PE buys, hurts CE buys
+            if (bias == "PE" and skew > 0) or (bias == "CE" and skew < 0):
+                score += 4
+                reasons.append("IV skew confirms")
+        oi_sh = t2.get("oi_shift") or []
+        if oi_sh:
+            top = oi_sh[0]
+            reasons.append(
+                f"OI {'+' if top['oi_change'] > 0 else ''}{int(top['oi_change'])}"
+                f" @ {top['option_type']}{top['strike_offset']:+d}")
+            score += 3
+
+    return {"symbol": t1.get("symbol"), "score": round(min(score, 100.0), 1),
+            "bias": bias, "buildup": buildup, "reasons": reasons,
+            "price_change_pct": pc, "volume_surge": surge,
+            "deep_dived": bool(t2)}
+
+
+def alert_setup(symbol: str, scored: dict) -> None:
+    """Push an ntfy alert + log a registry event for a high-scoring setup.
+    Reuses the token-manager ntfy channel; best-effort, never raises."""
+    try:
+        from app.core import registry
+        registry.record_event(
+            "info", "scanner",
+            f"setup {symbol} {scored.get('bias')} score={scored.get('score')}: "
+            + "; ".join(scored.get("reasons") or []))
+    except Exception:
+        pass
+    try:
+        import os
+
+        import requests
+        topic = os.environ.get("NTFY_TOPIC")
+        if not topic:
+            return
+        requests.post(
+            f"https://ntfy.sh/{topic}",
+            data=(f"{symbol} {scored.get('bias')} setup "
+                  f"({scored.get('score')}): "
+                  + ", ".join((scored.get('reasons') or [])[:3])).encode("utf-8"),
+            headers={"Title": f"Scanner: {symbol}", "Priority": "default",
+                     "Tags": "chart_with_upwards_trend"},
+            timeout=5)
+    except Exception:
+        pass
+
+
 def oi_shift(prev_cache: dict, cur_cache: dict, top: int = 6) -> list[dict]:
     """Per-strike OI change between two chain snapshots of the same name —
     where positioning is building or unwinding (support/resistance walls
@@ -308,7 +412,9 @@ class StockScanner:
         self._last_sweep_ts = None
         self.shortlist: list[dict] = []        # latest Tier-2 shortlist (ranked)
         self.tier2: dict[str, dict] = {}       # symbol -> Tier-2 chain analytics
+        self.scores: dict[str, dict] = {}      # symbol -> latest setup_score()
         self._prev_chain: dict[str, dict] = {} # symbol -> last chain cache (OI shift)
+        self._alerted: dict[str, str] = {}     # symbol -> day already alerted
 
     def _securities(self) -> dict:
         """{segment: [security_id...]} for the whole universe — futures under
@@ -433,9 +539,49 @@ class StockScanner:
                 hub.persist_chain_full(self.store, underlyings=set(symbols))
             except Exception as e:
                 registry.record_event("warn", "scanner", f"tier2 persist: {e!r}")
+        # score every shortlisted name (Tier-1 read + Tier-2 chain) and alert
+        # once/day per name above the settings threshold.
+        try:
+            threshold = float(registry.setting("scanner_alert_score", "70"))
+        except (TypeError, ValueError):
+            threshold = 70.0
+        today = datetime.now(IST).date().isoformat()
+        for d in self.shortlist:
+            sym = d["symbol"]
+            sc = setup_score(self.metrics.get(sym, {"symbol": sym}),
+                             self.tier2.get(sym))
+            self.scores[sym] = sc
+            if sc["score"] >= threshold and self._alerted.get(sym) != today:
+                self._alerted[sym] = today
+                alert_setup(sym, sc)
         if done:
             registry.record_event("info", "scanner", f"tier-2 deep-dive: {done} names")
         return done
+
+    def ranked_scores(self) -> list[dict]:
+        """All current setup scores, highest first — backs GET /scanner. Falls
+        back to a Tier-1-only score for names not yet deep-dived."""
+        out = []
+        seen = set()
+        for sym, sc in self.scores.items():
+            out.append(sc)
+            seen.add(sym)
+        for sym, m in self.metrics.items():
+            if sym not in seen:
+                out.append(setup_score(m, None))
+        out.sort(key=lambda s: s.get("score") or 0, reverse=True)
+        return out
+
+    def detail(self, symbol: str) -> dict:
+        """Full Tier-1 + Tier-2 picture for one symbol — backs GET
+        /scanner/{symbol}."""
+        return {
+            "symbol": symbol,
+            "score": self.scores.get(symbol),
+            "tier1": self.metrics.get(symbol),
+            "tier2": self.tier2.get(symbol),
+            "universe": self._universe.get(symbol),
+        }
 
     async def run_tier2(self, hub) -> None:
         """Long-lived Tier-2 loop: every TIER2_INTERVAL, re-rank and deep-dive
