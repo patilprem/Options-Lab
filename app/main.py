@@ -196,6 +196,7 @@ async def startup_event():
     spot_task = asyncio.create_task(_spot_bar_recorder())
     repair_task = asyncio.create_task(_nightly_gap_repair())
     scanner_task = asyncio.create_task(scanner_engine.run())
+    scanner_t2_task = asyncio.create_task(scanner_engine.run_tier2(hub))
     registry.record_event("info", "engine", "OptionsLab started")
     # M4: recover any paper strategies that were live before a restart.
     try:

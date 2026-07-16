@@ -347,7 +347,7 @@ class MarketHub:
         client = None
         warned: set[str] = set()
         while True:
-            for u in list(set(self._wanted) | self._chain_only):
+            for u in self._chain_order():
                 cfg = UNDERLYINGS.get(u)
                 if not cfg:
                     continue
@@ -360,22 +360,7 @@ class MarketHub:
                 try:
                     if client is None:
                         client = await loop.run_in_executor(None, dhan_client.get_client)
-                    expiries = await self._get_expiries(client, u, cfg, loop)
-                    for kind, off in self.CHAIN_TARGETS:
-                        exp = chainmod.resolve_expiry(expiries, kind, off)
-                        if not exp:
-                            continue
-                        data = await self._fetch_chain_ratelimited(client, cfg, exp, loop)
-                        if not data:
-                            continue
-                        ts = datetime.now(IST).replace(tzinfo=None)
-                        quotes = chainmod.normalize_chain(
-                            data, u, kind, off, date.fromisoformat(exp), ts)
-                        if quotes:
-                            self._chain_cache.setdefault(u, {}).update(quotes)
-                            sp = chainmod.chain_spot(data)
-                            if sp:
-                                self._chain_spot[u] = sp
+                    await self._poll_one_chain(u, cfg, client, loop, self.CHAIN_TARGETS)
                     warned.discard(u)
                 except Exception as e:
                     if u not in warned:
@@ -385,6 +370,38 @@ class MarketHub:
                     client = None          # rebuild for the next name/cycle
                     await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
             await asyncio.sleep(1.0)
+
+    def _chain_order(self) -> list:
+        """Underlyings to poll each cycle, DEPLOYED FIRST. Paper fills depend
+        on fresh chains for `_wanted`; the Tier-2 scanner (F3) dumps stock
+        names into `_chain_only`, so deployed strategies must never queue
+        behind the shortlist. Deployed names lead; chain-only names follow."""
+        order = list(self._wanted)
+        order += [u for u in self._chain_only if u not in self._wanted]
+        return order
+
+    async def _poll_one_chain(self, u, cfg, client, loop, targets) -> None:
+        """Refresh one underlying's chain cache for `targets` expiries through
+        the shared 3s gate. Single-sourced so both the deployed poll loop and
+        the Tier-2 scanner use the exact same fetch/normalize/cache path (and
+        the same global rate limit). Raises on hard failure; the caller owns
+        client rebuild and warn-throttling."""
+        expiries = await self._get_expiries(client, u, cfg, loop)
+        for kind, off in targets:
+            exp = chainmod.resolve_expiry(expiries, kind, off)
+            if not exp:
+                continue
+            data = await self._fetch_chain_ratelimited(client, cfg, exp, loop)
+            if not data:
+                continue
+            ts = datetime.now(IST).replace(tzinfo=None)
+            quotes = chainmod.normalize_chain(
+                data, u, kind, off, date.fromisoformat(exp), ts)
+            if quotes:
+                self._chain_cache.setdefault(u, {}).update(quotes)
+                sp = chainmod.chain_spot(data)
+                if sp:
+                    self._chain_spot[u] = sp
 
     async def _get_expiries(self, client, underlying, cfg, loop) -> list:
         today = datetime.now(IST).date()

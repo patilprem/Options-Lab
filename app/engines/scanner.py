@@ -32,6 +32,15 @@ _SESSION_END_MIN = 15 * 60 + 35
 POLL_INTERVAL = 60.0      # one universe sweep per minute
 QUOTE_BATCH = 900         # instruments per quote_data call (< Dhan's ~1000 cap)
 
+SHORTLIST_SIZE = 15       # Tier-2 deep-dive only this many movers
+TIER2_INTERVAL = 300.0    # re-rank + re-poll the shortlist every 5 min
+# Indian stock options are MONTHLY (no weeklies) — poll the nearest month.
+STOCK_CHAIN_TARGETS = (("MONTHLY", 0),)
+
+# Directional read of each buildup regime for an option-BUYING bias.
+_BIAS = {"long_buildup": "CE", "short_covering": "CE",
+         "short_buildup": "PE", "long_unwinding": "PE"}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -159,6 +168,118 @@ def compute_metrics(snap: dict, day_open_oi, day_open_price, vol_baseline) -> di
 
 
 # ---------------------------------------------------------------------------
+# Tier-2 ranking + chain analytics (pure)
+# ---------------------------------------------------------------------------
+
+def rank_shortlist(metrics: dict, top_n: int = SHORTLIST_SIZE,
+                   min_abs_move: float = 0.3) -> list[dict]:
+    """Rank Tier-1 metrics into the Tier-2 shortlist. Score rewards a bigger
+    move, a volume surge, and OI-buildup that CONFIRMS the move (fresh
+    positioning beats a move on shrinking OI). Names moving less than
+    `min_abs_move`% are ignored (chop). Returns the top N with a buy bias."""
+    scored = []
+    for sym, m in metrics.items():
+        pc = m.get("price_change_pct")
+        if pc is None or abs(pc) < min_abs_move:
+            continue
+        surge = m.get("volume_surge") or 1.0
+        buildup = m.get("buildup")
+        # fresh buildup (long/short) confirms hardest; covering/unwinding is
+        # weaker fuel; neutral/unknown barely scores.
+        align = (1.0 if buildup in ("long_buildup", "short_buildup")
+                 else 0.6 if buildup in ("short_covering", "long_unwinding")
+                 else 0.2)
+        score = abs(pc) * align * min(surge, 5.0)
+        scored.append((score, sym, m, buildup))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [
+        {"symbol": sym, "score": round(sc, 3), "buildup": b,
+         "bias": _BIAS.get(b),
+         "price_change_pct": m.get("price_change_pct"),
+         "volume_surge": m.get("volume_surge"),
+         "range_pos": m.get("range_pos")}
+        for sc, sym, m, b in scored[:top_n]]
+
+
+def chain_metrics(cache: dict, atm_window: int = 3) -> dict:
+    """PCR / ATM-IV / IV-skew from a hub chain cache
+    ({(kind, off, strike_offset, otype): OptionQuote}). Skew = avg OTM-put IV
+    minus avg OTM-call IV within `atm_window` strikes — positive = downside
+    fear (puts bid up), the classic pre-fall tell."""
+    calls = [q for k, q in cache.items() if k[3] == "CALL"]
+    puts = [q for k, q in cache.items() if k[3] == "PUT"]
+
+    def _sum(qs, attr):
+        return sum(getattr(q, attr) or 0 for q in qs)
+
+    call_oi, put_oi = _sum(calls, "oi"), _sum(puts, "oi")
+    call_vol, put_vol = _sum(calls, "volume"), _sum(puts, "volume")
+    atm_ivs = [q.iv for k, q in cache.items() if k[2] == 0 and q.iv]
+    otm_put_iv = [q.iv for k, q in cache.items()
+                  if k[3] == "PUT" and -atm_window <= k[2] < 0 and q.iv]
+    otm_call_iv = [q.iv for k, q in cache.items()
+                   if k[3] == "CALL" and 0 < k[2] <= atm_window and q.iv]
+
+    def _avg(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    skew = None
+    if otm_put_iv and otm_call_iv:
+        skew = _avg(otm_put_iv) - _avg(otm_call_iv)
+    return {
+        "pcr_oi": (put_oi / call_oi) if call_oi else None,
+        "pcr_volume": (put_vol / call_vol) if call_vol else None,
+        "atm_iv": _avg(atm_ivs),
+        "iv_skew": skew,
+        "call_oi": call_oi, "put_oi": put_oi,
+    }
+
+
+def liquidity_screen(cache: dict, atm_window: int = 2,
+                     max_spread_pct: float = 2.0, min_oi: float = 0.0) -> dict:
+    """A stock-option BUY is only real if you can get out. Check near-ATM
+    strikes: bid-ask spread as % of mid, and an OI floor. `ok` is False if any
+    checked strike is too wide or too thin — the single most important gate
+    for stock options, which get illiquid fast outside the top names."""
+    checked = bad = 0
+    worst_spread = 0.0
+    for k, q in cache.items():
+        if abs(k[2]) > atm_window:
+            continue
+        if q.bid is None or q.ask is None:
+            continue
+        mid = (q.bid + q.ask) / 2
+        if mid <= 0:
+            continue
+        checked += 1
+        spread_pct = (q.ask - q.bid) / mid * 100
+        worst_spread = max(worst_spread, spread_pct)
+        if spread_pct > max_spread_pct or (q.oi or 0) < min_oi:
+            bad += 1
+    if checked == 0:
+        return {"ok": False, "checked": 0, "bad": 0,
+                "worst_spread_pct": None, "reason": "no two-sided quotes"}
+    return {"ok": bad == 0, "checked": checked, "bad": bad,
+            "worst_spread_pct": round(worst_spread, 2),
+            "reason": "" if bad == 0 else f"{bad}/{checked} strikes illiquid"}
+
+
+def oi_shift(prev_cache: dict, cur_cache: dict, top: int = 6) -> list[dict]:
+    """Per-strike OI change between two chain snapshots of the same name —
+    where positioning is building or unwinding (support/resistance walls
+    forming or breaking). Largest absolute moves first."""
+    out = []
+    for k, q in cur_cache.items():
+        p = prev_cache.get(k)
+        if p is None or p.oi is None or q.oi is None:
+            continue
+        out.append({"strike_offset": k[2], "option_type": k[3],
+                    "oi_change": q.oi - p.oi})
+    out.sort(key=lambda d: abs(d["oi_change"]), reverse=True)
+    return out[:top]
+
+
+# ---------------------------------------------------------------------------
 # Poller
 # ---------------------------------------------------------------------------
 
@@ -183,8 +304,11 @@ class StockScanner:
         self.store = store
         self._universe: dict = {}
         self._universe_day = None
-        self.metrics: dict[str, dict] = {}     # symbol -> latest metrics
+        self.metrics: dict[str, dict] = {}     # symbol -> latest Tier-1 metrics
         self._last_sweep_ts = None
+        self.shortlist: list[dict] = []        # latest Tier-2 shortlist (ranked)
+        self.tier2: dict[str, dict] = {}       # symbol -> Tier-2 chain analytics
+        self._prev_chain: dict[str, dict] = {} # symbol -> last chain cache (OI shift)
 
     def _securities(self) -> dict:
         """{segment: [security_id...]} for the whole universe — futures under
@@ -251,6 +375,84 @@ class StockScanner:
                 snap, day_open_oi, day_open_price, baseline)
         self._last_sweep_ts = ts
         return len(snaps)
+
+    # -- Tier 2: shortlist chain deep-dive -----------------------------------
+    def _register_chain_cfgs(self, symbols) -> list[str]:
+        """Inject shortlisted stocks into dhan_client.UNDERLYINGS so the shared
+        chain poller can fetch them (option_chain keys off the cash-equity id
+        + NSE_EQ, the way resolve_mcx_ids injects MCX names). Returns the names
+        that actually have a spot id to poll."""
+        from app.data.dhan_client import UNDERLYINGS
+        ready = []
+        for sym in symbols:
+            u = self._universe.get(sym)
+            if not u or u.get("spot_security_id") is None:
+                continue
+            UNDERLYINGS[sym] = {
+                "security_id": int(u["spot_security_id"]),
+                "segment": "NSE_EQ", "fno_segment": u.get("fno_segment", "NSE_FNO"),
+                "instrument": "OPTSTK"}
+            ready.append(sym)
+        return ready
+
+    async def tier2_once(self, hub, loop) -> int:
+        """Re-rank Tier-1 metrics, then deep-dive the shortlist's option chains
+        THROUGH THE HUB'S shared gate (so it's globally rate-limited with, and
+        yields priority to, the deployed poller). Persists full chain rows and
+        computes per-symbol PCR/IV/skew/OI-shift + liquidity. Returns how many
+        names were analysed."""
+        from app.core import registry
+        from app.data import dhan_client
+        self.shortlist = rank_shortlist(self.metrics)
+        symbols = self._register_chain_cfgs(d["symbol"] for d in self.shortlist)
+        if not symbols:
+            return 0
+        from app.data.dhan_client import UNDERLYINGS
+        client = await loop.run_in_executor(None, dhan_client.get_client)
+        done = 0
+        for sym in symbols:
+            cfg = UNDERLYINGS.get(sym)
+            try:
+                await hub._poll_one_chain(sym, cfg, client, loop, STOCK_CHAIN_TARGETS)
+            except Exception as e:
+                registry.record_event("warn", "scanner", f"tier2 chain [{sym}]: {e!r}")
+                continue
+            cache = hub._chain_cache.get(sym) or {}
+            if not cache:
+                continue
+            metrics = chain_metrics(cache)
+            metrics["liquidity"] = liquidity_screen(cache)
+            prev = self._prev_chain.get(sym)
+            metrics["oi_shift"] = oi_shift(prev, cache) if prev else []
+            self._prev_chain[sym] = dict(cache)
+            self.tier2[sym] = metrics
+            done += 1
+        # persist the shortlist's full chains into the research dataset
+        if hasattr(self.store, "upsert_chain_rows"):
+            try:
+                hub.persist_chain_full(self.store, underlyings=set(symbols))
+            except Exception as e:
+                registry.record_event("warn", "scanner", f"tier2 persist: {e!r}")
+        if done:
+            registry.record_event("info", "scanner", f"tier-2 deep-dive: {done} names")
+        return done
+
+    async def run_tier2(self, hub) -> None:
+        """Long-lived Tier-2 loop: every TIER2_INTERVAL, re-rank and deep-dive
+        the shortlist. Gated by the same `scanner` setting + session window."""
+        from app.core import registry
+        loop = asyncio.get_running_loop()
+        await asyncio.sleep(90)   # let Tier-1 accumulate a first sweep or two
+        while True:
+            try:
+                if (registry.setting("scanner", "off") == "on"
+                        and _session_open() and self.metrics
+                        and hasattr(self.store, "con")):
+                    await hub.ensure_started()
+                    await self.tier2_once(hub, loop)
+            except Exception as e:
+                registry.record_event("warn", "scanner", f"tier2 loop: {e!r}")
+            await asyncio.sleep(TIER2_INTERVAL)
 
     async def run(self) -> None:
         """Long-lived poll loop. Market-hours gated; rebuilds the Dhan client
