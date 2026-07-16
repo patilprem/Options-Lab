@@ -116,6 +116,51 @@ hit-rate is measurable before anyone trades on it.
 > via Context — a new ctx.scanner read API, updated in all three contexts +
 > loader smoke context + prompts/strategy_prompt.md (invariant #5).
 
+## From scanner data to strategies
+
+A strategy here is a single-underlying class behind Context (contract.py), so
+"the scanner found RELIANCE" cannot live inside one strategy that hops between
+stocks. Three routes, in the order to build them:
+
+**Route 1 — index strategies on the bias signal (first, cheapest).**
+NIFTY/BANKNIFTY already have feed, liquidity, and backtest data. Expose the
+F5 bias through a new Context read (e.g. `ctx.signal("index_bias")` returning
+score + components, None in engines that lack it); an index option-buying
+strategy then trades its own price action ONLY when the breadth bias agrees
+(e.g. ORB long CE only if bias > +0.6). Invariant #5 applies: implement in all
+three contexts + loader smoke context + prompts/strategy_prompt.md.
+
+**Route 2 — scanner-deployed template strategies on stocks.**
+The scanner picks the stock; the platform instantiates a parameterized
+template on it (StrategyMeta.underlying = that stock, entry thesis passed via
+params). Start with one-click deploy from the Scanner UI (human confirms);
+auto-deploy only after the template has a measured paper track record.
+Templates to write first:
+- *Momentum CE/PE buyer*: enter on a confirming bar (don't buy the alert —
+  buy the first bar that continues it), ATM or 1-OTM via strike_offset,
+  engine-declared sl_pct/target_pct, time stop by 14:45, skip if ATM IV
+  already spiked vs its recorded percentile or spread > threshold.
+- *OI-wall breakout buyer*: enter when price closes beyond the max-OI strike
+  with OI unwinding there (shorts trapped), same exit discipline.
+
+**Route 3 — signals inside stock strategies.**
+Once a stock strategy exists, `ctx.signal(...)` also serves its own
+underlying's Tier-2 metrics (setup score, PCR, IV percentile, OI shift) so
+LLM-generated stock strategies can use them as filters.
+
+**Sizing and exits for buying** (all routes): risk a fixed % of allocated
+capital per trade — lots = risk_budget / (premium × sl_pct × lot_size);
+always declare sl_pct/target_pct so the engine enforces them; prefer time
+stops (theta bleeds all day) and trail with set_levels after 1R.
+
+**Backtesting honesty:** scanner signals derive from chain_snapshots, which
+only accumulate FORWARD — there is no historical intraday stock-chain data to
+replay. So: signal replay + forward-return stats over the recorded window
+(F6), entry/exit pricing via on-demand expired-options backfill for flagged
+names, then paper trading as the real proving ground. A conventional
+multi-year backtest of scanner strategies is not possible and should not be
+faked.
+
 ## Risks / gotchas
 - **Chain-gate contention** is the real engineering risk — priority queue for
   deployed underlyings is non-negotiable.
