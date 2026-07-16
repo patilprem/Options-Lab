@@ -59,6 +59,9 @@ UNDERLYINGS = {
 MCX_DYNAMIC = {"CRUDEOIL": "CRUDEOIL", "GOLD": "GOLD"}
 _SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 _MASTER_CACHE = Path(__file__).resolve().parents[2] / "scrip_master_mcx.csv"
+# The FNO-stock universe is trimmed from the SAME master, kept separately so
+# its 24h refresh cadence is independent of the MCX one.
+_FNO_MASTER_CACHE = Path(__file__).resolve().parents[2] / "scrip_master_fno.csv"
 
 
 def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
@@ -96,6 +99,119 @@ def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
                              "expiry": fut["SEM_EXPIRY_DATE"][:10]}
         out[name] = sid
     return out
+
+
+# ---------------------------------------------------------------------------
+# FNO stock universe (scanner) — resolve the ~190 NSE FNO stocks from the
+# scrip master, so the scanner knows each name's spot id, current-month
+# future id, lot size and expiries. Parsing is pure/offline-testable; the
+# download/cache wrapper mirrors resolve_mcx_ids.
+# ---------------------------------------------------------------------------
+
+def _to_int(v):
+    """'46376', '500.0', 500 -> int; blanks/garbage -> None (lot units and
+    security ids arrive as strings, sometimes float-formatted)."""
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_master_date(v):
+    """Scrip-master expiry -> date. Accepts 'YYYY-MM-DD' or
+    'YYYY-MM-DD HH:MM:SS' (Dhan has shipped both). None on failure."""
+    if not v:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def parse_fno_universe(rows, today=None) -> dict:
+    """Pure: scrip-master DictReader rows -> {symbol: {...}} for NSE FNO
+    stocks. Groups FUTSTK rows by underlying, keeps only non-expired
+    contracts, and pairs each with its cash-equity (spot) security id.
+
+    Returns per symbol: spot_security_id, future_security_id (nearest live
+    expiry), fno_segment, lot_size, near_expiry (ISO), expiries (sorted ISO
+    list). A symbol with no live future is dropped."""
+    if today is None:
+        today = datetime.now(IST).date()
+    elif isinstance(today, str):
+        today = date.fromisoformat(today)
+
+    futs: dict[str, list] = {}   # symbol -> [(expiry_date, sid, lot), ...]
+    spots: dict[str, int] = {}   # symbol -> cash-equity security id
+    for r in rows:
+        exch = (r.get("SEM_EXM_EXCH_ID") or "").strip()
+        if exch != "NSE":
+            continue
+        inst = (r.get("SEM_INSTRUMENT_NAME") or "").strip()
+        sym = (r.get("SM_SYMBOL_NAME") or "").strip()
+        if not sym:   # fall back to the trading-symbol prefix ("RELIANCE-...")
+            ts = (r.get("SEM_TRADING_SYMBOL") or "").strip()
+            sym = ts.split("-")[0].strip() if ts else ""
+        if not sym:
+            continue
+        sid = _to_int(r.get("SEM_SMST_SECURITY_ID"))
+        if inst == "FUTSTK":
+            exp = _parse_master_date(r.get("SEM_EXPIRY_DATE"))
+            if exp and sid:
+                futs.setdefault(sym, []).append(
+                    (exp, sid, _to_int(r.get("SEM_LOT_UNITS"))))
+        elif inst == "EQUITY" and sid:
+            spots[sym] = sid
+
+    out: dict[str, dict] = {}
+    for sym, contracts in futs.items():
+        live = sorted(c for c in contracts if c[0] >= today)
+        if not live:
+            continue
+        near_exp, fut_sid, lot = live[0]
+        out[sym] = {
+            "symbol": sym,
+            "spot_security_id": spots.get(sym),
+            "future_security_id": fut_sid,
+            "fno_segment": "NSE_FNO",
+            "lot_size": lot,
+            "near_expiry": near_exp.isoformat(),
+            "expiries": [c[0].isoformat() for c in live],
+        }
+    return out
+
+
+def resolve_fno_universe(max_age_h: float = 24.0, store=None, today=None) -> dict:
+    """Download (or reuse a <24h cache of) the scrip master, trim it to NSE
+    FUTSTK/EQUITY rows, parse the FNO stock universe, and — if a `store` is
+    given — persist a dated snapshot to `fno_universe` (lot sizes accumulate
+    over time the way LOT_HISTORY does). Returns {symbol: {...}}."""
+    import csv
+    import io
+    import urllib.request
+
+    if (not _FNO_MASTER_CACHE.exists()
+            or time.time() - _FNO_MASTER_CACHE.stat().st_mtime > max_age_h * 3600):
+        raw = urllib.request.urlopen(_SCRIP_MASTER_URL, timeout=120).read() \
+            .decode("utf-8", "replace")
+        lines = raw.splitlines()
+        # First column is SEM_EXM_EXCH_ID (see resolve_mcx_ids' MCX, filter);
+        # keep only NSE rows that name a stock future or a cash equity.
+        keep = [lines[0]] + [
+            ln for ln in lines[1:]
+            if ln.startswith("NSE,") and ("FUTSTK" in ln or "EQUITY" in ln)]
+        _FNO_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+
+    rows = list(csv.DictReader(io.StringIO(
+        _FNO_MASTER_CACHE.read_text(encoding="utf-8"))))
+    universe = parse_fno_universe(rows, today=today)
+    if store is not None and hasattr(store, "upsert_fno_universe"):
+        as_of = today or datetime.now(IST).date()
+        store.upsert_fno_universe(as_of, universe)
+    return universe
 
 
 # ---------------------------------------------------------------------------

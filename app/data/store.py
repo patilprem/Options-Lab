@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
     delta DOUBLE, theta DOUBLE, vega DOUBLE, gamma DOUBLE,
     PRIMARY KEY (underlying, ts, expiry_kind, expiry_offset, strike, option_type)
 );
+-- FNO stock universe (scanner F1): a DATED snapshot of every NSE FNO stock's
+-- ids/lot/expiries, resolved from the scrip master. Dated so lot-size history
+-- accumulates the way backtest.LOT_HISTORY does — a symbol's lot changes by
+-- exchange circular, and old backtests must see the lot that applied then.
+CREATE TABLE IF NOT EXISTS fno_universe (
+    as_of DATE, symbol VARCHAR,
+    spot_security_id INTEGER, future_security_id INTEGER,
+    fno_segment VARCHAR, lot_size INTEGER,
+    near_expiry DATE, expiries VARCHAR,
+    PRIMARY KEY (as_of, symbol)
+);
 """
 
 
@@ -277,6 +288,43 @@ class DataStore:
                 out[table] = {"deleted": before - after, "remaining": after}
         return out
 
+    # -- FNO universe (scanner F1) -------------------------------------------
+    def upsert_fno_universe(self, as_of, universe: dict) -> int:
+        """Persist a dated snapshot of the resolved FNO stock universe.
+        `universe` is {symbol: {...}} as returned by
+        dhan_client.parse_fno_universe. Idempotent per (as_of, symbol)."""
+        rows = [
+            (str(as_of), sym, u.get("spot_security_id"),
+             u.get("future_security_id"), u.get("fno_segment"),
+             u.get("lot_size"), u.get("near_expiry"),
+             ",".join(u.get("expiries") or []))
+            for sym, u in universe.items()]
+        if not rows:
+            return 0
+        with self._lock:
+            self.con.executemany(
+                "INSERT OR REPLACE INTO fno_universe VALUES (?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+
+    def fno_universe(self, as_of=None) -> list[dict]:
+        """The FNO universe as of `as_of` (default: the latest snapshot).
+        Returns [] if nothing has been resolved yet."""
+        if as_of is None:
+            row = self._q1("SELECT max(as_of) FROM fno_universe")
+            as_of = row[0] if row and row[0] is not None else None
+        if as_of is None:
+            return []
+        rows = self._q(
+            """SELECT symbol, spot_security_id, future_security_id, fno_segment,
+                      lot_size, near_expiry, expiries
+               FROM fno_universe WHERE as_of=? ORDER BY symbol""", [str(as_of)])
+        return [
+            {"symbol": r[0], "spot_security_id": r[1], "future_security_id": r[2],
+             "fno_segment": r[3], "lot_size": r[4],
+             "near_expiry": str(r[5]) if r[5] is not None else None,
+             "expiries": (r[6].split(",") if r[6] else [])}
+            for r in rows]
+
     def recording_status(self) -> list[dict]:
         """Per-underlying live-recording counters for the Data tab: what's been
         captured today (IST) in chain_snapshots + live spot bars."""
@@ -369,6 +417,8 @@ SyntheticStore.upsert_chain_rows = lambda self, rows: 0
 SyntheticStore.upsert_live_bar = lambda self, u, b: None
 SyntheticStore.learning_stats = lambda self: {
     "underlyings": [], "learning_days": 0, "chain_rows_total": 0}
+SyntheticStore.upsert_fno_universe = lambda self, as_of, universe: 0
+SyntheticStore.fno_universe = lambda self, as_of=None: []
 
 
 def get_store(prefer_real: bool = True):
