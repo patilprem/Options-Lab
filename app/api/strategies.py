@@ -558,14 +558,18 @@ def portfolio_today():
         if not deployed and ctx is None and not t_rows and not today_row:
             continue
         # ctx.day_pnl rolls on the FIRST BAR of a new session, so pre-open it
-        # still carries yesterday's total — only trust it once the engine's
-        # clock is actually on today (else the dashboard shows yesterday's
-        # P&L under today's date until 09:15).
-        if ctx and ctx.now.date().isoformat() == today:
+        # still carries yesterday's total. Only trust it once the engine's
+        # clock is actually on today's session (after first bar, ~09:15).
+        # Before then, use the database row only if it has today's trades,
+        # because an empty today_row at pre-open is a carry-over from yesterday.
+        engine_on_today = ctx and ctx.now.date().isoformat() == today
+        if engine_on_today:
             day_pnl = round(ctx.day_pnl, 2)
-        elif today_row:
+        elif today_row and t_rows:
+            # Database row + today's trades exist; use the row
             day_pnl = round((today_row["realized"] or 0.0) + (today_row["unrealized"] or 0.0), 2)
         else:
+            # No live engine, no today's trades → show 0.0 (fresh session)
             day_pnl = 0.0
         open_rows = []
         if ctx:
