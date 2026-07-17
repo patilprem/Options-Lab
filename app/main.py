@@ -127,8 +127,13 @@ async def _market_recorder():
             live_names = [u for u in names if _session_open(u)]
             # holiday/frozen-chain guard: persist only underlyings whose chain
             # CONTENT moved since the last snapshot (weekday holidays pass the
-            # clock gate but serve a frozen chain — identical fingerprint)
+            # clock gate but serve a frozen chain — identical fingerprint).
+            # CRITICAL: only consider changes for the intended record_list,
+            # NOT for any strategy stocks that happen to be cached (they bloat
+            # the dataset with unintended data).
             changed = hub.chain_changed(live_names)
+            # Filter changed to ONLY include things we meant to record
+            changed = [u for u in changed if u in names]
             if not changed:
                 # log which names were checked but had no changes (frozen/closed)
                 frozen = [u for u in live_names if u not in changed]
