@@ -93,22 +93,34 @@ async def _market_recorder():
         if not hasattr(store, "con"):
             continue  # synthetic store — nothing to persist into
         names = _record_list()
-        try:
+        if not names:
+            continue
+        # Log the recorder targets for visibility (useful for debugging missing underlyings)
+        registry.record_event("debug", "feed", f"recorder cycle: polling {','.join(names)}")
             # MCX chains hang off the CURRENT futures contract (id rolls
             # monthly) — resolve from the scrip master before polling.
             from app.data.dhan_client import MCX_DYNAMIC, UNDERLYINGS, resolve_mcx_ids
             from datetime import datetime as _dt
             _today = _dt.now().date().isoformat()
-            if any(n in MCX_DYNAMIC and (
-                    n not in UNDERLYINGS
-                    or UNDERLYINGS[n].get("expiry", "9999") < _today)  # rolled
-                   for n in names):
-                try:
-                    ids = await loop.run_in_executor(None, resolve_mcx_ids)
-                    if ids:
-                        registry.record_event("info", "feed", f"MCX ids resolved: {ids}")
-                except Exception as e:
-                    registry.record_event("warn", "feed", f"MCX resolve failed: {e!r}")
+            mcx_names = [n for n in names if n in MCX_DYNAMIC]
+            if mcx_names:
+                # Check if any MCX need resolution (missing or expired)
+                needs_resolve = [n for n in mcx_names if
+                                n not in UNDERLYINGS or
+                                UNDERLYINGS[n].get("expiry", "9999") < _today]
+                if needs_resolve:
+                    try:
+                        ids = await loop.run_in_executor(None, resolve_mcx_ids)
+                        if ids:
+                            registry.record_event("info", "feed", f"MCX ids resolved: {ids}")
+                        else:
+                            registry.record_event("warn", "feed",
+                                                f"MCX resolve returned empty for {','.join(needs_resolve)}")
+                    except Exception as e:
+                        registry.record_event("warn", "feed", f"MCX resolve failed: {e!r}")
+                else:
+                    registry.record_event("debug", "feed",
+                                        f"MCX {','.join(mcx_names)} already resolved (expires {[UNDERLYINGS[n].get('expiry') for n in mcx_names]})")
             for u in names:
                 hub.enable_chain(u)          # ensure it's being polled
             await hub.ensure_started()        # start the feed/poller if idle
@@ -118,13 +130,19 @@ async def _market_recorder():
             # clock gate but serve a frozen chain — identical fingerprint)
             changed = hub.chain_changed(live_names)
             if not changed:
+                # log which names were checked but had no changes (frozen/closed)
+                frozen = [u for u in live_names if u not in changed]
+                if frozen:
+                    registry.record_event("debug", "feed",
+                                         f"frozen/closed chains (no change): {','.join(frozen)}")
                 continue                      # closed or frozen — nothing real
             n_full = hub.persist_chain_full(store, underlyings=changed)
             n_atm = hub.persist_chain_snapshots(store, underlyings=changed)
             hub.mark_chain_persisted(changed)
             if n_full or n_atm:
                 registry.record_event("info", "feed",
-                                       f"recorder: {n_full} chain rows + {n_atm} ATM snapshots")
+                                       f"recorder: {n_full} chain rows + {n_atm} ATM snapshots "
+                                       f"for {','.join(changed)}")
         except Exception as e:
             registry.record_event("warn", "feed", f"recorder error: {e!r}")
 
