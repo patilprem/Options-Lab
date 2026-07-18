@@ -1,13 +1,21 @@
 # Trend Rider v2 — momentum option BUYER (slightly ITM) built to catch BIG
-# trend days. v2 is tuned from the first real 2-year backtest's attribution
-# (2024-07 -> 2026-07, +21.9%, Sharpe 1.2), which exposed two drags:
-#   * the Supertrend-flip exit fired on single-bar noise: 151 flip exits at
-#     29.8% win rate cost -1.1L, while the 53 trades that survived to the
-#     time exit made +1.86L -> the flip now needs `flip_confirm_bars`
-#     CONSECUTIVE flipped bars before it cuts the trade.
+# trend days. Tuned from the first real 2-year backtest's attribution
+# (2024-07 -> 2026-07, +21.9%, Sharpe 1.2) and then WALK-FORWARD tested
+# (6 folds, full range, 18-combo grid, 114 backtests):
 #   * dead-IV entries washed out: 115 trades below IV-rank 30 netted ~zero
-#     while paying fees -> new `iv_rank_floor` skips them (cheap IV = dead
-#     tape = breakouts are usually fakeouts).
+#     while paying fees -> `iv_rank_floor` skips them (cheap IV = dead tape =
+#     breakouts are usually fakeouts). Walk-forward: the floor won in-sample
+#     in the two most recent folds (late-2025 onward) though not the earlier
+#     ones — kept, on the theory recent folds matter most for live trading,
+#     but this one's a softer signal than the flip fix below.
+#   * flip_confirm_bars=1 (i.e. exit on the FIRST flipped bar, no delay):
+#     an earlier attempt required 2 CONSECUTIVE flipped bars, reasoning that
+#     151 single-bar flip exits at 29.8% WR cost -1.1L while trades left to
+#     run made +1.86L. That held up only partially — the full backtest then
+#     showed confirmed flips got WORSE per-trade (-729 -> -1,495 avg: waiting
+#     for confirmation just gives back more before exiting a real reversal),
+#     and 4 of 6 walk-forward folds independently picked flip_confirm_bars=1
+#     over 2. Three convergent pieces of evidence beat one plausible theory.
 # Paste this file's contents into New Strategy.
 
 class TrendRiderITM(Strategy):
@@ -43,7 +51,7 @@ class TrendRiderITM(Strategy):
             "sl_pct": 0.35,                  # disaster stop on premium
             "arm_pct": 0.25,                 # gain that activates the trail
             "trail_pct": 0.20,               # trail distance below premium high
-            "flip_confirm_bars": 2,          # v2: bars a flip must persist to exit
+            "flip_confirm_bars": 1,          # walk-forward: 1 beat 2 in 4/6 folds
             "bias_gate": 0.3,
             "iv_rank_floor": 30,             # v2: skip dead-IV tape (fakeout zone)
             "iv_rank_cap": 75,               # don't overpay for rich premium
