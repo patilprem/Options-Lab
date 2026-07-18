@@ -274,6 +274,46 @@ class MarketHub:
             except Exception as e:
                 registry.record_event("warn", "feed", f"watchdog error: {e!r}")
 
+    async def _index_vol_check_loop(self) -> None:
+        """Self-report whether the index-futures volume companion actually
+        streams volume+OI on the VPS — the one check that needs the registered
+        static IP + market hours. Runs at most once per market day until it
+        records a pass; verdict goes to the events log + an ntfy push, so no
+        shell/login is needed. Settings: index_vol_check = auto (default) |
+        off | force; index_vol_check_result / index_vol_check_ran persist state.
+        Fully isolated (its own short-lived MarketFeed) and best-effort — it
+        never disturbs the trading feed or raises into the app."""
+        from app.data.dhan_client import INDEX_FUT_NAMES
+        from app.engines.watchdog import session_open_for
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(300)
+            try:
+                mode = registry.setting("index_vol_check", "auto")
+                if mode == "off":
+                    continue
+                if mode != "force" and \
+                        registry.setting("index_vol_check_result", "").startswith("pass"):
+                    continue    # already confirmed working — stop nagging
+                now = datetime.now(IST).replace(tzinfo=None)
+                day = now.date().isoformat()
+                if mode != "force" and registry.setting("index_vol_check_ran", "") == day:
+                    continue    # already attempted today
+                if not session_open_for({"NSE"}, now):
+                    continue    # need a live NSE session for real volume
+                syms = ([u for u in self._wanted if u in INDEX_FUT_NAMES]
+                        or ["NIFTY", "BANKNIFTY"])
+                registry.set_setting("index_vol_check_ran", day)
+                registry.record_event("info", "diag",
+                                      f"index-futures volume self-check starting {syms}")
+                from app.engines import index_vol_check as ivc
+                await loop.run_in_executor(None, ivc.run_and_report, syms, 45)
+                if mode == "force":
+                    registry.set_setting("index_vol_check", "auto")
+            except Exception as e:
+                registry.record_event("warn", "diag",
+                                      f"index-vol self-check loop error: {e!r}")
+
     def _use_synthetic(self) -> bool:
         from app.data.store import SyntheticStore
         if os.environ.get("OPTIONSLAB_SYNTHETIC") == "1":
@@ -315,6 +355,7 @@ class MarketHub:
             self._tasks.append(asyncio.create_task(self._eod_clock()))
             self._tasks.append(asyncio.create_task(self._chain_poll_loop()))
             self._tasks.append(asyncio.create_task(self._watchdog_loop()))
+            self._tasks.append(asyncio.create_task(self._index_vol_check_loop()))
 
     async def stop(self) -> None:
         if self._livefeed:

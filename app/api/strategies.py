@@ -664,6 +664,34 @@ def set_risk(req: RiskSettingsReq):
     return runner.risk_snapshot()
 
 
+# --- diagnostics -----------------------------------------------------------
+
+diag_router = APIRouter(tags=["diag"])
+
+
+@diag_router.get("/diag/index_vol")
+def index_vol_status():
+    """Last verdict of the index-futures volume self-check + its mode. The
+    check runs itself on the VPS during market hours (MarketHub loop) and pushes
+    the verdict to ntfy; this surfaces it for the dashboard too."""
+    return {
+        "result": registry.setting("index_vol_check_result", "(not run yet)"),
+        "mode": registry.setting("index_vol_check", "auto"),
+        "last_attempt_day": registry.setting("index_vol_check_ran", ""),
+        "companion_enabled": registry.setting("index_futures_volume", "off") == "on",
+    }
+
+
+@diag_router.post("/diag/index_vol/run")
+def index_vol_force():
+    """Force the self-check to run at the next in-session opportunity (clears
+    the once-per-day guard). Verdict arrives via ntfy + GET /diag/index_vol."""
+    registry.set_setting("index_vol_check", "force")
+    registry.set_setting("index_vol_check_ran", "")
+    registry.record_event("info", "diag", "index-vol self-check armed (force)")
+    return {"status": "armed", "note": "runs at the next live NSE session"}
+
+
 # --- live execution (M8) — gated -------------------------------------------
 
 live_router = APIRouter(tags=["live"])

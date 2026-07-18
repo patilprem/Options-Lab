@@ -24,8 +24,8 @@ class SPAStaticFiles(StaticFiles):
 from app.core import registry, token_manager
 from app.api.strategies import (router, portfolio_router, activity_router,
                                 data_router, trades_router, risk_router,
-                                live_router, scanner_router, hub, runner,
-                                scanner_engine, _instantiate)
+                                live_router, scanner_router, diag_router, hub,
+                                runner, scanner_engine, _instantiate)
 
 registry.init_db()
 app = FastAPI(title="OptionsLab", version="1.0.0")
@@ -42,6 +42,7 @@ app.include_router(trades_router)
 app.include_router(risk_router)
 app.include_router(live_router)
 app.include_router(scanner_router)
+app.include_router(diag_router)
 app.include_router(token_manager.router)
 
 # Static files + SPA fallback
