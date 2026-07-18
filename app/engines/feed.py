@@ -16,15 +16,18 @@ Two pieces, deliberately separated:
 
 Index SPOT is subscribed (Ticker mode) to build the underlying candles.
 Because index spot carries NO traded volume, an optional COMPANION stream (the
-index's front-month future, Quote mode) supplies real volume/OI, folded into
-the same candle via CandleBuilder.add_volume — price stays the spot's, so
-backtests (spot-based history) and paper stay comparable. Option quotes for
-fills/greeks come from the chain poller (M3), not this feed.
+index's front-month future, FULL mode) supplies real volume/OI, folded into the
+same candle via CandleBuilder.add_volume — price stays the spot's, so backtests
+(spot-based history) and paper stay comparable. FULL (not Quote) because only
+Full's single packet carries OI alongside LTP+volume — verified against the
+dhanhq SDK's packet parsers. Option quotes for fills/greeks come from the chain
+poller (M3), not this feed.
 
-Live-verification pending (offline-built): the companion path's front-month
-future ids (resolve_index_futures), the Quote packet's cumulative-volume field,
-and the Ticker->Quote mode int must be confirmed on the VPS during market hours
-before the index_futures_volume setting is trusted with real volume.
+Verified against the installed dhanhq SDK offline: the FULL packet dict keys
+(security_id/LTP/volume/OI) and the feed-mode/segment ints. STILL VPS-pending
+during market hours: that resolve_index_futures() picks the right live contract
+and that a Full subscription actually streams increasing volume + OI from the
+registered static IP — run scripts/verify_index_futures.py there.
 """
 
 from __future__ import annotations

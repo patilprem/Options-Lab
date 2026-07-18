@@ -113,6 +113,21 @@ def test_hub_companion_volume_lands_in_bar():
     assert bar.volume == 15.0 and bar.oi == 600.0
 
 
+def test_companion_uses_full_mode_and_exchange_correct_segment():
+    from app.engines.paper import _FEED_BSE_FNO, _FEED_FULL, _FEED_NSE_FNO
+    hub = MarketHub(_FakeStore())
+    hub.register("NIFTY", 5)     # NSE index
+    hub.register("SENSEX", 5)    # BSE index
+    hub._index_fut = {
+        "NIFTY": {"security_id": 111, "expiry": "2026-07-31", "segment": "NSE"},
+        "SENSEX": {"security_id": 222, "expiry": "2026-07-30", "segment": "BSE"},
+    }
+    insts = {sid: (seg, mode) for seg, sid, mode in hub._companion_instruments()}
+    # Full mode (OI + volume in one packet); NSE future -> NSE_FnO, BSE -> BSE_FnO
+    assert insts["111"] == (_FEED_NSE_FNO, _FEED_FULL)
+    assert insts["222"] == (_FEED_BSE_FNO, _FEED_FULL)
+
+
 def test_hub_instruments_unchanged_when_companion_disabled():
     hub = MarketHub(_FakeStore())
     hub.register("NIFTY", 5)

@@ -8,8 +8,8 @@ three things that couldn't be verified offline before flipping the
 
   1. resolve_index_futures() picks each index's real front-month FUTIDX id.
   2. The MarketFeed mode ints hardcoded in paper.py match the SDK's constants
-     (_FEED_QUOTE / _FEED_NSE_FNO / _FEED_TICKER / _FEED_IDX).
-  3. A Quote subscription to that future actually delivers a CUMULATIVE
+     (_FEED_FULL / _FEED_NSE_FNO / _FEED_BSE_FNO / _FEED_TICKER / _FEED_IDX).
+  3. A Full subscription to that future actually delivers a CUMULATIVE
      `volume` field (that increases) and an OI field — the inputs
      LiveFeed._volume_delta() turns into per-bar volume/OI.
 
@@ -28,16 +28,17 @@ import asyncio
 from datetime import datetime
 
 from app.data import dhan_client
-from app.engines.paper import (_FEED_IDX, _FEED_NSE_FNO, _FEED_QUOTE,
-                               _FEED_TICKER)
+from app.engines.paper import (_FEED_BSE_FNO, _FEED_FULL, _FEED_IDX,
+                               _FEED_NSE_FNO, _FEED_TICKER)
 
 
 def check_constants() -> bool:
     """Compare paper.py's hardcoded feed-mode ints against the SDK's own."""
     from dhanhq import MarketFeed
     pairs = [
-        ("Quote (companion future)", _FEED_QUOTE, getattr(MarketFeed, "Quote", None)),
+        ("Full (companion future)", _FEED_FULL, getattr(MarketFeed, "Full", None)),
         ("NSE_FNO segment", _FEED_NSE_FNO, getattr(MarketFeed, "NSE_FNO", None)),
+        ("BSE_FNO segment", _FEED_BSE_FNO, getattr(MarketFeed, "BSE_FNO", None)),
         ("Ticker (spot)", _FEED_TICKER, getattr(MarketFeed, "Ticker", None)),
         ("IDX segment", _FEED_IDX, getattr(MarketFeed, "IDX", None)),
     ]
@@ -77,7 +78,7 @@ def check_resolution(symbols: list[str]) -> dict:
 
 
 async def check_live_packets(resolved: dict, symbols: list[str], seconds: int) -> bool:
-    """Subscribe each index's SPOT (Ticker) + FUTURE (Quote) and watch the raw
+    """Subscribe each index's SPOT (Ticker) + FUTURE (Full) and watch the raw
     packets for a cumulative, increasing volume + an OI field on the future."""
     from dhanhq import MarketFeed
 
@@ -90,13 +91,16 @@ async def check_live_packets(resolved: dict, symbols: list[str], seconds: int) -
             spot_sids[int(cfg["security_id"])] = name
         fut = resolved.get(name)
         if fut:
-            instruments.append((_FEED_NSE_FNO, str(fut["security_id"]), _FEED_QUOTE))
+            seg = (_FEED_BSE_FNO
+                   if (cfg or {}).get("fno_segment") == "BSE_FNO"
+                   else _FEED_NSE_FNO)
+            instruments.append((seg, str(fut["security_id"]), _FEED_FULL))
             fut_sids[int(fut["security_id"])] = name
     if not fut_sids:
         print("\n[3] SKIPPED — no futures resolved to subscribe.")
         return False
 
-    print(f"\n[3] Live Quote packets for {seconds}s "
+    print(f"\n[3] Live Full packets for {seconds}s "
           f"(futures: {', '.join(fut_sids.values())}) ...")
     feed = MarketFeed(dhan_client.get_dhan_context(), instruments, "v2")
     await feed.connect()
@@ -147,7 +151,7 @@ async def check_live_packets(resolved: dict, symbols: list[str], seconds: int) -
               f"increasing={'yes' if grew else 'NO'})  "
               f"OI_field={'yes' if has_oi else 'NO'} ({saw_oi.get(sid)})")
     if not ok:
-        print("    -> if volume/OI are absent, the Quote packet uses different "
+        print("    -> if volume/OI are absent, the Full packet uses different "
               "keys; adjust LiveFeed._volume_delta() key lookups.")
     return ok
 

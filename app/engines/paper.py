@@ -45,10 +45,17 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # MarketFeed subscription constants (avoid importing the SDK at module load).
 _FEED_IDX = 0      # MarketFeed.IDX  — index spot segment
-_FEED_NSE_FNO = 2  # MarketFeed.NSE_FNO — index/stock futures (companion volume)
+_FEED_NSE_FNO = 2  # MarketFeed.NSE_FNO — NSE index/stock futures (companion vol)
+_FEED_BSE_FNO = 8  # MarketFeed.BSE_FNO — BSE index futures (SENSEX/BANKEX)
 _FEED_MCX = 5      # MarketFeed.MCX  — commodity segment (FUTCOM contracts)
 _FEED_TICKER = 15  # MarketFeed.Ticker — LTP-only packets (enough for candles)
-_FEED_QUOTE = 17   # MarketFeed.Quote  — adds day volume + OI (companion futures)
+_FEED_QUOTE = 17   # MarketFeed.Quote  — LTP + day volume, but NO OI (see below)
+_FEED_FULL = 21    # MarketFeed.Full   — LTP + volume + OI in ONE packet
+# Verified against the installed dhanhq SDK's packet parsers (marketfeed.py):
+# Quote carries volume but OI arrives as a SEPARATE packet with no LTP (which
+# _handle_packet drops), so the companion subscribes FULL — its single packet
+# has security_id+LTP+volume+OI, exactly what _handle_packet/_volume_delta read.
+# All constants match dhanhq MarketFeed.* (scripts/verify_index_futures.py).
 # NOTE: _FEED_NSE_FNO / _FEED_QUOTE are used only by the gated index-futures
 # companion (index_futures_volume setting, default off) — VPS-verify the ints
 # and the Quote packet's cumulative-volume field before trusting real volume.
@@ -359,11 +366,16 @@ class MarketHub:
 
     def _companion_instruments(self) -> list:
         """Quote-mode subscription tuples for the resolved index futures — the
-        volume/OI companions for index spot. NSE names -> NSE_FnO segment."""
+        volume/OI companions for index spot. Segment follows the index's
+        exchange: NSE indices -> NSE_FnO, BSE indices (SENSEX/BANKEX) -> BSE_FnO
+        (their futures trade on BSE, not NSE)."""
         out = []
         for u, fut in self._index_fut.items():
-            seg = _FEED_NSE_FNO   # index futures trade in the FnO segment
-            out.append((seg, str(fut["security_id"]), _FEED_QUOTE))
+            bse = UNDERLYINGS.get(u, {}).get("fno_segment") == "BSE_FNO"
+            seg = _FEED_BSE_FNO if bse else _FEED_NSE_FNO
+            # FULL (not Quote): only Full's single packet carries OI alongside
+            # LTP+volume — Quote's OI is a separate, LTP-less packet we'd drop.
+            out.append((seg, str(fut["security_id"]), _FEED_FULL))
         return out
 
     def _sec_to_companion(self) -> dict:

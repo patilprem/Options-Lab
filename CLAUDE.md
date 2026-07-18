@@ -192,8 +192,13 @@ Before real capital, ON THE VPS during market hours: (a) live tick→candle flow
 kill_switch action strings. Also pending: MCX chain recording needs MCX security
 ids in dhan_client.UNDERLYINGS. Flip live on only via /live/settings ON the VPS.
 - Index-futures VOLUME companion (engines/feed.py + paper.py, gated behind the
-  `index_futures_volume` setting, default OFF): the tick→candle volume/OI
-  plumbing and the FUTIDX front-month parser are tested offline, but the live
-  path is UNVERIFIED — confirm on the VPS: resolve_index_futures() symbol
-  format, the `_FEED_NSE_FNO`/`_FEED_QUOTE` mode ints, and the Quote packet's
-  cumulative-volume field. Only flip the setting on after that.
+  `index_futures_volume` setting, default OFF). VERIFIED against the installed
+  dhanhq SDK: feed-mode/segment ints (Ticker15/Full21/IDX0/NSE_FNO2/BSE_FNO8),
+  the FUTIDX instrument + `NAME-MonYYYY-FUT` symbol format, and the packet keys
+  — the companion subscribes FULL (mode 21), NOT Quote, because only Full's
+  single packet carries OI with LTP+volume (Quote's OI is a separate LTP-less
+  packet _handle_packet drops). STILL VPS-pending during market hours (needs
+  the registered static IP): that resolve_index_futures() returns the right live
+  contract and that a Full subscription actually streams increasing volume+OI —
+  run `venv/bin/python -m scripts.verify_index_futures`. Flip the setting on
+  only after that passes.
