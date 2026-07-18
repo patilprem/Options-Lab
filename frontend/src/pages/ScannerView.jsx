@@ -140,13 +140,17 @@ export default function ScannerView({ showToast }) {
         </span>
         <span style={{ color: 'var(--muted)', fontSize: 13 }}>alert ≥ {data.alert_score}</span>
         <button
-          className="btn"
+          className="btn btn-ghost"
           title="Off: only symbols the auto-trader actually holds get their full option chain persisted to disk. On: every shortlisted mover does, for a research dataset — uses more storage/API budget."
           onClick={() => setRecordChains(!data.record_chains)}
         >
           Record shortlist chains: {data.record_chains ? 'on' : 'off'}
         </button>
-        <button className="btn" style={{ marginLeft: 'auto' }} onClick={() => setEnabled(!data.enabled)}>
+        <button
+          className={`btn ${data.enabled ? 'btn-danger' : 'btn-primary'}`}
+          style={{ marginLeft: 'auto' }}
+          onClick={() => setEnabled(!data.enabled)}
+        >
           {data.enabled ? 'Turn off' : 'Turn on'}
         </button>
       </div>
@@ -189,7 +193,11 @@ export default function ScannerView({ showToast }) {
               {book.open}/{book.max_positions} open · realized ₹{Math.round(book.realized).toLocaleString('en-IN')} ·
               unrealized <span style={{ color: book.unrealized >= 0 ? 'var(--green)' : 'var(--red)' }}>₹{Math.round(book.unrealized).toLocaleString('en-IN')}</span>
             </span>
-            <button className="btn" style={{ marginLeft: 'auto' }} onClick={() => setTrading(!book.enabled)}>
+            <button
+              className={`btn ${book.enabled ? 'btn-danger' : 'btn-primary'}`}
+              style={{ marginLeft: 'auto' }}
+              onClick={() => setTrading(!book.enabled)}
+            >
               {book.enabled ? 'Stop' : 'Start (paper)'}
             </button>
           </div>
