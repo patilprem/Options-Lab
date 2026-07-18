@@ -15,6 +15,7 @@ export default function DataView({ showToast }) {
   const [maturity, setMaturity] = useState(null)
   const [underlying, setUnderlying] = useState('NIFTY')
   const [period, setPeriod] = useState('2y')
+  const [strikes, setStrikes] = useState(5)   // ATM±N option strikes to pull
   const [status, setStatus] = useState(null)
   const poll = useRef(null)
 
@@ -45,7 +46,8 @@ export default function DataView({ showToast }) {
     try {
       const res = await fetch('/data/backfill', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ underlying, period, strike_offsets: 2, interval: 5 }),
+        body: JSON.stringify({ underlying, period,
+                               strike_offsets: Number(strikes) || 2, interval: 5 }),
       })
       const d = await res.json()
       if (!res.ok) throw new Error(d.detail || 'failed')
@@ -161,13 +163,23 @@ export default function DataView({ showToast }) {
             {PERIODS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
           </select>
         </label>
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12 }}>
+          Strikes ATM±
+          <select style={input} value={strikes} onChange={e => setStrikes(e.target.value)} disabled={running}>
+            {[2, 3, 4, 5].map(n => <option key={n} value={n}>±{n}</option>)}
+          </select>
+        </label>
         <button className="btn btn-primary" onClick={startBackfill} disabled={running}>
           {running ? 'Backfilling…' : 'Pull history'}
         </button>
       </div>
       <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 6 }}>
-        Pulls spot + ATM±2 option candles (5-min). The expired-options endpoint is slow
-        (~1 min/chunk); Max (~5y) can take a few hours — it runs in the background.
+        Pulls spot + ATM±N option candles (5-min). Wider strikes = more chunks =
+        slower, but multi-leg strategies (spreads/condors with far-OTM wings) can
+        only backtest strikes that exist here. Re-running is incremental: chunks
+        already fetched (e.g. an earlier ±2 pull) are skipped, only new offsets
+        download. The expired-options endpoint is slow (~1 min/chunk) and runs in
+        the background.
       </div>
 
       <div style={{ marginTop: 12, padding: 12, borderRadius: 8, border: '1px solid var(--line)', background: 'var(--glass)' }}>

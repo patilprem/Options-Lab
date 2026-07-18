@@ -159,7 +159,18 @@ class IronCondorHarvest(Strategy):
         legs = self._condor_legs()
         qs = [ctx.option(l) for l in legs]
         if any(q is None for q in qs):
-            return                           # incomplete chain -> no trade
+            # LOUD, not silent: a 2-year backtest once produced exactly ONE
+            # condor because the store's option history only covered ATM+/-2
+            # while the legs need +/-(short_offset+wing_strikes) — and this
+            # branch skipped every day without a word. If you see this log,
+            # re-backfill with Strikes ATM+/-5 on the Data tab.
+            if self.skip_logged != today:
+                self.skip_logged = today
+                missing = [f"{l.option_type.value[0]}{l.strike_offset:+d}"
+                           for l, q in zip(legs, qs) if q is None]
+                ctx.log(f"condor skipped: no quote for {', '.join(missing)} "
+                        "(option history missing these strikes?)")
+            return
         sc, lc, sp, lp = qs
         credit = (sc.ltp + sp.ltp) - (lc.ltp + lp.ltp)
         width = lc.strike - sc.strike        # rupee width of one wing
