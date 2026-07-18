@@ -28,7 +28,10 @@ def rec(tmp_path, monkeypatch):
     monkeypatch.setattr(registry, "DB_PATH", tmp_path / "test.db")
     registry.init_db()
     r = registry.create("PBK Confluence", "x")
+    registry.transition(r.id, registry.State.VALIDATED)
+    registry.transition(r.id, registry.State.DEPLOYED_PAUSED)
     registry.allocate(r.id, 500_000)
+    registry.transition(r.id, registry.State.RUNNING)   # match the real report: RUNNING
     yield registry.get(r.id)
     runner.contexts.pop(r.id, None)   # never leak into other tests
 

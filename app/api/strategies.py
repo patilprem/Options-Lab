@@ -539,47 +539,68 @@ def trade_history(from_date: str = "", to_date: str = "",
 portfolio_router = APIRouter(tags=["portfolio"])
 
 
+def _ist_today() -> str:
+    """IST calendar date — the single source of truth for 'what day is it' on
+    every P&L read. The whole paper engine (PaperContext._roll_day,
+    _session_date()) keys off IST wall-clock; a naive datetime.now() call
+    disagrees with that near the IST/UTC midnight offset on any server not
+    clocked to IST, which can misroute the reset logic below."""
+    from app.engines.paper import IST
+    return datetime.now(IST).date().isoformat()
+
+
+def _today_day_pnl(rec, ctx, today: str) -> tuple[float, int, list[dict]]:
+    """The single reset-aware read of ONE strategy's today's P&L. Shared by
+    /portfolio/today and /{sid}/performance so they can't drift into two
+    different (and differently buggy) answers to the same question — that
+    drift is exactly how a fix in one endpoint left the other one showing
+    stale P&L under today's date.
+
+    Returns (day_pnl, n_open, trades_today_rows).
+
+    ctx.day_pnl rolls on the FIRST BAR of a new trading day (PaperContext.
+    _roll_day, called from push_bar) — so before that first bar arrives
+    (anywhere from market close through the next session's open, including
+    all of a weekend), ctx.day_pnl still holds the PREVIOUS session's total.
+    Trust it only once the engine's own clock (ctx.now, driven by the same
+    bar) is actually on today. Otherwise fall back to a persisted row for
+    today if one exists (a strategy that traded today then got stopped), else
+    zero — and as a final backstop, zero-activity (no fill today, nothing
+    open right now) can never legitimately produce a nonzero P&L, so that
+    combination always wins over a possibly-stale persisted row."""
+    n_open = len(ctx.positions) if ctx else 0
+    t_rows = registry.trades_for(rec.id, today, "PAPER")
+    today_row = next((r for r in registry.performance_rows(rec.id, "PAPER")
+                      if r["trade_date"] == today), None)
+    if ctx and ctx.now.date().isoformat() == today:
+        day_pnl = round(ctx.day_pnl, 2)
+    elif today_row:
+        day_pnl = round((today_row["realized"] or 0.0) + (today_row["unrealized"] or 0.0), 2)
+    else:
+        day_pnl = 0.0
+    if not t_rows and n_open == 0:
+        day_pnl = 0.0
+    return day_pnl, n_open, t_rows
+
+
 @portfolio_router.get("/portfolio/today")
 def portfolio_today():
     """Combined view across every deployed strategy: today's P&L / ROI,
     all open positions, all trades — plus a per-strategy breakdown."""
-    from app.engines.paper import IST
-    # IST, not naive datetime.now(): the whole paper engine (PaperContext's
-    # _roll_day, _session_date()) keys "today" off IST wall-clock. A naive
-    # `today` disagrees with that around the IST/UTC midnight offset on any
-    # server not clocked to IST, which can misroute the branches below.
-    today = datetime.now(IST).date().isoformat()
+    today = _ist_today()
     strategies_out, positions, trades = [], [], []
     total_alloc = total_day = total_margin = 0.0
     for rec in registry.list_all():
         deployed = rec.state in (State.RUNNING, State.DEPLOYED_PAUSED)
         ctx = runner.contexts.get(rec.id)
-        n_open = len(ctx.positions) if ctx else 0
-        t_rows = registry.trades_for(rec.id, today, "PAPER")
+        day_pnl, n_open, t_rows = _today_day_pnl(rec, ctx, today)
         # A strategy that traded today still belongs in today's P&L even if it
-        # has since been stopped — otherwise stopping it silently erases the day.
-        today_row = next((r for r in registry.performance_rows(rec.id, "PAPER")
-                          if r["trade_date"] == today), None)
-        if not deployed and ctx is None and not t_rows and not today_row:
+        # has since been stopped — otherwise stopping it silently erases the
+        # day. Gated on t_rows/n_open (reliable, freshly computed), never on a
+        # persisted row alone — a stale row must not keep a dead strategy
+        # visible under today's date either.
+        if not deployed and ctx is None and not t_rows and n_open == 0:
             continue
-        # ctx.day_pnl rolls on the FIRST BAR of a new session, so pre-open it
-        # still carries yesterday's total — only trust it once the engine's
-        # clock is actually on today (else the dashboard shows yesterday's
-        # P&L under today's date until 09:15).
-        if ctx and ctx.now.date().isoformat() == today:
-            day_pnl = round(ctx.day_pnl, 2)
-        elif today_row:
-            day_pnl = round((today_row["realized"] or 0.0) + (today_row["unrealized"] or 0.0), 2)
-        else:
-            day_pnl = 0.0
-        # ZERO-ACTIVITY GUARD: no trade filled today AND nothing open right now
-        # means today's realized+unrealized P&L is definitionally zero — any
-        # nonzero value here can only be a stale row a rare edge left behind
-        # (e.g. a day that got a daily_pnl row without the bars to back it),
-        # and showing it under TODAY'S date is exactly the "yesterday's P&L
-        # mislabeled as today" bug. Zero it rather than trust a leftover row.
-        if not t_rows and n_open == 0:
-            day_pnl = 0.0
         open_rows = []
         if ctx:
             for p in ctx.positions:
@@ -1001,10 +1022,19 @@ def metrics(sid: str, mode: str = "PAPER"):
 def performance(sid: str):
     rec = _rec_or_404(sid)
     ctx = runner.contexts.get(sid)
+    today = _ist_today()
     open_positions = []
+    # day_pnl stays None (not 0.0) when there's no live context — the frontend
+    # (PaperPanel.jsx) reads day_pnl===null as "not currently deployed" and
+    # hides the live stat cards on that signal, so this distinction is load
+    # bearing, not cosmetic. When ctx DOES exist, route through the same
+    # reset-aware helper /portfolio/today uses — ctx.day_pnl alone rolls only
+    # on the first bar of a new day, so reading it directly (as this endpoint
+    # used to) showed the PREVIOUS session's total under today's date for the
+    # whole overnight window, including the first few minutes after 09:15.
     day_pnl = None
     if ctx:
-        day_pnl = round(ctx.day_pnl, 2)
+        day_pnl, _n_open, _t_rows = _today_day_pnl(rec, ctx, today)
         open_positions = [{
             "id": p.id, "tag": p.tag, "type": p.leg.option_type.value,
             "strike": p.strike, "expiry": str(p.expiry), "qty": p.qty,
@@ -1013,8 +1043,6 @@ def performance(sid: str):
             "margin": p.margin_blocked,
             "unrealized": round(p.unrealized_pnl, 2),
         } for p in ctx.positions]
-    from datetime import datetime as _dt
-    today = _dt.now().date().isoformat()
     cap = rec.allocated_capital or 0.0
     day_roi = round(100 * day_pnl / cap, 2) if (day_pnl is not None and cap > 0) else None
     margin_used = round(ctx._margin_used, 2) if ctx else 0.0
