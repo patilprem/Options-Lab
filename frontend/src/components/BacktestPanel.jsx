@@ -137,7 +137,7 @@ export default function BacktestPanel({ id, underlying }) {
             <Line data={chartData} options={chartOpts} />
           </div>
 
-          <div style={{ overflowX: 'auto', maxHeight: 260 }}>
+          <div className="table-scroll" style={{ maxHeight: 260 }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <thead>
                 <tr style={{ color: 'var(--muted)', textAlign: 'left' }}>
@@ -262,7 +262,7 @@ function Section({ title, children }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div style={{ fontSize: 13, color: 'var(--ink)', fontWeight: 600 }}>{title}</div>
-      <div style={{ overflowX: 'auto', maxHeight: 260 }}>{children}</div>
+      <div className="table-scroll" style={{ maxHeight: 260 }}>{children}</div>
     </div>
   )
 }
