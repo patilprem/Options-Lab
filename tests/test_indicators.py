@@ -223,3 +223,16 @@ def test_example_strategy_using_indicators_validates():
     r = loader.validate(code.read_text())
     assert r.ok, (r.errors, r.warnings)
     assert r.meta.params.get("warmup_bars") == 60
+
+
+@pytest.mark.parametrize("fname", ["trend_rider_itm.py", "range_income_seller.py"])
+def test_toolbox_example_strategies_validate(fname):
+    """The trend-buyer and range-seller examples (built on indicators + the
+    extended Context reads) must pass the loader pipeline and declare warmup."""
+    from pathlib import Path
+
+    from app.core import loader
+    code = Path(__file__).resolve().parents[1] / "examples" / fname
+    r = loader.validate(code.read_text())
+    assert r.ok, (r.errors, r.warnings)
+    assert r.meta.params.get("warmup_bars", 0) > 0
