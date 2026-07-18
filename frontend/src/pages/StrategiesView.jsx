@@ -11,10 +11,26 @@ const input = {
   borderRadius: 8, padding: '7px 10px', fontFamily: 'var(--mono)', fontSize: 13,
 }
 
-export default function StrategiesView({ strategies, onSelect, onNew }) {
+const DEPLOYED_STATES = ['RUNNING', 'DEPLOYED_PAUSED']
+
+export default function StrategiesView({ strategies, onSelect, onNew, onDeleted, showToast }) {
   const [q, setQ] = useState('')
   const [state, setState] = useState('ALL')
   const [live, setLive] = useState({})   // id -> {day_pnl, trades_today, open_positions}
+
+  const handleDelete = async (e, s) => {
+    e.stopPropagation()
+    if (!window.confirm(`Delete "${s.name}"? This removes its backtests, trades and history too.`)) return
+    try {
+      const res = await fetch(`/strategies/${s.id}`, { method: 'DELETE' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Delete failed')
+      showToast?.('Strategy deleted')
+      onDeleted?.()
+    } catch (err) {
+      showToast?.(err.message)
+    }
+  }
 
   useEffect(() => {
     const load = async () => {
@@ -83,11 +99,13 @@ export default function StrategiesView({ strategies, onSelect, onNew }) {
               <th>Day P&L</th>
               <th>Open</th>
               <th>Trades</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
             {rows.map(s => {
               const l = live[s.id]
+              const deployed = DEPLOYED_STATES.includes(s.state)
               return (
                 <tr key={s.id} style={{ cursor: 'pointer' }} onClick={() => onSelect(s.id)}>
                   <td style={{ fontFamily: 'var(--body)', fontWeight: 600 }}>{s.name}</td>
@@ -99,6 +117,15 @@ export default function StrategiesView({ strategies, onSelect, onNew }) {
                   <td className={l ? pnlCls(l.day_pnl) : ''}>{l ? sign(l.day_pnl) : '—'}</td>
                   <td>{l ? l.open_positions : '—'}</td>
                   <td>{l ? l.trades_today : '—'}</td>
+                  <td>
+                    <button
+                      className="btn btn-ghost"
+                      style={{ padding: '4px 10px', fontSize: 12 }}
+                      onClick={e => handleDelete(e, s)}
+                      disabled={deployed}
+                      title={deployed ? 'Stop the strategy before deleting it' : 'Delete strategy'}
+                    >Delete</button>
+                  </td>
                 </tr>
               )
             })}

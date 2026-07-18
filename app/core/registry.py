@@ -192,6 +192,50 @@ def set_meta(strategy_id: str, meta: dict) -> None:
                   (json.dumps(meta), _now(), strategy_id))
 
 
+def rename(strategy_id: str, name: str) -> StrategyRecord:
+    name = name.strip()
+    if not name:
+        raise ValueError("name cannot be empty")
+    rec = get(strategy_id)
+    if rec is None:
+        raise KeyError(strategy_id)
+    with _conn() as c:
+        c.execute("UPDATE strategies SET name=?, updated_at=? WHERE id=?",
+                  (name, _now(), strategy_id))
+    return get(strategy_id)
+
+
+def update_code(strategy_id: str, code: str) -> StrategyRecord:
+    """Replace a strategy's code. Caller must re-validate + set_meta +
+    transition to VALIDATED afterwards; this only guards state and resets
+    to DRAFT since the old meta/validation no longer applies."""
+    rec = get(strategy_id)
+    if rec is None:
+        raise KeyError(strategy_id)
+    if rec.state in (State.RUNNING, State.DEPLOYED_PAUSED):
+        raise ValueError("Stop the strategy before editing its code")
+    with _conn() as c:
+        c.execute("UPDATE strategies SET code=?, state=?, updated_at=? WHERE id=?",
+                  (code, State.DRAFT.value, _now(), strategy_id))
+    return get(strategy_id)
+
+
+def delete(strategy_id: str) -> None:
+    rec = get(strategy_id)
+    if rec is None:
+        raise KeyError(strategy_id)
+    if rec.state in (State.RUNNING, State.DEPLOYED_PAUSED):
+        raise ValueError("Stop the strategy before deleting it")
+    with _conn() as c:
+        c.execute("DELETE FROM strategies WHERE id=?", (strategy_id,))
+        c.execute("DELETE FROM backtest_runs WHERE strategy_id=?", (strategy_id,))
+        c.execute("DELETE FROM daily_pnl WHERE strategy_id=?", (strategy_id,))
+        c.execute("DELETE FROM events WHERE strategy_id=?", (strategy_id,))
+        c.execute("DELETE FROM trades WHERE strategy_id=?", (strategy_id,))
+        c.execute("DELETE FROM paper_state WHERE strategy_id=?", (strategy_id,))
+        c.execute("DELETE FROM settings WHERE key LIKE ?", (f"%:{strategy_id}",))
+
+
 def allocate(strategy_id: str, capital: float, square_off_on_pause: Optional[bool] = None) -> StrategyRecord:
     if capital < 0:
         raise ValueError("capital must be >= 0")

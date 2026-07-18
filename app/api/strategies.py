@@ -4,6 +4,9 @@ REST API — what your UI talks to.
 POST   /strategies                     paste code -> validate -> register
 GET    /strategies                     list all with state + capital
 GET    /strategies/{id}                detail (code, meta, state)
+PATCH  /strategies/{id}                {"name": "..."} -> rename
+PUT    /strategies/{id}/code           {"code": "..."} -> validate -> replace (blocked while running/deployed)
+DELETE /strategies/{id}                remove strategy + its history (blocked while running/deployed)
 POST   /strategies/{id}/allocate       {"capital": 500000, "square_off_on_pause": false}
 POST   /strategies/{id}/backtest       {"from_date": "...", "to_date": "...", "capital": ...}
 GET    /strategies/{id}/backtests      past runs (summary + daily P&L)
@@ -51,6 +54,14 @@ scanner_engine.trader = ScannerTrader(_store)   # positional paper book on scree
 
 class CreateReq(BaseModel):
     name: str
+    code: str
+
+
+class RenameReq(BaseModel):
+    name: str
+
+
+class UpdateCodeReq(BaseModel):
     code: str
 
 
@@ -850,6 +861,50 @@ def get_strategy(sid: str):
             "allocated_capital": r.allocated_capital,
             "square_off_on_pause": r.square_off_on_pause,
             "meta": r.meta, "code": r.code}
+
+
+@router.patch("/{sid}")
+def rename_strategy(sid: str, req: RenameReq):
+    _rec_or_404(sid)
+    try:
+        rec = registry.rename(sid, req.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    registry.record_event("info", "lifecycle", f"Renamed to '{rec.name}'", sid)
+    return {"id": sid, "name": rec.name}
+
+
+@router.put("/{sid}/code")
+def update_code(sid: str, req: UpdateCodeReq):
+    rec = _rec_or_404(sid)
+    if rec.state in (State.RUNNING, State.DEPLOYED_PAUSED):
+        raise HTTPException(400, "Stop the strategy before editing its code")
+    result = loader.validate(req.code)
+    if not result.ok:
+        raise HTTPException(422, detail={"errors": result.errors,
+                                         "warnings": result.warnings})
+    registry.update_code(sid, req.code)
+    registry.set_meta(sid, {
+        "underlying": result.meta.underlying,
+        "segment": result.meta.segment,
+        "timeframe": result.meta.timeframe,
+        "params": result.meta.params,
+        "class_name": result.strategy_class_name,
+        "description": result.meta.description,
+    })
+    registry.transition(sid, State.VALIDATED)
+    registry.record_event("info", "lifecycle", "Code updated & revalidated", sid)
+    return {"id": sid, "state": "VALIDATED",
+            "meta": registry.get(sid).meta, "warnings": result.warnings}
+
+
+@router.delete("/{sid}")
+def delete_strategy(sid: str):
+    rec = _rec_or_404(sid)
+    if rec.state in (State.RUNNING, State.DEPLOYED_PAUSED):
+        raise HTTPException(400, "Stop the strategy before deleting it")
+    registry.delete(sid)
+    return {"id": sid, "deleted": True}
 
 
 @router.post("/{sid}/allocate")
