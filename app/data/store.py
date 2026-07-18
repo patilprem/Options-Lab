@@ -463,6 +463,19 @@ class DataStore:
                WHERE index_name=? AND CAST(ts AS DATE)=CAST(? AS DATE)
                ORDER BY ts""", [index_name, str(day)])
 
+    def index_bias_full_series(self, index_name: str, end):
+        """Full ascending index_bias_history rows up to `end` — the BACKTEST
+        preload source for ctx.signal('index_bias'), fetched ONCE per backtest
+        run (see index_bias_asof, which re-queries per call — too slow when a
+        strategy checks the signal every bar over a multi-year window). Same
+        row shape as index_bias_asof's SELECT, just unbounded on `ts`."""
+        return self._q(
+            """SELECT ts, score, buildup_breadth, price_breadth, bull_weight,
+                      bear_weight, coverage, n, spot
+               FROM index_bias_history
+               WHERE index_name=? AND ts <= ?
+               ORDER BY ts""", [index_name, end])
+
     def index_bias_asof(self, index_name: str, ts, max_age_min: int = 20):
         """Point-in-time index_bias read AS-OF `ts` for backtest replay (F6):
         the most recent recorded reading at or before `ts`, reconstructed into
@@ -491,6 +504,36 @@ class DataStore:
                 "label": label, "spot": row[8], "contributors": [],
                 "as_of": row[0].isoformat(sep=" ", timespec="seconds"),
                 "replayed": True}
+
+    def atm_iv_full_series(self, underlying: str, end):
+        """Full ascending ATM IV time series up to `end` from option_bars — the
+        BACKTEST preload source for ctx.iv_rank(). Unlike atm_iv_option_series
+        (which re-queries a `lookback_days` window every call — a per-bar cost
+        that dominates a multi-year backtest), this is fetched ONCE per
+        backtest run and bisected in memory by the caller, the same pattern
+        _quote()/mark_price() already use for option series. Rows: (ts, iv)."""
+        rows = self._q(
+            """SELECT ts, avg(iv) FROM option_bars
+               WHERE underlying=? AND expiry_kind='WEEKLY' AND expiry_offset=0
+                 AND strike_offset=0 AND iv IS NOT NULL AND ts <= ?
+               GROUP BY ts ORDER BY ts""", [underlying, end])
+        return [(r[0], r[1]) for r in rows if r[1] is not None]
+
+    def chain_snapshot_rows(self, underlying: str, end):
+        """Full ascending chain_snapshots rows up to `end` — the BACKTEST
+        preload source for ctx.chain(). Unlike chain_cache_asof (two queries
+        PER CALL: one to find the latest poll timestamp, one to fetch its
+        rows), this is fetched ONCE per backtest run; the caller bisects the
+        returned (ts_list, rows) to reconstruct the point-in-time cache
+        chain_cache_asof would have returned, without re-hitting the store.
+        Same columns/order as chain_cache_asof's per-row SELECT."""
+        return self._q(
+            """SELECT ts, expiry, expiry_kind, expiry_offset, strike,
+                      strike_offset, option_type, ltp, bid, ask, iv, oi, volume,
+                      delta, theta, vega, gamma
+               FROM chain_snapshots
+               WHERE underlying=? AND ts <= ?
+               ORDER BY ts""", [underlying, end])
 
     def atm_iv_option_series(self, underlying: str, end, lookback_days: int = 30):
         """ATM (weekly-0, strike_offset 0) IV time series up to `end` from
@@ -744,6 +787,9 @@ SyntheticStore.index_bias_asof = lambda self, name, ts, max_age_min=20: None
 SyntheticStore.chain_cache_asof = lambda self, u, ts, max_age_min=10: None
 SyntheticStore.atm_iv_option_series = lambda self, u, end, lookback_days=30: []
 SyntheticStore.atm_iv_chain_series = lambda self, u, end, lookback_days=30: []
+SyntheticStore.atm_iv_full_series = lambda self, u, end: []
+SyntheticStore.chain_snapshot_rows = lambda self, u, end: []
+SyntheticStore.index_bias_full_series = lambda self, name, end: []
 SyntheticStore.latest_spot = lambda self, u, day=None: None
 SyntheticStore.record_setup_flag = lambda self, ts, s, b, sc, sp, ap: None
 SyntheticStore.setup_flags_since = lambda self, since_day: []

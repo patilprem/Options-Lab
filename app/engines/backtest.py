@@ -16,7 +16,7 @@ import bisect
 import math
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 from app.core.contract import (Action, Bar, Context, LegSpec, OptionQuote,
@@ -77,6 +77,15 @@ class BacktestContext(Context):
         self._interval: Optional[int] = None        # own timeframe (set by run_backtest)
         self._warmup: list[Bar] = []                # pre-`start` bars for indicator lookback
         self._bars: list[Bar] = []
+        # Preload-once caches for the extended read surface (history(interval=),
+        # chain(), iv_rank()) — each is hit up to once PER BAR by a strategy, so
+        # a per-call DuckDB query (the naive first cut) turns a multi-year
+        # backtest into tens of thousands of queries and times the request out.
+        # Same fix as _quote()/mark_price() below: fetch the whole series once,
+        # bisect in memory after that. Populated lazily on first use.
+        self._htf_series: dict = {}                 # interval -> (ts_list, bars)
+        self._iv_series: Optional[tuple] = None      # (ts_list, iv_list)
+        self._chain_rows: Optional[tuple] = None      # (ts_list, rows)
         self._positions: list[Position] = []
         self.closed: list[Position] = []
         self._margin_used = 0.0
@@ -174,32 +183,68 @@ class BacktestContext(Context):
     def history(self, n: int, interval: Optional[int] = None) -> list[Bar]:
         # A different timeframe than our own -> resample from the store as-of
         # now (point-in-time safe: history_bars only aggregates rows <= now).
-        if (interval is not None and interval != self._interval
-                and hasattr(self.store, "history_bars")):
-            return self.store.history_bars(self.underlying, self.now, interval, n)
+        if interval is not None and interval != self._interval:
+            return self._htf_history(interval, n)
         # own timeframe: warmup bars (recorded before `start`) prepend the live
         # window so an indicator strategy has lookback from its first on_bar.
         if self._warmup:
             return (self._warmup + self._bars)[-n:]
         return self._bars[-n:]
 
+    def _htf_history(self, interval: int, n: int) -> list[Bar]:
+        """Multi-timeframe read, preloaded ONCE per interval then bisected —
+        a strategy may call history(interval=...) on every bar, and a fresh
+        DuckDB query each time turns a multi-year backtest into tens of
+        thousands of round-trips (this is what stalled/timed out real
+        backtests — see git history). Same pattern as _quote()/mark_price()."""
+        if self._end is not None:
+            cached = self._htf_series.get(interval)
+            if cached is None:
+                bars = self.store.underlying_bars(
+                    self.underlying, datetime(1970, 1, 1), self._end, interval)
+                cached = ([b.ts for b in bars], bars)
+                self._htf_series[interval] = cached
+            ts_list, bars = cached
+            i = bisect.bisect_right(ts_list, self.now)
+            return bars[:i][-n:]
+        if hasattr(self.store, "history_bars"):
+            return self.store.history_bars(self.underlying, self.now, interval, n)
+        return []
+
     def chain(self) -> Optional[dict]:
-        if not self._bars or not hasattr(self.store, "chain_cache_asof"):
+        if not self._bars:
             return None
-        cache = self.store.chain_cache_asof(self.underlying, self.now)
+        cache = self._replay.chain_cache_at(self.underlying, self.now)
         if not cache:
             return None
         from app.engines.scanner import chain_summary
         return chain_summary(cache)
 
     def iv_rank(self, lookback_days: int = 30) -> Optional[float]:
-        if not self._bars or not hasattr(self.store, "atm_iv_option_series"):
+        if not self._bars:
             return None
-        series = self.store.atm_iv_option_series(self.underlying, self.now, lookback_days)
+        series = self._iv_window(lookback_days)
         if len(series) < 5:            # too thin to rank meaningfully
             return None
         from app.engines.indicators import percentile_rank
         return percentile_rank(series[-1], series)
+
+    def _iv_window(self, lookback_days: int) -> list[float]:
+        """The [now-lookback_days, now] ATM-IV window, from a full series
+        preloaded ONCE per backtest and bisected — see _htf_history for why
+        per-call querying isn't an option over a multi-year replay."""
+        if self._end is not None:
+            if self._iv_series is None:
+                rows = self.store.atm_iv_full_series(self.underlying, self._end)
+                self._iv_series = ([r[0] for r in rows], [r[1] for r in rows])
+            ts_list, iv_list = self._iv_series
+            start = self.now - timedelta(days=lookback_days)
+            lo = bisect.bisect_left(ts_list, start)
+            hi = bisect.bisect_right(ts_list, self.now)
+            return iv_list[lo:hi]
+        if hasattr(self.store, "atm_iv_option_series"):
+            return self.store.atm_iv_option_series(self.underlying, self.now, lookback_days)
+        return []
 
     def signal(self, name: str):
         """Point-in-time replay of recorded scanner signals (F6). Returns the
@@ -322,7 +367,6 @@ def _seed_warmup(ctx: "BacktestContext", store, underlying: str,
     exist only to deepen ctx.history()."""
     if n <= 0:
         return
-    from datetime import timedelta
     per_day = max(1, 375 // max(1, interval))          # ~375 trading min/day
     lookback_days = max(5, (n // per_day + 2) * 2)     # pad for weekends/holidays
     prior = store.underlying_bars(underlying, start - timedelta(days=lookback_days),
@@ -341,6 +385,7 @@ def run_backtest(strategy: Strategy, store, start: datetime, end: datetime,
     ctx = BacktestContext(meta.underlying, store, capital,
                           fee_cfg or F.FeeConfig(), slip_cfg or F.SlippageConfig())
     ctx._end = end                      # enables in-memory option-series preload
+    ctx._replay.set_end(end)            # same, for signal()'s index_bias/chain preload
     interval = int(meta.timeframe)
     ctx._interval = interval            # own timeframe (for history(interval=...))
     # warmup depth: explicit arg wins; else honor a strategy's declared hint so
