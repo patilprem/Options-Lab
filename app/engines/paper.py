@@ -829,7 +829,15 @@ class PaperContext(Context):
         """Snapshot open positions + margin/P&L to SQLite so a restart mid-
         session can recover this strategy exactly where it left off."""
         registry.save_paper_state(self.rec.id, {
-            "date": _session_date(),
+            # Label the snapshot with the trading day the counters ACTUALLY
+            # belong to (self._day), not the wall clock. Over a weekend/holiday
+            # no bar arrives, so _roll_day never fires and _realized_today still
+            # holds the last session's P&L — stamping it with today's wall-clock
+            # date would make restore_state treat it as "same session" and carry
+            # yesterday's P&L into today (observed after a Saturday restart:
+            # dashboard showed Friday's -₹ under today's date). Fall back to the
+            # wall clock only before the first bar, when there are no counters.
+            "date": (self._day.isoformat() if self._day else _session_date()),
             "margin_used": round(self._margin_used, 2),
             "realized_today": round(self._realized_today, 2),
             "fees_today": round(self._fees_today, 2),

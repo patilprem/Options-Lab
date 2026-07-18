@@ -70,3 +70,34 @@ def test_pnl_persists_at_eod_then_resets_next_day(db):
     assert rows[0]["equity_eod"] == day1_equity          # past day intact
     # day-2 equity chains off day-1 close (flat day → equals it)
     assert rows[1]["equity_eod"] == day1_equity
+
+
+def test_prior_day_snapshot_discarded_on_restart(db):
+    """A weekend/overnight restart must not carry a prior session's realized
+    P&L into today. Over a weekend no bar arrives, so _roll_day never fires and
+    _realized_today still holds the last session's P&L; persist_state labels the
+    snapshot with the trading day the counters belong to (self._day), so
+    restore_state discards a stale one instead of treating it as the current
+    session. Regression for: after a Saturday restart the dashboard showed
+    Friday's P&L under today's date."""
+    from app.core.contract import Bar
+
+    rec = _running_record()
+    hub = MarketHub(SyntheticStore())
+    ctx = PaperContext(rec, "NIFTY", hub, 5)
+
+    # A prior trading day left a non-zero realized counter with no later bar to
+    # roll it (clearly-past date so it can never equal the real "today").
+    ctx.push_bar(Bar(datetime(2020, 1, 2, 15, 25), 22000, 22010, 21990, 22000))
+    ctx._realized_today = -2431.87
+    ctx.persist_state()
+
+    snap = registry.load_paper_state(rec.id)
+    assert snap["date"] == "2020-01-02"                  # labeled with the counters' day
+    assert snap["date"] != datetime.now().date().isoformat()   # ...not the wall clock
+
+    # Restart "today": the stale snapshot is discarded, counters start clean.
+    ctx2 = PaperContext(rec, "NIFTY", hub, 5)
+    assert ctx2.restore_state() == 0
+    assert ctx2._realized_today == 0.0
+    assert registry.load_paper_state(rec.id) is None     # cleared as stale
