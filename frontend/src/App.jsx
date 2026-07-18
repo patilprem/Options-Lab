@@ -124,6 +124,7 @@ export default function App() {
             setDeployTarget(id)
             setLiveModalOpen(true)
           }}
+          onChanged={loadList}
           showToast={showToast}
         />
       )
@@ -138,6 +139,8 @@ export default function App() {
             strategies={strategies}
             onSelect={goStrategy}
             onNew={() => setNewModalOpen(true)}
+            onDeleted={loadList}
+            showToast={showToast}
           />
         )
       case 'risk':
