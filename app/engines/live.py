@@ -230,7 +230,7 @@ class LiveContext(Context):
     def set_paused(self, paused: bool) -> None:
         self.paused = paused
         if paused and self.rec.square_off_on_pause:
-            self.exit_all()
+            self.exit_all(reason="pause")
 
     # -- Context surface -----------------------------------------------------
     @property
@@ -342,18 +342,18 @@ class LiveContext(Context):
                 return True
         return False
 
-    def exit(self, position_id: str) -> bool:
+    def exit(self, position_id: str, reason: str = "signal") -> bool:
         for p in self._open:
             if p.id == position_id and p.is_open:
-                self._square(p, reason="manual")
+                self._square(p, reason=reason)
                 return True
         return False
 
-    def exit_all(self) -> None:
+    def exit_all(self, reason: str = "signal") -> None:
         for p in list(self.positions):
-            self._square(p, reason="manual")
+            self._square(p, reason=reason)
 
-    def _square(self, p: Position, reason: str = "manual") -> None:
+    def _square(self, p: Position, reason: str = "signal") -> None:
         seg = UNDERLYINGS.get(self.underlying, {}).get("fno_segment", "NSE_FNO")
         # cancel the resting super order, then send an opposite squaring order
         try:
@@ -461,7 +461,7 @@ class LiveRunner:
             if kind == "eod" or (bar and bar.ts.time() >= dtime(15, 25)):
                 if bar:
                     ctx.push_bar(bar)
-                ctx.exit_all()
+                ctx.exit_all(reason="squareoff")
                 strategy.on_day_end(ctx)
                 ctx.persist_day()
                 if kind == "eod":
@@ -498,7 +498,7 @@ class LiveRunner:
         registry.record_event("error", "live", f"KILL: {reason}; flattening all")
         for sid, ctx in list(self.contexts.items()):
             try:
-                ctx.exit_all()
+                ctx.exit_all(reason="squareoff")
                 ctx.kill.arm()
                 ctx.set_paused(True)
                 registry.transition(sid, registry.State.DEPLOYED_PAUSED)
@@ -508,7 +508,7 @@ class LiveRunner:
     async def stop(self, sid: str) -> None:
         ctx = self.contexts.get(sid)
         if ctx:
-            ctx.exit_all()
+            ctx.exit_all(reason="squareoff")
             ctx.persist_day()
         if sid in self.tasks:
             self.tasks[sid].cancel()

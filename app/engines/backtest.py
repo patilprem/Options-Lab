@@ -224,16 +224,16 @@ class BacktestContext(Context):
         self._margin_used += est
         return True
 
-    def exit(self, position_id: str) -> bool:
+    def exit(self, position_id: str, reason: str = "signal") -> bool:
         for p in self._positions:
             if p.id == position_id and p.is_open:
-                self._close(p)
+                self._close(p, reason=reason)
                 return True
         return False
 
-    def exit_all(self) -> None:
+    def exit_all(self, reason: str = "signal") -> None:
         for p in list(self.positions):
-            self._close(p, reason="manual")
+            self._close(p, reason=reason)
 
     def set_levels(self, position_id: str, stop_loss=None, target=None) -> bool:
         for p in self._positions:
@@ -245,7 +245,7 @@ class BacktestContext(Context):
                 return True
         return False
 
-    def _close(self, p: Position, reason: str = "manual") -> None:
+    def _close(self, p: Position, reason: str = "signal") -> None:
         m = self.mark_price(self.now, p)      # exit the ACTUAL contract held
         price = m if m is not None else p.mtm_price
         action = Action.SELL if p.qty > 0 else Action.BUY
@@ -318,7 +318,7 @@ def run_backtest(strategy: Strategy, store, start: datetime, end: datetime,
             strategy.on_fill(ctx, p)
 
     if cur_day:
-        ctx.exit_all()
+        ctx.exit_all(reason="squareoff")   # end-of-range flatten, not a signal
         _close_day(ctx, strategy, cur_day, daily, equity)
     strategy.on_stop(ctx)
 

@@ -744,18 +744,18 @@ class PaperContext(Context):
             "reason": reason, "tag": p.tag,
         })
 
-    def exit(self, position_id: str) -> bool:
+    def exit(self, position_id: str, reason: str = "signal") -> bool:
         for p in self._open:
             if p.id == position_id and p.is_open:
-                self._close(p)
+                self._close(p, reason=reason)
                 return True
         return False
 
-    def exit_all(self) -> None:
+    def exit_all(self, reason: str = "signal") -> None:
         for p in list(self.positions):
-            self._close(p, reason='manual')
+            self._close(p, reason=reason)
 
-    def _close(self, p: Position, reason: str = "manual") -> None:
+    def _close(self, p: Position, reason: str = "signal") -> None:
         q = self.hub.quote_position(self.underlying, self.now, p)  # actual contract
         action = Action.SELL if p.qty > 0 else Action.BUY
         fees = 0.0
@@ -1009,7 +1009,7 @@ class PaperRunner:
 
     async def stop(self, sid: str) -> None:
         if sid in self.contexts:
-            self.contexts[sid].exit_all()
+            self.contexts[sid].exit_all(reason="squareoff")
             self.contexts[sid].persist_day()
         if sid in self.tasks:
             self.tasks[sid].cancel()
