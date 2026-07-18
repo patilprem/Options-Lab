@@ -14,9 +14,17 @@ Two pieces, deliberately separated:
                    call_soon_threadsafe. Reconnects with exponential backoff
                    and logs connect/disconnect to registry.record_event.
 
-Only index SPOT is subscribed here (Ticker mode) — enough to build the
-underlying candles strategies run on. Option quotes for fills/greeks come
-from the chain poller (M3), not this feed.
+Index SPOT is subscribed (Ticker mode) to build the underlying candles.
+Because index spot carries NO traded volume, an optional COMPANION stream (the
+index's front-month future, Quote mode) supplies real volume/OI, folded into
+the same candle via CandleBuilder.add_volume — price stays the spot's, so
+backtests (spot-based history) and paper stay comparable. Option quotes for
+fills/greeks come from the chain poller (M3), not this feed.
+
+Live-verification pending (offline-built): the companion path's front-month
+future ids (resolve_index_futures), the Quote packet's cumulative-volume field,
+and the Ticker->Quote mode int must be confirmed on the VPS during market hours
+before the index_futures_volume setting is trusted with real volume.
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ class CandleBuilder:
         self._start: Optional[datetime] = None
         self._o = self._h = self._l = self._c = 0.0
         self._v = 0.0
+        self._oi = 0.0     # open interest is a LEVEL: latest seen, carried over
 
     def _bucket_start(self, ts: datetime) -> datetime:
         mod = ts.hour * 60 + ts.minute
@@ -53,9 +62,12 @@ class CandleBuilder:
         return ts.replace(hour=floored // 60, minute=floored % 60,
                           second=0, microsecond=0)
 
-    def add_tick(self, ts: datetime, price: float, volume: float = 0.0) -> Optional[Bar]:
-        """Feed one tick. Returns a completed Bar when the tick opens a new
-        bucket, else None."""
+    def add_tick(self, ts: datetime, price: float, volume: float = 0.0,
+                 oi: float = 0.0) -> Optional[Bar]:
+        """Feed one PRICE tick. `volume` is the interval volume delta (0 for
+        volumeless index spot / Ticker packets); `oi` is the latest open
+        interest level (0 = no OI in this packet, keep the last). Returns a
+        completed Bar when the tick opens a new bucket, else None."""
         b = self._bucket_start(ts)
         completed = None
         if self._start is None:
@@ -67,15 +79,30 @@ class CandleBuilder:
         self._l = min(self._l, price)
         self._c = price
         self._v += volume
+        if oi:
+            self._oi = oi
         return completed
+
+    def add_volume(self, volume: float = 0.0, oi: float = 0.0) -> None:
+        """Companion stream: fold volume/OI from a DIFFERENT instrument (e.g. an
+        index's front-month future) into the current bar WITHOUT touching price
+        — indexes have no traded volume, so their futures supply it. No-op until
+        a price bucket is open (nothing to attach the volume to)."""
+        if self._start is None:
+            return
+        self._v += volume
+        if oi:
+            self._oi = oi
 
     def _open_bucket(self, start: datetime, price: float) -> None:
         self._start = start
         self._o = self._h = self._l = self._c = price
         self._v = 0.0
+        # note: _oi intentionally NOT reset — it's a level, carried across bars
 
     def _to_bar(self) -> Bar:
-        return Bar(self._start, self._o, self._h, self._l, self._c, self._v)
+        return Bar(self._start, self._o, self._h, self._l, self._c, self._v,
+                   self._oi)
 
     def flush(self) -> Optional[Bar]:
         """Emit the current partial bar (e.g. at market close) and reset."""
@@ -105,15 +132,22 @@ class LiveFeed:
     def __init__(self, context_factory: Callable[[], object],
                  instruments: Callable[[], list],
                  sec_to_underlying: Callable[[], dict],
-                 on_tick: Callable[[str, float, datetime], None],
+                 on_tick: Callable[..., None],
                  on_event: Callable[[str, str], None],
-                 watch_open: Optional[Callable[[], bool]] = None):
+                 watch_open: Optional[Callable[[], bool]] = None,
+                 sec_to_companion: Optional[Callable[[], dict]] = None,
+                 on_companion: Optional[Callable[..., None]] = None):
         self._context_factory = context_factory
         self._instruments = instruments
         self._sec_to_underlying = sec_to_underlying
         self._on_tick = on_tick
         self._on_event = on_event
         self._watch_open = watch_open   # 'should packets be flowing right now?'
+        # companion (volume/OI-only) instruments: index futures feeding the
+        # matching spot underlying's candle. Optional — off unless wired.
+        self._sec_to_companion = sec_to_companion or (lambda: {})
+        self._on_companion = on_companion
+        self._last_cum_vol: dict[int, float] = {}   # per-sid cumulative day volume
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._app_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -214,7 +248,9 @@ class LiveFeed:
         ltp = pkt.get("LTP")
         if sid is None or ltp is None:
             return
-        underlying = self._sec_to_underlying().get(int(sid))
+        sid_i = int(sid)
+        companion = self._sec_to_companion().get(sid_i)
+        underlying = companion or self._sec_to_underlying().get(sid_i)
         if underlying is None:
             return
         try:
@@ -225,9 +261,44 @@ class LiveFeed:
             return
         ts = datetime.now(IST).replace(tzinfo=None)  # bucket by IST arrival time
         self.last_tick = ts
-        vol = pkt.get("volume") or 0.0
-        if self._app_loop is not None:
-            self._app_loop.call_soon_threadsafe(self._on_tick, underlying, price, ts)
+        # Quote/Full packets carry CUMULATIVE day volume; a bar wants the
+        # per-tick delta. First sight (or an end-of-day reset to a smaller
+        # number) contributes 0.
+        vol_delta, oi = self._volume_delta(sid_i, pkt)
+        if self._app_loop is None:
+            return
+        if companion is not None:
+            if self._on_companion is not None:
+                self._app_loop.call_soon_threadsafe(
+                    self._on_companion, underlying, vol_delta, oi, ts)
+            return
+        self._app_loop.call_soon_threadsafe(
+            self._on_tick, underlying, price, ts, vol_delta, oi)
+
+    def _volume_delta(self, sid: int, pkt: dict) -> tuple:
+        """(interval_volume, open_interest) from a packet. Volume is the delta
+        of the cumulative day volume since this sid's last packet; OI is the
+        level as-is. Ticker packets have neither -> (0, 0)."""
+        oi = 0.0
+        for k in ("OI", "oi", "open_interest"):
+            if pkt.get(k) is not None:
+                try:
+                    oi = float(pkt[k])
+                except (TypeError, ValueError):
+                    oi = 0.0
+                break
+        cum = pkt.get("volume")
+        if cum is None:
+            return 0.0, oi
+        try:
+            cum = float(cum)
+        except (TypeError, ValueError):
+            return 0.0, oi
+        prev = self._last_cum_vol.get(sid)
+        self._last_cum_vol[sid] = cum
+        if prev is None or cum < prev:      # first sight / daily reset
+            return 0.0, oi
+        return cum - prev, oi
 
     def _close_current_feed(self) -> None:
         feed, loop = self._feed, self._feed_loop

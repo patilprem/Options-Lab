@@ -166,6 +166,21 @@ off-hours window; genuinely urgent fixes get the marker.
 - STT/charges rates in fills.py are approximations — verify vs contract
   notes before trusting absolute P&L.
 
+## Data / price-action strategy surface (post-M8)
+Strategies now reach a richer, backtestable data surface (all through Context):
+- `ctx.signal("index_bias"|"tier2")` REPLAYS recorded point-in-time data in
+  backtest (index_bias_history / chain_snapshots via engines/replay.py), None
+  when unrecorded; tier1/setup stay None. Live/paper unchanged.
+- `indicators.*` — a tested toolbox (engines/indicators.py) injected into the
+  strategy namespace (EMA/RSI/ATR/ADX/Supertrend/Bollinger/MACD/VWAP + price
+  action: swings, BOS, inside/outside bar, prev-day, opening range, pivots,
+  CPR, gap). Strategies must NOT hand-roll these.
+- `ctx.history(n, interval=60)` multi-timeframe; `ctx.chain()` (PCR/IV/skew/
+  max_pain); `ctx.iv_rank()` (ATM-IV percentile). `warmup_bars` param preloads
+  indicator lookback in backtest + on paper/live (re)start.
+Invariant #5 still holds: any Context change touches all four contexts
+(backtest/paper/live/loader smoke) + prompt + example.
+
 ## Current gaps (see docs/ROADMAP.md for ordered milestones + prompts)
 ALL ROADMAP MILESTONES DONE (M1–M8). M1 backfill / M2 WS feed / M3 chain poller
 live-verified; M4 persistence, M6 walk-forward + Lab UI, M7 risk panel + view all
@@ -176,3 +191,9 @@ Before real capital, ON THE VPS during market hours: (a) live tick→candle flow
 (d) M8 real-order path incl. OrderUpdate fill reconciliation (not yet built) +
 kill_switch action strings. Also pending: MCX chain recording needs MCX security
 ids in dhan_client.UNDERLYINGS. Flip live on only via /live/settings ON the VPS.
+- Index-futures VOLUME companion (engines/feed.py + paper.py, gated behind the
+  `index_futures_volume` setting, default OFF): the tick→candle volume/OI
+  plumbing and the FUTIDX front-month parser are tested offline, but the live
+  path is UNVERIFIED — confirm on the VPS: resolve_index_futures() symbol
+  format, the `_FEED_NSE_FNO`/`_FEED_QUOTE` mode ints, and the Quote packet's
+  cumulative-volume field. Only flip the setting on after that.

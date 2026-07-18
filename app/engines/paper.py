@@ -45,8 +45,13 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # MarketFeed subscription constants (avoid importing the SDK at module load).
 _FEED_IDX = 0      # MarketFeed.IDX  — index spot segment
+_FEED_NSE_FNO = 2  # MarketFeed.NSE_FNO — index/stock futures (companion volume)
 _FEED_MCX = 5      # MarketFeed.MCX  — commodity segment (FUTCOM contracts)
 _FEED_TICKER = 15  # MarketFeed.Ticker — LTP-only packets (enough for candles)
+_FEED_QUOTE = 17   # MarketFeed.Quote  — adds day volume + OI (companion futures)
+# NOTE: _FEED_NSE_FNO / _FEED_QUOTE are used only by the gated index-futures
+# companion (index_futures_volume setting, default off) — VPS-verify the ints
+# and the Quote packet's cumulative-volume field before trusting real volume.
 
 
 def _session_date() -> str:
@@ -129,6 +134,10 @@ class MarketHub:
         self._last_chain_ts = 0.0
         self._margin_client = None            # lazy dhanhq client for real margin (M5)
         self._last_heal: Optional[datetime] = None   # feed self-heal cooldown
+        # Gated index-futures companion (volume/OI for volumeless index spot):
+        # underlying -> {security_id, expiry, segment}. Empty unless the
+        # index_futures_volume setting is on AND resolution succeeds.
+        self._index_fut: dict[str, dict] = {}
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -282,6 +291,8 @@ class MarketHub:
             from app.data import dhan_client
             loop = asyncio.get_running_loop()
             from app.engines.watchdog import session_open_for
+            if self._companion_enabled():
+                self._resolve_index_futures()
             self._livefeed = LiveFeed(
                 context_factory=dhan_client.get_dhan_context,
                 instruments=self._instruments,
@@ -290,7 +301,9 @@ class MarketHub:
                 on_event=lambda lvl, msg: registry.record_event(lvl, "feed", msg),
                 watch_open=lambda: session_open_for(
                     self._watch_segments(),
-                    datetime.now(IST).replace(tzinfo=None), grace_min=10))
+                    datetime.now(IST).replace(tzinfo=None), grace_min=10),
+                sec_to_companion=self._sec_to_companion,
+                on_companion=self._on_companion)
             self._livefeed.start(loop)
             self._tasks.append(asyncio.create_task(self._eod_clock()))
             self._tasks.append(asyncio.create_task(self._chain_poll_loop()))
@@ -316,6 +329,7 @@ class MarketHub:
             if cfg:
                 seg = _FEED_MCX if cfg.get("segment") == "MCX_COMM" else _FEED_IDX
                 out.append((seg, str(cfg["security_id"]), _FEED_TICKER))
+        out += self._companion_instruments()   # index-futures volume (gated)
         return out
 
     def _sec_to_underlying(self) -> dict:
@@ -323,32 +337,84 @@ class MarketHub:
                 for u in set(self._wanted) | self._chain_only
                 if u in UNDERLYINGS}
 
+    # -- index-futures companion (volume/OI for index spot; gated) -----------
+    def _companion_enabled(self) -> bool:
+        """On only when the setting is flipped AND we're on the live (not
+        synthetic) driver — a synthetic replay has no futures feed."""
+        return (registry.setting("index_futures_volume", "off") == "on"
+                and not self._use_synthetic())
+
+    def _resolve_index_futures(self) -> None:
+        """Populate self._index_fut with the front-month FUTIDX id for each
+        deployed INDEX underlying (best-effort; leaves it empty on failure)."""
+        try:
+            from app.data import dhan_client
+            resolved = dhan_client.resolve_index_futures()
+        except Exception as e:
+            registry.record_event("warn", "feed",
+                                  f"index-futures resolve failed: {e!r}")
+            return
+        self._index_fut = {u: resolved[u] for u in self._wanted
+                           if u in resolved}
+
+    def _companion_instruments(self) -> list:
+        """Quote-mode subscription tuples for the resolved index futures — the
+        volume/OI companions for index spot. NSE names -> NSE_FnO segment."""
+        out = []
+        for u, fut in self._index_fut.items():
+            seg = _FEED_NSE_FNO   # index futures trade in the FnO segment
+            out.append((seg, str(fut["security_id"]), _FEED_QUOTE))
+        return out
+
+    def _sec_to_companion(self) -> dict:
+        return {int(fut["security_id"]): u for u, fut in self._index_fut.items()}
+
     def _emit(self, msg: tuple) -> None:
         for q in self.subscribers:
             q.put_nowait(msg)
 
-    def _on_tick(self, underlying: str, price: float, ts: datetime) -> None:
-        """Called on the app loop for each parsed tick; rolls candles and emits
-        completed bars per registered timeframe.
-
-        TICK GATE: only regular-session, plausibly-timed ticks build candles.
-        Dhan's feed also delivers pre-open auction prints (09:00-09:08) and
-        stale snapshot ticks on (re)subscribe — observed producing a 09:00 bar,
+    def _tick_ok(self, ts: datetime) -> bool:
+        """Shared tick gate: regular-session, plausibly-timed ticks only. Dhan's
+        feed also delivers pre-open auction prints (09:00-09:08) and stale
+        snapshot ticks on (re)subscribe — observed producing a 09:00 bar,
         future-stamped bars (which tripped the 15:25 EOD branch mid-day), and
         weekend bars. All junk dies here, at the single choke point."""
         if ts.weekday() >= 5 or not (dtime(9, 15) <= ts.time() <= dtime(15, 30)):
-            return
+            return False
         if self.TICK_FRESHNESS_S:          # None in tests/replays (fixed clocks)
             now = datetime.now(IST).replace(tzinfo=None)
             if abs((ts - now).total_seconds()) > self.TICK_FRESHNESS_S:
-                return
+                return False
+        return True
+
+    def _on_tick(self, underlying: str, price: float, ts: datetime,
+                 volume: float = 0.0, oi: float = 0.0) -> None:
+        """Called on the app loop for each parsed PRICE tick; rolls candles and
+        emits completed bars per registered timeframe. `volume`/`oi` are 0 for
+        volumeless index spot (Ticker) — the companion future supplies them via
+        _on_companion."""
+        if not self._tick_ok(ts):
+            return
         for interval in tuple(self._wanted.get(underlying, ())):
             builder = self._builders.get((underlying, interval))
             if builder is None:
                 continue
-            bar = builder.add_tick(ts, price)
+            bar = builder.add_tick(ts, price, volume, oi)
             if bar is not None:
                 self._emit(("bar", underlying, interval, bar))
+
+    def _on_companion(self, underlying: str, volume: float, oi: float,
+                      ts: datetime) -> None:
+        """Fold an index future's volume/OI into every open candle for the SPOT
+        underlying, without touching price (index spot already sets it). Same
+        tick gate as price ticks. No bar is emitted here — the price tick that
+        rolls the bucket carries the accumulated volume/OI out."""
+        if not self._tick_ok(ts):
+            return
+        for interval in tuple(self._wanted.get(underlying, ())):
+            builder = self._builders.get((underlying, interval))
+            if builder is not None:
+                builder.add_volume(volume, oi)
 
     async def _eod_clock(self) -> None:
         """At 15:31 IST, flush partial candles and emit EOD so strategies square

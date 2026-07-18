@@ -101,6 +101,65 @@ def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
     return out
 
 
+# Index names whose front-month FUTIDX supplies the traded volume/OI their
+# spot (IDX_I) index can't — the companion feed for volume-based price action.
+INDEX_FUT_NAMES = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
+                   "SENSEX", "BANKEX")
+
+
+def parse_index_futures(rows: list, names, today: str) -> dict:
+    """Pure: pick each index's nearest non-expired FUTIDX contract from scrip-
+    master rows. Returns {name: {security_id, expiry, segment}}. Matched on the
+    trading symbol with a boundary check so NIFTY never captures NIFTYNXT50.
+    Tested offline; resolve_index_futures() feeds it the real master."""
+    out = {}
+    for name in names:
+        cands = []
+        for r in rows:
+            if r.get("SEM_INSTRUMENT_NAME") != "FUTIDX":
+                continue
+            sym = (r.get("SEM_TRADING_SYMBOL") or "").upper()
+            if not sym.startswith(name):
+                continue
+            tail = sym[len(name):len(name) + 1]
+            if tail and tail.isalnum():          # e.g. NIFTYNXT50 for NIFTY
+                continue
+            if (r.get("SEM_EXPIRY_DATE") or "") >= today:
+                cands.append(r)
+        if not cands:
+            continue
+        fut = min(cands, key=lambda r: r["SEM_EXPIRY_DATE"])
+        out[name] = {"security_id": int(fut["SEM_SMST_SECURITY_ID"]),
+                     "expiry": (fut.get("SEM_EXPIRY_DATE") or "")[:10],
+                     "segment": (fut.get("SEM_SEGMENT")
+                                 or fut.get("SEM_EXM_EXCH_ID") or "NSE")}
+    return out
+
+
+def resolve_index_futures(max_age_h: float = 24.0) -> dict:
+    """Resolve each index's front-month FUTIDX security id from Dhan's scrip
+    master (reuses the FNO master cache). Returns {name: {security_id, expiry,
+    segment}}. Safe to call repeatedly. Network/cache wrapper around the pure
+    parse_index_futures(). Live-verify on the VPS: the FUTIDX trading-symbol
+    format and the correct NSE-FnO feed segment int."""
+    import csv
+    import io
+    import urllib.request
+
+    if (not _FNO_MASTER_CACHE.exists()
+            or time.time() - _FNO_MASTER_CACHE.stat().st_mtime > max_age_h * 3600):
+        raw = urllib.request.urlopen(_SCRIP_MASTER_URL, timeout=120).read() \
+            .decode("utf-8", "replace")
+        lines = raw.splitlines()
+        keep = [lines[0]] + [ln for ln in lines[1:]
+                             if ln.startswith("NSE,") or ln.startswith("BSE,")]
+        _FNO_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+    rows = list(csv.DictReader(io.StringIO(
+        _FNO_MASTER_CACHE.read_text(encoding="utf-8"))))
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    return parse_index_futures(rows, INDEX_FUT_NAMES, today)
+
+
 # ---------------------------------------------------------------------------
 # FNO stock universe (scanner) — resolve the ~190 NSE FNO stocks from the
 # scrip master, so the scanner knows each name's spot id, current-month
