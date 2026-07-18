@@ -34,6 +34,7 @@ BANNED_IMPORTS = {
 ALLOWED_IMPORTS = {
     "math", "statistics", "datetime", "dataclasses", "typing", "enum",
     "collections", "itertools", "functools", "random", "numpy", "pandas",
+    "indicators",
 }
 BANNED_CALLS = {"eval", "exec", "compile", "open", "__import__", "input", "globals", "vars"}
 
@@ -91,6 +92,14 @@ def _exec_namespace() -> dict:
     for name in ("Strategy", "Context", "StrategyMeta", "LegSpec", "Bar",
                  "OptionQuote", "Position", "OptionType", "Action", "ExpiryKind"):
         ns[name] = getattr(C, name)
+    # Curated indicator/price-action toolbox — available as `indicators`
+    # (no import needed), so strategies don't hand-roll EMA/ATR/Supertrend.
+    # Also registered so an explicit `import indicators` resolves (allowlisted),
+    # covering either idiom without a runtime ModuleNotFoundError.
+    import sys as _sys
+    from app.engines import indicators as _indicators
+    _sys.modules.setdefault("indicators", _indicators)
+    ns["indicators"] = _indicators
     return ns
 
 

@@ -7,15 +7,19 @@ Output ONLY Python code, no explanations, no markdown fences.
 1. Define EXACTLY ONE class that subclasses `Strategy`.
 2. Do NOT write any import statements. These names are already available:
    `Strategy, Context, StrategyMeta, LegSpec, Bar, OptionQuote, Position,
-   OptionType, Action, ExpiryKind`. (If you truly need it, only `math`,
-   `statistics` and `datetime` may be imported — nothing else.)
+   OptionType, Action, ExpiryKind`, and `indicators` (the tested toolbox
+   below). (If you truly need it, only `math`, `statistics` and `datetime`
+   may be imported — nothing else.)
 3. Never touch files, network, threads, `eval`, `exec`, or `open`.
 4. All market access and orders go through the `ctx` object ONLY.
 5. Strikes are RELATIVE: `strike_offset=0` is ATM, `+2` is two strikes
    above ATM, `-1` is one below. Never use absolute strike numbers.
 6. Expose every tunable number in `meta().params` and read from
    `self.params` so I can tweak them without regenerating code.
-7. Keep per-bar work light: no heavy loops over long history each bar.
+7. Keep per-bar work light: no heavy loops over long history each bar. Use
+   the `indicators` toolbox (below) — do NOT hand-roll EMA/ATR/Supertrend/
+   VWAP/pivots; the built-ins are tested and stateless (recomputed from the
+   history window each call, so a restart can't desync them).
 8. If your logic needs indicator lookback (EMA/RSI/ATR/etc.), set
    `"warmup_bars": N` in `meta().params` — the engine preloads N bars of
    history BEFORE the start of a backtest and on a mid-session paper restart,
@@ -84,6 +88,37 @@ Act:   `ctx.enter(legs, tag="", sl_pct=None, target_pct=None) -> bool`
 LegSpec fields: option_type (OptionType.CALL/PUT), action (Action.BUY/SELL),
 strike_offset (int), expiry_kind (ExpiryKind.WEEKLY/MONTHLY),
 expiry_offset (int, 0=nearest), lots (int), tag (str).
+
+## Indicators toolbox (`indicators.*`, already available — do NOT import)
+
+All take `bars` = a history window (`ctx.history(n)`, oldest first) and read
+the tail; they return None when there isn't enough data, so guard on None.
+Set `"warmup_bars"` in params (rule 8) so history is deep enough at bar 1.
+
+Trend / momentum / volatility:
+- `indicators.sma(bars, n, key="close")`, `indicators.ema(bars, n, key="close")`
+- `indicators.rsi(bars, n=14)` → 0..100
+- `indicators.macd(bars, fast=12, slow=26, signal=9)` → {macd, signal, hist}
+- `indicators.atr(bars, n=14)`; `indicators.true_ranges(bars)` → list
+- `indicators.bollinger(bars, n=20, k=2.0)` → {mid, upper, lower, width}
+- `indicators.adx(bars, n=14)` → {adx, plus_di, minus_di}
+- `indicators.supertrend(bars, period=10, mult=3.0)` → {dir: +1/-1, level}
+- `indicators.vwap(bars)` → session-anchored (degrades to avg typical price
+  on indexes, which carry no volume)
+
+Price action / structure:
+- `indicators.range_position(bar)` → 0 (at low) .. 1 (at high)
+- `indicators.is_inside_bar(bars)` / `indicators.is_outside_bar(bars)` → bool
+- `indicators.swing_high(bars, left=2, right=2)` / `swing_low(...)`
+- `indicators.break_of_structure(bars, lookback=20)` → "up" / "down" / None
+
+Session references / pivots (need multi-day history via warmup_bars):
+- `indicators.prev_day(bars)` → {open, high, low, close} of the prior session
+- `indicators.opening_range(bars, minutes=15)` → {high, low}
+- `indicators.pivots(high, low, close)` → {p, r1, s1, r2, s2, r3, s3};
+  `indicators.pivots_from_history(bars)` computes them from the prior session
+- `indicators.cpr(high, low, close)` → {pivot, bc, tc, width}
+- `indicators.gap_pct(bars)` → opening gap vs prior close, %
 
 ## Behavioral requirements
 - Check `ctx.now.time()` for entry windows; the engine calls you on every bar.
