@@ -543,13 +543,18 @@ portfolio_router = APIRouter(tags=["portfolio"])
 def portfolio_today():
     """Combined view across every deployed strategy: today's P&L / ROI,
     all open positions, all trades — plus a per-strategy breakdown."""
-    from datetime import datetime as _dt
-    today = _dt.now().date().isoformat()
+    from app.engines.paper import IST
+    # IST, not naive datetime.now(): the whole paper engine (PaperContext's
+    # _roll_day, _session_date()) keys "today" off IST wall-clock. A naive
+    # `today` disagrees with that around the IST/UTC midnight offset on any
+    # server not clocked to IST, which can misroute the branches below.
+    today = datetime.now(IST).date().isoformat()
     strategies_out, positions, trades = [], [], []
     total_alloc = total_day = total_margin = 0.0
     for rec in registry.list_all():
         deployed = rec.state in (State.RUNNING, State.DEPLOYED_PAUSED)
         ctx = runner.contexts.get(rec.id)
+        n_open = len(ctx.positions) if ctx else 0
         t_rows = registry.trades_for(rec.id, today, "PAPER")
         # A strategy that traded today still belongs in today's P&L even if it
         # has since been stopped — otherwise stopping it silently erases the day.
@@ -566,6 +571,14 @@ def portfolio_today():
         elif today_row:
             day_pnl = round((today_row["realized"] or 0.0) + (today_row["unrealized"] or 0.0), 2)
         else:
+            day_pnl = 0.0
+        # ZERO-ACTIVITY GUARD: no trade filled today AND nothing open right now
+        # means today's realized+unrealized P&L is definitionally zero — any
+        # nonzero value here can only be a stale row a rare edge left behind
+        # (e.g. a day that got a daily_pnl row without the bars to back it),
+        # and showing it under TODAY'S date is exactly the "yesterday's P&L
+        # mislabeled as today" bug. Zero it rather than trust a leftover row.
+        if not t_rows and n_open == 0:
             day_pnl = 0.0
         open_rows = []
         if ctx:
