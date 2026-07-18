@@ -324,6 +324,14 @@ class DataStore:
                 out[table] = {"deleted": before - after, "remaining": after}
         return out
 
+    def checkpoint(self) -> None:
+        """Force a DuckDB CHECKPOINT: flush the WAL into the main file and
+        reclaim pages freed by deletes (purge_offhours). DuckDB does not
+        shrink the file on DELETE alone, so on a small VPS space creeps up
+        until a checkpoint runs. Cheap; safe to call from maintenance."""
+        with self._lock:
+            self.con.execute("CHECKPOINT")
+
     # -- FNO universe (scanner F1) -------------------------------------------
     def upsert_fno_universe(self, as_of, universe: dict) -> int:
         """Persist a dated snapshot of the resolved FNO stock universe.

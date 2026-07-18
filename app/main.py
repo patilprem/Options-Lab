@@ -209,12 +209,44 @@ async def _nightly_gap_repair():
             registry.record_event("warn", "scanner", f"bias scoring failed: {e!r}")
 
 
+async def _nightly_maintenance():
+    """Keep the market-data store lean without a human in the loop. Every day
+    at 02:00 IST — both NSE and MCX shut, so no contention with live recording
+    or the chain poller — purge off-hours/weekend JUNK rows (never real
+    session data; see DataStore.purge_offhours) and CHECKPOINT so DuckDB
+    actually reclaims the freed disk. Gated by the `db_maintenance` setting."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    ist = _tz(_td(hours=5, minutes=30))
+    while True:
+        now = _dt.now(ist)
+        target = now.replace(hour=2, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += _td(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        if registry.setting("db_maintenance", "on") != "on":
+            continue
+        store = hub.store
+        if not hasattr(store, "purge_offhours"):
+            continue                          # synthetic store — nothing to do
+        loop = asyncio.get_running_loop()
+        try:
+            res = await loop.run_in_executor(None, store.purge_offhours)
+            deleted = sum(v.get("deleted", 0) for v in res.values())
+            await loop.run_in_executor(None, store.checkpoint)
+            registry.record_event("info", "data",
+                                  f"db maintenance: purged {deleted} junk rows, "
+                                  f"checkpointed ({res})")
+        except Exception as e:
+            registry.record_event("warn", "data", f"db maintenance failed: {e!r}")
+
+
 @app.on_event("startup")
 async def startup_event():
     token_task = asyncio.create_task(token_manager.daily_refresh_loop())
     rec_task = asyncio.create_task(_market_recorder())
     spot_task = asyncio.create_task(_spot_bar_recorder())
     repair_task = asyncio.create_task(_nightly_gap_repair())
+    maint_task = asyncio.create_task(_nightly_maintenance())
     scanner_task = asyncio.create_task(scanner_engine.run())
     scanner_t2_task = asyncio.create_task(scanner_engine.run_tier2(hub))
     registry.record_event("info", "engine", "OptionsLab started")

@@ -76,13 +76,13 @@ class PBKConfluence(Strategy):
             fav = move if self._side == "up" else -move
             if fav >= self.params["target_pts"]:
                 ctx.log(f"target +{fav:.1f} pts")
-                ctx.exit_all()
+                ctx.exit_all(reason="target")
             elif fav <= -self.params["stop_pts"]:
                 ctx.log(f"stop {fav:.1f} pts")
-                ctx.exit_all()
+                ctx.exit_all(reason="stop_loss")
             elif hm >= (15, 0):
                 ctx.log("time exit 15:00")
-                ctx.exit_all()
+                ctx.exit_all(reason="time_exit")
         elif (not self._traded and (10, 0) <= hm <= (14, 30)
               and self.prev_bar is not None and self.atr is not None):
             rng = bar.high - bar.low
@@ -111,4 +111,4 @@ class PBKConfluence(Strategy):
 
     def on_day_end(self, ctx: Context) -> None:
         if ctx.positions:
-            ctx.exit_all()
+            ctx.exit_all(reason="time_exit")

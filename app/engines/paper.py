@@ -128,6 +128,7 @@ class MarketHub:
         self._chain_gate = asyncio.Lock()
         self._last_chain_ts = 0.0
         self._margin_client = None            # lazy dhanhq client for real margin (M5)
+        self._last_heal: Optional[datetime] = None   # feed self-heal cooldown
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -169,6 +170,30 @@ class MarketHub:
         if self._started and self._livefeed:
             self._livefeed.refresh()
 
+    def self_heal_feed(self) -> dict:
+        """Recovery action for a silent/down feed during market hours — the
+        failure LiveFeed's dropped-socket reconnect can't catch (socket up but
+        no data). An MCX commodity contract can go dead mid-session BEFORE its
+        stored expiry passes, so re-resolve the MCX ids, drop the now-stale
+        per-day expiry cache for those names (a new contract has new expiries),
+        then force a resubscribe so the socket rebuilds around the LIVE
+        contracts. Idempotent; safe to call repeatedly. Sync (network) — the
+        watchdog runs it off the event loop."""
+        out = {"resolved": {}, "resubscribed": False}
+        tracked = set(self._wanted) | self._chain_only
+        try:
+            from app.data.dhan_client import MCX_DYNAMIC, resolve_mcx_ids
+            if any(u in MCX_DYNAMIC for u in tracked):
+                out["resolved"] = resolve_mcx_ids() or {}
+                for u in MCX_DYNAMIC:
+                    self._expiries_cache.pop(u, None)   # new contract → new expiries
+        except Exception as e:
+            registry.record_event("warn", "feed", f"self-heal resolve failed: {e!r}")
+        if self._started and self._livefeed:
+            self._livefeed.refresh()
+            out["resubscribed"] = True
+        return out
+
     def feed_status(self) -> dict:
         """Health surface for the dashboard's Feed pill: driver mode, socket
         state, and how fresh the last tick is."""
@@ -203,7 +228,9 @@ class MarketHub:
     async def _watchdog_loop(self) -> None:
         """Once a minute: if the feed is down/silent during market hours,
         push an ntfy alert (same channel as token refresh). See watchdog.py."""
-        from app.engines.watchdog import FeedWatchdog, session_open_for
+        from app.engines.watchdog import (FeedWatchdog, feed_broken,
+                                          session_open_for)
+        HEAL_COOLDOWN_S = 180        # at most one self-heal attempt / 3 min
         wd = FeedWatchdog()
         loop = asyncio.get_running_loop()
         while True:
@@ -217,6 +244,17 @@ class MarketHub:
                 if kind:
                     lvl = "info" if kind == "recovered" else "warn"
                     registry.record_event(lvl, "feed", f"watchdog: feed {kind}")
+                # SELF-HEAL: don't just alert — try to recover. A silent socket
+                # (dead/rolled MCX contract, stale connection) won't fix itself.
+                if feed_broken(status, is_open):
+                    if (self._last_heal is None
+                            or (now - self._last_heal).total_seconds() >= HEAL_COOLDOWN_S):
+                        self._last_heal = now
+                        res = await loop.run_in_executor(None, self.self_heal_feed)
+                        registry.record_event(
+                            "warn", "feed", f"watchdog: feed broken — self-heal {res}")
+                else:
+                    self._last_heal = None      # healthy again → reset cooldown
             except Exception as e:
                 registry.record_event("warn", "feed", f"watchdog error: {e!r}")
 
@@ -744,18 +782,18 @@ class PaperContext(Context):
             "reason": reason, "tag": p.tag,
         })
 
-    def exit(self, position_id: str) -> bool:
+    def exit(self, position_id: str, reason: str = "signal") -> bool:
         for p in self._open:
             if p.id == position_id and p.is_open:
-                self._close(p)
+                self._close(p, reason=reason)
                 return True
         return False
 
-    def exit_all(self) -> None:
+    def exit_all(self, reason: str = "signal") -> None:
         for p in list(self.positions):
-            self._close(p, reason='manual')
+            self._close(p, reason=reason)
 
-    def _close(self, p: Position, reason: str = "manual") -> None:
+    def _close(self, p: Position, reason: str = "signal") -> None:
         q = self.hub.quote_position(self.underlying, self.now, p)  # actual contract
         action = Action.SELL if p.qty > 0 else Action.BUY
         fees = 0.0
@@ -1009,7 +1047,7 @@ class PaperRunner:
 
     async def stop(self, sid: str) -> None:
         if sid in self.contexts:
-            self.contexts[sid].exit_all()
+            self.contexts[sid].exit_all(reason="squareoff")
             self.contexts[sid].persist_day()
         if sid in self.tasks:
             self.tasks[sid].cancel()

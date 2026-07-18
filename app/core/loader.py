@@ -136,11 +136,11 @@ class _SmokeContext(C.Context):
         self.calls.append(f"set_levels({position_id})")
         return True
 
-    def exit(self, position_id):
+    def exit(self, position_id, reason="signal"):
         self.calls.append(f"exit({position_id})")
         return True
 
-    def exit_all(self): self.calls.append("exit_all()")
+    def exit_all(self, reason="signal"): self.calls.append("exit_all()")
     def log(self, msg): self.calls.append(f"log: {msg}")
 
 

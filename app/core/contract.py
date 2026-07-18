@@ -108,7 +108,7 @@ class Position:
     stop_loss: Optional[float] = None    # premium level; engine enforces if set
     target: Optional[float] = None       # premium level; engine enforces if set
     margin_blocked: float = 0.0          # estimated margin share for this leg
-    exit_reason: str = ""                # entry|stop_loss|target|time_exit|expiry|pause|manual
+    exit_reason: str = ""                # entry|stop_loss|target|time_exit|signal|squareoff|expiry|pause|manual
 
     @property
     def is_open(self) -> bool:
@@ -219,10 +219,15 @@ class Context(abc.ABC):
         """Update declared levels on an open position (e.g. trail a stop)."""
 
     @abc.abstractmethod
-    def exit(self, position_id: str) -> bool: ...
+    def exit(self, position_id: str, reason: str = "signal") -> bool:
+        """Close one open position. `reason` records WHY on the blotter for
+        later exit-attribution analysis; default "signal" (your own decision).
+        Pass a specific value like "time_exit" when it fits. The label
+        "manual" is reserved for human intervention — don't use it here."""
 
     @abc.abstractmethod
-    def exit_all(self) -> None: ...
+    def exit_all(self, reason: str = "signal") -> None:
+        """Close every open position. Same `reason` semantics as exit()."""
 
     @abc.abstractmethod
     def log(self, msg: str) -> None: ...

@@ -66,7 +66,11 @@ Act:   `ctx.enter(legs, tag="", sl_pct=None, target_pct=None) -> bool`
         the engine enforces them and shows them on the dashboard),
        `ctx.set_levels(position_id, stop_loss=None, target=None)` to
        trail or adjust levels on an open position,
-       `ctx.exit(position_id) -> bool`, `ctx.exit_all()`, `ctx.log(msg)`.
+       `ctx.exit(position_id, reason="signal") -> bool`,
+       `ctx.exit_all(reason="signal")`, `ctx.log(msg)`.
+       Pass a specific `reason` (e.g. "time_exit") so the blotter records WHY
+       you exited — it powers exit-attribution analysis. Leave "manual" alone;
+       it means human intervention.
 
 LegSpec fields: option_type (OptionType.CALL/PUT), action (Action.BUY/SELL),
 strike_offset (int), expiry_kind (ExpiryKind.WEEKLY/MONTHLY),
@@ -79,6 +83,7 @@ expiry_offset (int, 0=nearest), lots (int), tag (str).
   engine enforces them even between your on_bar calls); add your own
   structure-level exits (combined premium, day P&L) inside `on_bar`.
 - The engine force-squares-off expiring positions near close; still call
-  `ctx.exit_all()` yourself when your logic says the day is done.
+  `ctx.exit_all(reason="time_exit")` yourself when your logic says the day is
+  done (use a descriptive reason so the exit is attributable later).
 
 Now here is the strategy I want: <DESCRIBE YOUR STRATEGY HERE>
