@@ -126,16 +126,18 @@ class DataStore:
         import shutil
         import threading
         self.con = duckdb.connect(str(path))
-        # Small-VPS defaults (deploy/SETUP.md: 1-2GB RAM boxes): fewer threads
-        # and no insertion-order bookkeeping both cut peak spill volume, per
-        # DuckDB's own OOM-error suggestions. Cap the temp dir at 70% of
-        # *currently free* disk (not a fixed size — this runs on anything
-        # from a 1GB fallback VPS to Oracle's free 24GB tier) so a big
-        # backfill fails fast and resumably instead of filling the disk
-        # completely and starving other processes (registry.db writes, logs).
+        # The Oracle A1.Flex box (4 OCPU / 24GB RAM) has RAM and CPU to spare —
+        # DuckDB's own thread/memory_limit defaults (core count / ~80% RAM)
+        # are already right for it, so leave those alone. The actual
+        # constraint is disk: it's block storage only, sized by whatever
+        # volume was attached, and a big multi-year options backfill can fill
+        # it. Drop insertion-order bookkeeping (cheap win, nothing here relies
+        # on row order) and cap the temp dir at 70% of *currently free* disk
+        # (computed at connect time, not a fixed size) so a big backfill fails
+        # fast and resumably instead of consuming every free byte and
+        # starving other processes (registry.db writes, logs).
         free_bytes = shutil.disk_usage(Path(path).resolve().parent).free
         temp_cap_gb = max(1, int(free_bytes * 0.7 / (1024 ** 3)))
-        self.con.execute("SET threads=2")
         self.con.execute("SET preserve_insertion_order=false")
         self.con.execute(f"SET max_temp_directory_size='{temp_cap_gb}GiB'")
         self.con.execute(SCHEMA)
