@@ -123,8 +123,21 @@ class DataStore:
 
     def __init__(self, path: Path = DB_PATH):
         import duckdb
+        import shutil
         import threading
         self.con = duckdb.connect(str(path))
+        # Small-VPS defaults (deploy/SETUP.md: 1-2GB RAM boxes): fewer threads
+        # and no insertion-order bookkeeping both cut peak spill volume, per
+        # DuckDB's own OOM-error suggestions. Cap the temp dir at 70% of
+        # *currently free* disk (not a fixed size — this runs on anything
+        # from a 1GB fallback VPS to Oracle's free 24GB tier) so a big
+        # backfill fails fast and resumably instead of filling the disk
+        # completely and starving other processes (registry.db writes, logs).
+        free_bytes = shutil.disk_usage(Path(path).resolve().parent).free
+        temp_cap_gb = max(1, int(free_bytes * 0.7 / (1024 ** 3)))
+        self.con.execute("SET threads=2")
+        self.con.execute("SET preserve_insertion_order=false")
+        self.con.execute(f"SET max_temp_directory_size='{temp_cap_gb}GiB'")
         self.con.execute(SCHEMA)
         self._lock = threading.Lock()
 
