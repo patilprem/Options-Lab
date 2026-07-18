@@ -35,10 +35,25 @@ export default function WalkForward({ id, params = {} }) {
 
   const run = async () => {
     const param_grid = {}
+    const badTokens = []
     for (const [k, v] of Object.entries(grid)) {
-      const vals = String(v).split(',').map(s => s.trim()).filter(Boolean)
-        .map(Number).filter(n => !Number.isNaN(n))
-      if (vals.length) param_grid[k] = vals
+      if (!String(v).trim()) continue
+      // tolerate a typed list literal like "[20, 22, 25]" — strip the
+      // brackets rather than let them corrupt the split (a bare "[20" and
+      // "25]" both fail Number() and get silently dropped, which once
+      // collapsed a 3-value sweep down to a single value with NO error
+      // shown — a walk-forward result that looked legitimate but had
+      // silently swept just the strategy's own hardcoded default).
+      const tokens = String(v).replace(/[[\]()]/g, '')
+        .split(',').map(s => s.trim()).filter(Boolean)
+      const nums = tokens.map(Number)
+      const bad = tokens.filter((t, i) => Number.isNaN(nums[i]))
+      if (bad.length) badTokens.push(`${k}: "${bad.join('", "')}"`)
+      else if (nums.length) param_grid[k] = nums
+    }
+    if (badTokens.length) {
+      setError(`Can't parse as numbers — ${badTokens.join('; ')}. Use comma-separated values, e.g. 20, 22, 25.`)
+      return
     }
     setRunning(true); setError(null); setResult(null)
     try {
