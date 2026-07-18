@@ -164,8 +164,10 @@ def test_step_enters_then_trailing_exits(tmp_path, monkeypatch):
     assert "RELIANCE" not in trader.book
     # a realized daily row got booked
     assert reg.cum_pnl(st.STRATEGY_ID) != 0.0
-    # blotter has an entry and an exit
-    trades = reg.trades_for(st.STRATEGY_ID, date(2026, 7, 16).isoformat(), "PAPER")
+    # blotter has an entry and an exit (booked under today's IST date, the
+    # same clock step() uses — not a hardcoded day, which goes stale)
+    today = datetime.now(st.IST).date().isoformat()
+    trades = reg.trades_for(st.STRATEGY_ID, today, "PAPER")
     assert len([t for t in trades if t.get("reason") == "entry"]) == 1
     assert len([t for t in trades if t.get("side") == "SELL"]) == 1
 
