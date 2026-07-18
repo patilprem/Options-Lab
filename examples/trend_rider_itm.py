@@ -1,9 +1,13 @@
-# Trend Rider — momentum option BUYER (slightly ITM) built to catch BIG trend
-# days. Multi-timeframe trend alignment + ADX strength + ATR-buffered breakout
-# for entry; NO fixed target — a ratcheting trailing stop and a Supertrend-flip
-# exit let the winner run and give back only the tail. Slightly ITM (1 strike)
-# because the higher delta tracks the move harder and bleeds less theta per
-# rupee of directional exposure than ATM/OTM on a trend day.
+# Trend Rider v2 — momentum option BUYER (slightly ITM) built to catch BIG
+# trend days. v2 is tuned from the first real 2-year backtest's attribution
+# (2024-07 -> 2026-07, +21.9%, Sharpe 1.2), which exposed two drags:
+#   * the Supertrend-flip exit fired on single-bar noise: 151 flip exits at
+#     29.8% win rate cost -1.1L, while the 53 trades that survived to the
+#     time exit made +1.86L -> the flip now needs `flip_confirm_bars`
+#     CONSECUTIVE flipped bars before it cuts the trade.
+#   * dead-IV entries washed out: 115 trades below IV-rank 30 netted ~zero
+#     while paying fees -> new `iv_rank_floor` skips them (cheap IV = dead
+#     tape = breakouts are usually fakeouts).
 # Paste this file's contents into New Strategy.
 
 class TrendRiderITM(Strategy):
@@ -14,15 +18,18 @@ class TrendRiderITM(Strategy):
       * 5-min Supertrend UP and close above EMA20
       * ADX >= adx_min                      — real momentum, not drift
       * close breaks the prior `breakout_bars` high by breakout_atr * ATR
-      * optional (None never blocks, so fully backtestable):
-        index bias not strongly against; IV rank not already rich
+      * IV rank inside [iv_rank_floor, iv_rank_cap] when known — skip dead
+        tape (nothing expands) AND already-rich premium (overpaying);
+        unknown (None) never blocks, so it stays fully backtestable
+      * optional: index bias not strongly against
       -> BUY CALL strike_offset=-1 (PUT +1 for the bearish mirror)
 
     Exits — built to CATCH the big one, not scalp it:
       * engine-enforced disaster stop sl_pct below entry premium
       * once premium is +arm_pct, trail a stop trail_pct below the premium
         high (ratchets up only; locks breakeven first)
-      * Supertrend flips against the position -> exit (trend is done)
+      * Supertrend flipped against the position for `flip_confirm_bars`
+        CONSECUTIVE bars -> exit (a one-bar whip no longer cuts the ride)
       * hard flat 15:12
     """
 
@@ -36,21 +43,26 @@ class TrendRiderITM(Strategy):
             "sl_pct": 0.35,                  # disaster stop on premium
             "arm_pct": 0.25,                 # gain that activates the trail
             "trail_pct": 0.20,               # trail distance below premium high
-            "bias_gate": 0.3, "iv_rank_cap": 75,
+            "flip_confirm_bars": 2,          # v2: bars a flip must persist to exit
+            "bias_gate": 0.3,
+            "iv_rank_floor": 30,             # v2: skip dead-IV tape (fakeout zone)
+            "iv_rank_cap": 75,               # don't overpay for rich premium
             "max_entries_per_day": 2, "lots": 1,
             "warmup_bars": 90,               # settled EMA/ADX/Supertrend + HTF
         }
         self.day = None
         self.entries_today = 0
         self.prem_high = {}                  # position id -> premium high-water
+        self.flip_streak = 0                 # consecutive bars Supertrend is against us
 
     def meta(self) -> StrategyMeta:
         return StrategyMeta(
-            name="Trend Rider ITM",
+            name="Trend Rider ITM v2",
             underlying="NIFTY", segment="NSE_FNO", timeframe="5",
             params=self.params,
             description="Slightly-ITM option buyer: MTF trend + ADX + ATR "
-                        "breakout entry, trailing-stop exit to ride big trends",
+                        "breakout entry, confirmed-flip + trailing-stop exits "
+                        "to ride big trends (v2: flip confirmation, IV floor)",
         )
 
     # -- helpers --------------------------------------------------------------
@@ -60,6 +72,7 @@ class TrendRiderITM(Strategy):
             self.day = d
             self.entries_today = 0
             self.prem_high = {}
+            self.flip_streak = 0
 
     def _bias_ok(self, ctx, want_ce: bool) -> bool:
         """Veto only on a STRONG opposing breadth read; unknown never blocks."""
@@ -72,19 +85,30 @@ class TrendRiderITM(Strategy):
         return s > 0 if want_ce else s < 0
 
     def _manage(self, ctx):
-        """Trail winners; exit on trend flip. Runs before any entry logic."""
+        """Trail winners; exit on a CONFIRMED trend flip. Runs before entries."""
         if not ctx.positions:
+            self.flip_streak = 0
             return
         st = indicators.supertrend(ctx.history(self.params["st_period"] * 4 + 5),
                                    self.params["st_period"], self.params["st_mult"])
         for p in ctx.positions:
-            # trend flipped against the long option -> the ride is over
-            if st is not None:
-                long_ce = p.leg.option_type == OptionType.CALL
-                if (long_ce and st["dir"] == -1) or (not long_ce and st["dir"] == 1):
-                    ctx.log(f"trend flip exit on {p.tag or p.id}")
+            # trend flipped against the long option — but only a flip that
+            # HOLDS for flip_confirm_bars consecutive bars ends the ride
+            # (v2: single-bar flips exited 151 trades at 29.8% WR for -1.1L
+            # while trades left to run made +1.86L)
+            long_ce = p.leg.option_type == OptionType.CALL
+            flipped = st is not None and (
+                (long_ce and st["dir"] == -1) or (not long_ce and st["dir"] == 1))
+            if flipped:
+                self.flip_streak += 1
+                if self.flip_streak >= self.params["flip_confirm_bars"]:
+                    ctx.log(f"confirmed trend flip ({self.flip_streak} bars) — "
+                            f"exiting {p.tag or p.id}")
                     ctx.exit(p.id, reason="signal")
+                    self.flip_streak = 0
                     continue
+            else:
+                self.flip_streak = 0
             # ratcheting premium trail (up only; arms after +arm_pct)
             high = max(self.prem_high.get(p.id, p.entry_price), p.mtm_price)
             self.prem_high[p.id] = high
@@ -146,9 +170,14 @@ class TrendRiderITM(Strategy):
             ctx.log(f"breakout {'CE' if want_ce else 'PE'} skipped: bias against")
             return
         r = ctx.iv_rank(30)
-        if r is not None and r > self.params["iv_rank_cap"]:
-            ctx.log(f"entry skipped: IV rank {r:.0f} too rich to buy")
-            return
+        if r is not None:
+            if r > self.params["iv_rank_cap"]:
+                ctx.log(f"entry skipped: IV rank {r:.0f} too rich to buy")
+                return
+            if r < self.params["iv_rank_floor"]:
+                # v2: 115 sub-30 trades netted ~zero — dead IV means dead tape
+                ctx.log(f"entry skipped: IV rank {r:.0f} too dead to buy")
+                return
 
         # slightly ITM: CALL below ATM / PUT above ATM
         off = -self.params["itm_offset"] if want_ce else self.params["itm_offset"]
@@ -160,6 +189,7 @@ class TrendRiderITM(Strategy):
             tag="rider", sl_pct=self.params["sl_pct"])   # NO target: let it run
         if ok:
             self.entries_today += 1
+            self.flip_streak = 0
             ctx.log(f"trend entry {'CE' if want_ce else 'PE'}{off:+d} @ spot "
                     f"{px:.1f} (adx {adx['adx']:.0f}, atr {a:.1f})")
 
