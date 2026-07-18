@@ -162,8 +162,12 @@ class Context(abc.ABC):
         """Resolve a relative leg to a live quote (None if unavailable)."""
 
     @abc.abstractmethod
-    def history(self, n: int) -> list[Bar]:
-        """Last n underlying bars, oldest first."""
+    def history(self, n: int, interval: Optional[int] = None) -> list[Bar]:
+        """Last n underlying bars, oldest first. `interval` (minutes) selects a
+        DIFFERENT timeframe than the strategy's own — e.g. a 5-min strategy
+        consulting the 60-min trend via history(50, interval=60). Higher
+        timeframes are resampled from stored data; the strategy's own interval
+        (default, or interval=None) returns its live in-memory bars."""
 
     def signal(self, name: str) -> Optional[dict]:
         """FNO-scanner read for THIS strategy's underlying (F6), or None.
@@ -181,6 +185,25 @@ class Context(abc.ABC):
         strategies must always treat None as "unknown", and know that a signal
         only backtests over the window it was actually recorded for.
         Default here is None so a context without scanner wiring is safe."""
+        return None
+
+    def chain(self) -> Optional[dict]:
+        """Normalized option-chain summary for THIS strategy's underlying as-of
+        now, or None if unavailable. Keys: pcr_oi, pcr_volume, atm_iv, iv_skew
+        (avg OTM-put IV − OTM-call IV; positive = downside fear), call_oi,
+        put_oi, max_pain (OI-gravity strike). Live/paper read the live chain
+        cache; the backtest REPLAYS it from recorded chain_snapshots (None for
+        windows the recorder wasn't running). Default None so a context without
+        chain wiring is safe — always handle None."""
+        return None
+
+    def iv_rank(self, lookback_days: int = 30) -> Optional[float]:
+        """Percentile rank (0..100) of the current ATM IV within its own last
+        `lookback_days` — the single most useful options-selling filter ("is
+        premium rich right now?"). Backtest reads option_bars IV; live/paper
+        read recorded chain_snapshots IV. None when there isn't enough IV
+        history (early backtest windows, thin recording) — handle None.
+        Default None so a context without IV history is safe."""
         return None
 
     # ---- portfolio -------------------------------------------------------

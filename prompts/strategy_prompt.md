@@ -54,6 +54,16 @@ class MyStrategy(Strategy):
 ## What `ctx` gives you
 
 Read:  `ctx.now`, `ctx.spot`, `ctx.history(n) -> list[Bar]`,
+       `ctx.history(n, interval=60)` — SAME underlying at a DIFFERENT (higher)
+        timeframe, e.g. a 5-min strategy consulting the 60-min trend; resampled
+        from stored data, returns [] if unavailable,
+       `ctx.chain() -> dict | None` — option-chain summary NOW for your
+        underlying: pcr_oi / pcr_volume / atm_iv / iv_skew (>0 = downside fear)
+        / call_oi / put_oi / max_pain (OI-gravity strike). Live in paper/live,
+        REPLAYED from recorded snapshots in backtest, None when unavailable,
+       `ctx.iv_rank(lookback_days=30) -> float | None` — percentile (0..100) of
+        current ATM IV in its recent range; the key premium-selling filter
+        (sell rich IV, buy cheap). None without enough IV history,
        `ctx.option(LegSpec(...)) -> OptionQuote | None`
        (OptionQuote has ltp, bid, ask, iv, oi, delta/theta/vega/gamma
         — greeks may be None in backtests),

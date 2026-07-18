@@ -492,6 +492,31 @@ class DataStore:
                 "as_of": row[0].isoformat(sep=" ", timespec="seconds"),
                 "replayed": True}
 
+    def atm_iv_option_series(self, underlying: str, end, lookback_days: int = 30):
+        """ATM (weekly-0, strike_offset 0) IV time series up to `end` from
+        option_bars — the BACKTEST source for ctx.iv_rank(). CE/PE averaged per
+        timestamp. Returns a list of IV floats, oldest first (empty if none)."""
+        from datetime import timedelta
+        start = end - timedelta(days=lookback_days)
+        rows = self._q(
+            """SELECT ts, avg(iv) FROM option_bars
+               WHERE underlying=? AND expiry_kind='WEEKLY' AND expiry_offset=0
+                 AND strike_offset=0 AND iv IS NOT NULL AND ts BETWEEN ? AND ?
+               GROUP BY ts ORDER BY ts""", [underlying, start, end])
+        return [r[1] for r in rows if r[1] is not None]
+
+    def atm_iv_chain_series(self, underlying: str, end, lookback_days: int = 30):
+        """ATM IV time series up to `end` from chain_snapshots — the LIVE/PAPER
+        source for ctx.iv_rank() (recorded per poll). Oldest first."""
+        from datetime import timedelta
+        start = end - timedelta(days=lookback_days)
+        rows = self._q(
+            """SELECT ts, avg(iv) FROM chain_snapshots
+               WHERE underlying=? AND expiry_kind='WEEKLY' AND expiry_offset=0
+                 AND strike_offset=0 AND iv IS NOT NULL AND ts BETWEEN ? AND ?
+               GROUP BY ts ORDER BY ts""", [underlying, start, end])
+        return [r[1] for r in rows if r[1] is not None]
+
     def chain_cache_asof(self, underlying: str, ts, max_age_min: int = 10):
         """Rebuild a hub-shaped chain cache ({(kind, offset, strike_offset,
         option_type): OptionQuote}) from the recorded chain_snapshots poll
@@ -671,6 +696,26 @@ class SyntheticStore:
                            iv=iv * 100)
 
 
+def _history_bars(self, underlying: str, end, interval_min: int, n: int):
+    """Last `n` resampled bars at `interval_min` ending at/before `end` — the
+    engine of ctx.history(n, interval=...) for multi-timeframe reads. Bounded
+    lookback (padded for weekends) so a 5-min strategy consulting the 60-min
+    trend costs one small windowed query, never a full-history scan. Works on
+    both stores (delegates to underlying_bars). Point-in-time safe: the
+    aggregation only sees rows <= end, so a forming higher-TF bar reflects data
+    up to now with no lookahead."""
+    from datetime import timedelta
+    per_day = max(1, 375 // max(1, interval_min))
+    lookback_days = max(5, (n // per_day + 2) * 2)
+    bars = self.underlying_bars(underlying, end - timedelta(days=lookback_days),
+                                end, interval_min)
+    return [b for b in bars if b.ts <= end][-n:]
+
+
+DataStore.history_bars = _history_bars
+SyntheticStore.history_bars = _history_bars
+
+
 def _duck_has(self, underlying: str, start, end) -> bool:
     row = self._q1(
         "SELECT count(*) FROM underlying_bars WHERE underlying=? AND ts BETWEEN ? AND ?",
@@ -697,6 +742,8 @@ SyntheticStore.recent_index_bias = lambda self, name, limit=60: []
 SyntheticStore.index_bias_accuracy = lambda self, name, limit=30: []
 SyntheticStore.index_bias_asof = lambda self, name, ts, max_age_min=20: None
 SyntheticStore.chain_cache_asof = lambda self, u, ts, max_age_min=10: None
+SyntheticStore.atm_iv_option_series = lambda self, u, end, lookback_days=30: []
+SyntheticStore.atm_iv_chain_series = lambda self, u, end, lookback_days=30: []
 SyntheticStore.latest_spot = lambda self, u, day=None: None
 SyntheticStore.record_setup_flag = lambda self, ts, s, b, sc, sp, ap: None
 SyntheticStore.setup_flags_since = lambda self, since_day: []

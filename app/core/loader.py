@@ -126,8 +126,17 @@ class _SmokeContext(C.Context):
                              leg.option_type, 100.0, 99.5, 100.5, 15.0, 1e5, 1e4,
                              0.5, -5.0, 10.0, 0.001)
 
-    def history(self, n): return self._bars[-n:]
+    def history(self, n, interval=None): return self._bars[-n:]
     def signal(self, name): return None   # no scanner in the smoke harness (F6)
+
+    def chain(self):
+        # a small but well-formed chain so a strategy reading ctx.chain() in
+        # on_bar smoke-tests without special-casing None
+        return {"pcr_oi": 1.0, "pcr_volume": 1.0, "atm_iv": 15.0,
+                "iv_skew": 0.0, "call_oi": 1e5, "put_oi": 1e5,
+                "max_pain": round(self.spot / 50) * 50}
+
+    def iv_rank(self, lookback_days=30): return 50.0
     @property
     def positions(self): return []
     @property

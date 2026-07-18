@@ -74,6 +74,7 @@ class BacktestContext(Context):
         self._series: dict = {}                     # leg-key -> (ts_list, rows) cache
         self._contract: dict = {}                   # (strike,type,expiry) -> (ts_list, rows)
         self._replay = SignalReplay(store)          # F6: point-in-time signal replay
+        self._interval: Optional[int] = None        # own timeframe (set by run_backtest)
         self._warmup: list[Bar] = []                # pre-`start` bars for indicator lookback
         self._bars: list[Bar] = []
         self._positions: list[Position] = []
@@ -170,13 +171,35 @@ class BacktestContext(Context):
     def option(self, leg: LegSpec) -> Optional[OptionQuote]:
         return self._quote(self.now, leg)
 
-    def history(self, n: int) -> list[Bar]:
-        # warmup bars (recorded before `start`) prepend the live window so an
-        # indicator strategy has lookback from its very first on_bar — see
-        # _seed_warmup / run_backtest(warmup_bars=...).
+    def history(self, n: int, interval: Optional[int] = None) -> list[Bar]:
+        # A different timeframe than our own -> resample from the store as-of
+        # now (point-in-time safe: history_bars only aggregates rows <= now).
+        if (interval is not None and interval != self._interval
+                and hasattr(self.store, "history_bars")):
+            return self.store.history_bars(self.underlying, self.now, interval, n)
+        # own timeframe: warmup bars (recorded before `start`) prepend the live
+        # window so an indicator strategy has lookback from its first on_bar.
         if self._warmup:
             return (self._warmup + self._bars)[-n:]
         return self._bars[-n:]
+
+    def chain(self) -> Optional[dict]:
+        if not self._bars or not hasattr(self.store, "chain_cache_asof"):
+            return None
+        cache = self.store.chain_cache_asof(self.underlying, self.now)
+        if not cache:
+            return None
+        from app.engines.scanner import chain_summary
+        return chain_summary(cache)
+
+    def iv_rank(self, lookback_days: int = 30) -> Optional[float]:
+        if not self._bars or not hasattr(self.store, "atm_iv_option_series"):
+            return None
+        series = self.store.atm_iv_option_series(self.underlying, self.now, lookback_days)
+        if len(series) < 5:            # too thin to rank meaningfully
+            return None
+        from app.engines.indicators import percentile_rank
+        return percentile_rank(series[-1], series)
 
     def signal(self, name: str):
         """Point-in-time replay of recorded scanner signals (F6). Returns the
@@ -316,6 +339,7 @@ def run_backtest(strategy: Strategy, store, start: datetime, end: datetime,
                           fee_cfg or F.FeeConfig(), slip_cfg or F.SlippageConfig())
     ctx._end = end                      # enables in-memory option-series preload
     interval = int(meta.timeframe)
+    ctx._interval = interval            # own timeframe (for history(interval=...))
     # warmup depth: explicit arg wins; else honor a strategy's declared hint so
     # existing backtests (no hint) keep their exact current behavior.
     if warmup_bars <= 0:

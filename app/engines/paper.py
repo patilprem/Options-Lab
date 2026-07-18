@@ -696,7 +696,13 @@ class PaperContext(Context):
     def option(self, leg: LegSpec) -> Optional[OptionQuote]:
         return self.hub.quote(self.underlying, self.now, leg)
 
-    def history(self, n: int) -> list[Bar]:
+    def history(self, n: int, interval: Optional[int] = None) -> list[Bar]:
+        # A different timeframe than our own -> resample from the store (kept
+        # current by upsert_live_bar). Higher TFs work; the strategy's own TF
+        # returns the live in-memory bars (fresher than the store).
+        if (interval is not None and interval != self.interval
+                and hasattr(self.hub.store, "history_bars")):
+            return self.hub.store.history_bars(self.underlying, self.now, interval, n)
         # warmup bars (loaded from the store at deploy) prepend the live
         # session so an indicator strategy isn't blind after a mid-session
         # (re)start — see warmup(). They never affect now/spot/day accounting
@@ -709,6 +715,24 @@ class PaperContext(Context):
         """Live FNO-scanner read for this underlying (F6)."""
         from app.engines import signals
         return signals.get_signal(self.underlying, name)
+
+    def chain(self) -> Optional[dict]:
+        """Live chain summary from the hub's shared cache for this underlying."""
+        cache = self.hub._chain_cache.get(self.underlying)
+        if not cache:
+            return None
+        from app.engines.scanner import chain_summary
+        return chain_summary(cache)
+
+    def iv_rank(self, lookback_days: int = 30) -> Optional[float]:
+        if not self._bars or not hasattr(self.hub.store, "atm_iv_chain_series"):
+            return None
+        series = self.hub.store.atm_iv_chain_series(
+            self.underlying, self.now, lookback_days)
+        if len(series) < 5:
+            return None
+        from app.engines.indicators import percentile_rank
+        return percentile_rank(series[-1], series)
 
     @property
     def positions(self) -> list[Position]:

@@ -199,6 +199,7 @@ class LiveContext(Context):
         self.kill = KillSwitch(self._client)
         self.paused = record.state != registry.State.RUNNING
         self._bars: list[Bar] = []
+        self._warmup: list[Bar] = []        # pre-session bars for indicator lookback
         self._open: list[Position] = []
         self.closed_today: list[Position] = []
         self._margin_used = 0.0
@@ -232,6 +233,26 @@ class LiveContext(Context):
         if paused and self.rec.square_off_on_pause:
             self.exit_all(reason="pause")
 
+    def warmup(self, store, n: int) -> int:
+        """Seed history() lookback from the store on deploy (bars only) so an
+        indicator strategy isn't blind at start. Mirrors PaperContext.warmup;
+        the warmup list never affects now/spot/day counters."""
+        if n <= 0 or self._warmup or self._bars:
+            return 0
+        try:
+            now = datetime.now(IST).replace(tzinfo=None)
+            per_day = max(1, 375 // max(1, self.interval))
+            lookback_days = max(5, (n // per_day + 2) * 2)
+            prior = store.underlying_bars(
+                self.underlying, now - timedelta(days=lookback_days), now,
+                self.interval)
+            prior = [b for b in prior if b.ts < now]
+            if prior:
+                self._warmup = prior[-n:]
+            return len(self._warmup)
+        except Exception:
+            return 0
+
     # -- Context surface -----------------------------------------------------
     @property
     def now(self) -> datetime:
@@ -248,13 +269,35 @@ class LiveContext(Context):
     def option(self, leg: LegSpec) -> Optional[OptionQuote]:
         return self.hub.quote(self.underlying, self.now, leg)
 
-    def history(self, n: int) -> list[Bar]:
+    def history(self, n: int, interval: Optional[int] = None) -> list[Bar]:
+        if (interval is not None and interval != self.interval
+                and hasattr(self.hub.store, "history_bars")):
+            return self.hub.store.history_bars(self.underlying, self.now, interval, n)
+        if self._warmup:
+            return (self._warmup + self._bars)[-n:]
         return self._bars[-n:]
 
     def signal(self, name: str):
         """Live FNO-scanner read for this underlying (F6)."""
         from app.engines import signals
         return signals.get_signal(self.underlying, name)
+
+    def chain(self) -> Optional[dict]:
+        cache = self.hub._chain_cache.get(self.underlying)
+        if not cache:
+            return None
+        from app.engines.scanner import chain_summary
+        return chain_summary(cache)
+
+    def iv_rank(self, lookback_days: int = 30) -> Optional[float]:
+        if not self._bars or not hasattr(self.hub.store, "atm_iv_chain_series"):
+            return None
+        series = self.hub.store.atm_iv_chain_series(
+            self.underlying, self.now, lookback_days)
+        if len(series) < 5:
+            return None
+        from app.engines.indicators import percentile_rank
+        return percentile_rank(series[-1], series)
 
     @property
     def positions(self) -> list[Position]:
@@ -442,6 +485,9 @@ class LiveRunner:
         interval = int(meta.timeframe)
         ctx = LiveContext(record, meta.underlying, self.hub, interval)
         self.contexts[record.id] = ctx
+        w = int((meta.params or {}).get("warmup_bars", 0) or 0)
+        if w:
+            ctx.warmup(self.hub.store, w)
         self.hub.register(meta.underlying, interval)
         await self.hub.ensure_started()
         registry.record_event("warn", "live",

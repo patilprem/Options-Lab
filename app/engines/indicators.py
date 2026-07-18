@@ -402,6 +402,16 @@ def pivots_from_history(bars) -> Optional[dict]:
     return pivots(pd["high"], pd["low"], pd["close"])
 
 
+def percentile_rank(value, series) -> Optional[float]:
+    """Percentile rank (0..100) of `value` within `series`: the % of samples at
+    or below it. Backs ctx.iv_rank() — "is today's ATM IV rich vs its recent
+    range?". None if `value` is None or `series` is empty."""
+    if value is None or not series:
+        return None
+    below = sum(1 for x in series if x <= value)
+    return 100.0 * below / len(series)
+
+
 def gap_pct(bars) -> Optional[float]:
     """Opening gap of the latest session vs the prior session's close, in %.
     Positive = gap up. None without two sessions."""

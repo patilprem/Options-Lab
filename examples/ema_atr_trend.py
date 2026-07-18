@@ -21,10 +21,27 @@ class EmaAtrTrend(Strategy):
         self.params = {
             "ema_period": 20, "st_period": 10, "st_mult": 3.0, "atr_period": 14,
             "breakout_atr": 0.25, "sl_pct": 0.35, "target_pct": 0.70, "lots": 1,
+            "htf_interval": 60,      # higher-timeframe trend filter
+            "htf_ema": 20,
+            "iv_rank_cap": 70,       # don't buy options when IV is already rich
             # deep enough for a settled EMA20/Supertrend/ATR at bar 1
             "warmup_bars": 60,
         }
         self.entered_today = None
+
+    def _htf_trend_ok(self, ctx, want_ce: bool) -> bool:
+        """Higher-timeframe agreement via ctx.history(interval=). Unknown
+        (no data) -> don't block, so the strategy stays backtestable."""
+        htf = ctx.history(self.params["htf_ema"] + 5, interval=self.params["htf_interval"])
+        e = indicators.ema(htf, self.params["htf_ema"])
+        if e is None:
+            return True
+        return htf[-1].close > e if want_ce else htf[-1].close < e
+
+    def _iv_not_rich(self, ctx) -> bool:
+        """Skip buying when ATM IV is in the top of its range. None -> allow."""
+        r = ctx.iv_rank(30)
+        return r is None or r <= self.params["iv_rank_cap"]
 
     def meta(self) -> StrategyMeta:
         return StrategyMeta(
@@ -69,6 +86,12 @@ class EmaAtrTrend(Strategy):
         want_pe = (px < vw and px < ema and st["dir"] == -1
                    and px < prior_low - buf)
         if not (want_ce or want_pe):
+            return
+
+        # optional confirmations (skip when data is unknown -> backtestable):
+        # higher-timeframe trend agreement + don't buy already-rich IV
+        if not self._htf_trend_ok(ctx, want_ce) or not self._iv_not_rich(ctx):
+            ctx.log(f"{'CE' if want_ce else 'PE'} setup skipped: HTF/IV filter")
             return
 
         otype = OptionType.CALL if want_ce else OptionType.PUT

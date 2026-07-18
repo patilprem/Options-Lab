@@ -362,6 +362,34 @@ def setup_score(t1: dict, t2: dict | None = None) -> dict:
             "deep_dived": bool(t2)}
 
 
+def max_pain(cache: dict) -> Optional[float]:
+    """Max-pain strike from a hub chain cache: the expiry price that minimizes
+    total option-writer payout (Σ call_oi·max(P-K,0) + Σ put_oi·max(K-P,0)),
+    evaluated over the strikes present. The classic OI-gravity level. None if
+    the cache has no strikes."""
+    strikes = sorted({q.strike for q in cache.values() if q.strike is not None})
+    if not strikes:
+        return None
+    calls = [(q.strike, q.oi or 0) for k, q in cache.items() if k[3] == "CALL"]
+    puts = [(q.strike, q.oi or 0) for k, q in cache.items() if k[3] == "PUT"]
+    best = best_pain = None
+    for P in strikes:
+        pain = (sum(oi * max(P - s, 0) for s, oi in calls)
+                + sum(oi * max(s - P, 0) for s, oi in puts))
+        if best_pain is None or pain < best_pain:
+            best, best_pain = P, pain
+    return best
+
+
+def chain_summary(cache: dict) -> dict:
+    """One-call chain read for ctx.chain(): PCR / ATM-IV / IV-skew / OI
+    (from chain_metrics) plus the max-pain strike. Same pure inputs the live
+    scanner uses, so backtest (replayed cache) and live agree."""
+    m = chain_metrics(cache)
+    m["max_pain"] = max_pain(cache)
+    return m
+
+
 def hitrate_stats(rows: list[dict]) -> dict:
     """Forward-return hit-rate of flagged setups (F6 validation). Each row:
     {score, entry, exit} — entry/exit are the bias-side ATM premiums at flag
