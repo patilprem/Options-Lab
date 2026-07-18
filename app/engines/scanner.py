@@ -711,10 +711,18 @@ class StockScanner:
             self._prev_chain[sym] = dict(cache)
             self.tier2[sym] = metrics
             done += 1
-        # persist the shortlist's full chains into the research dataset
-        if hasattr(self.store, "upsert_chain_rows"):
+        # Persist full chains to disk. By default this is limited to names the
+        # trader actually holds (needed for MTM/exit reconstruction); every
+        # shortlisted name is already scored/alerted above from the in-memory
+        # cache regardless. Set scanner_record_chains=on to persist the whole
+        # daily shortlist as a research/validation dataset instead.
+        if registry.setting("scanner_record_chains", "off") == "on":
+            to_persist = set(symbols)
+        else:
+            to_persist = set(symbols) & set(held)
+        if to_persist and hasattr(self.store, "upsert_chain_rows"):
             try:
-                hub.persist_chain_full(self.store, underlyings=set(symbols))
+                hub.persist_chain_full(self.store, underlyings=to_persist)
             except Exception as e:
                 registry.record_event("warn", "scanner", f"tier2 persist: {e!r}")
         # score every shortlisted name (Tier-1 read + Tier-2 chain) and alert

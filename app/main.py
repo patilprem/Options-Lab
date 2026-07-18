@@ -103,10 +103,23 @@ async def _market_recorder():
                     n not in UNDERLYINGS
                     or UNDERLYINGS[n].get("expiry", "9999") < _today)  # rolled
                    for n in names):
+                old_ids = {n: UNDERLYINGS.get(n, {}).get("security_id")
+                           for n in MCX_DYNAMIC}
                 try:
                     ids = await loop.run_in_executor(None, resolve_mcx_ids)
                     if ids:
                         registry.record_event("info", "feed", f"MCX ids resolved: {ids}")
+                        rolled = [n for n, sid in ids.items()
+                                  if old_ids.get(n) is not None and old_ids[n] != sid]
+                        if rolled:
+                            # the WS feed is still subscribed to the OLD (now
+                            # dead) contract's security id — force a reconnect
+                            # so it picks up the new one, else this
+                            # underlying's live recording silently stalls
+                            hub.resubscribe()
+                            registry.record_event(
+                                "info", "feed",
+                                f"MCX contract rolled ({rolled}); feed resubscribed")
                 except Exception as e:
                     registry.record_event("warn", "feed", f"MCX resolve failed: {e!r}")
             for u in names:

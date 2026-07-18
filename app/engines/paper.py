@@ -158,6 +158,17 @@ class MarketHub:
                 and underlying in UNDERLYINGS):
             self._livefeed.refresh()
 
+    def resubscribe(self) -> None:
+        """Force the live feed to reconnect and rebuild its instrument list.
+        Needed when an already-tracked underlying's security id CHANGES
+        underneath us (e.g. an MCX futures contract rolling over at expiry)
+        — enable_chain()/register() only refresh on first-time registration,
+        so a rollover otherwise leaves the socket subscribed to the old,
+        now-dead contract until some unrelated reconnect happens (which can
+        be hours away), silently freezing that underlying's recording."""
+        if self._started and self._livefeed:
+            self._livefeed.refresh()
+
     def feed_status(self) -> dict:
         """Health surface for the dashboard's Feed pill: driver mode, socket
         state, and how fresh the last tick is."""
@@ -606,6 +617,17 @@ class PaperContext(Context):
                 p.mtm_price = q.ltp
         self._enforce_levels()
 
+    def refresh_mtm(self, ts: datetime) -> None:
+        """Mark open positions from the live chain cache between bar closes.
+        The chain poller refreshes every ~3s, but push_bar (and with it the
+        displayed P&L) only fires once per the strategy's own timeframe —
+        5+ minutes for most strategies — so without this, P&L looked frozen
+        between bars even though fresh quotes were already in memory."""
+        for p in self._open:
+            q = self.hub.quote_position(self.underlying, ts, p)
+            if q:
+                p.mtm_price = q.ltp
+
     def _enforce_levels(self) -> None:
         for p in list(self.positions):
             hit = F.level_hit(p.qty, p.mtm_price, p.stop_loss, p.target)
@@ -825,12 +847,14 @@ class PaperRunner:
     """Owns all live strategy tasks. The API layer calls play/pause/stop."""
 
     HEARTBEAT_SEC = 60
+    MTM_REFRESH_SEC = 5
 
     def __init__(self, hub: MarketHub):
         self.hub = hub
         self.contexts: dict[str, PaperContext] = {}
         self.tasks: dict[str, asyncio.Task] = {}
         self._hb_task: Optional[asyncio.Task] = None
+        self._mtm_task: Optional[asyncio.Task] = None
 
     async def deploy(self, record: registry.StrategyRecord, strategy: Strategy,
                      restore: bool = False) -> None:
@@ -846,6 +870,7 @@ class PaperRunner:
         self.hub.register(meta.underlying, interval)
         await self.hub.ensure_started()
         self._ensure_heartbeat()
+        self._ensure_mtm_refresh()
         self.tasks[record.id] = asyncio.create_task(self._loop(record.id, strategy, ctx))
 
     async def restore_all(self, instantiate) -> int:
@@ -881,6 +906,22 @@ class PaperRunner:
     def _ensure_heartbeat(self) -> None:
         if self._hb_task is None or self._hb_task.done():
             self._hb_task = asyncio.create_task(self._heartbeat())
+
+    def _ensure_mtm_refresh(self) -> None:
+        if self._mtm_task is None or self._mtm_task.done():
+            self._mtm_task = asyncio.create_task(self._mtm_refresh_loop())
+
+    async def _mtm_refresh_loop(self) -> None:
+        """Keep displayed P&L moving with live prices between bar closes —
+        see PaperContext.refresh_mtm for why push_bar alone isn't enough."""
+        while True:
+            await asyncio.sleep(self.MTM_REFRESH_SEC)
+            now = datetime.now(IST).replace(tzinfo=None)
+            for ctx in list(self.contexts.values()):
+                try:
+                    ctx.refresh_mtm(now)
+                except Exception as e:
+                    registry.record_event("warn", "engine", f"mtm refresh failed: {e!r}")
 
     async def _heartbeat(self) -> None:
         """Persist every live context on an interval so an ungraceful crash

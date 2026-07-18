@@ -996,6 +996,8 @@ scanner_router = APIRouter(tags=["scanner"])
 class ScannerSettingsReq(BaseModel):
     enabled: bool | None = None          # master on/off (needs live creds)
     alert_score: float | None = None     # ntfy alert threshold (0-100)
+    record_chains: bool | None = None    # persist full chains for every
+                                          # shortlisted name, not just held ones
 
 
 @scanner_router.get("/scanner")
@@ -1005,6 +1007,7 @@ def scanner_view():
     return {
         "enabled": registry.setting("scanner", "off") == "on",
         "alert_score": float(registry.setting("scanner_alert_score", "70")),
+        "record_chains": registry.setting("scanner_record_chains", "off") == "on",
         "session": scanner._session_open(),
         "universe_size": len(scanner_engine._universe),
         "last_sweep": (str(scanner_engine._last_sweep_ts)
@@ -1099,6 +1102,9 @@ def set_scanner(req: ScannerSettingsReq):
     if req.alert_score is not None:
         registry.set_setting("scanner_alert_score",
                              str(max(0.0, min(100.0, req.alert_score))))
+    if req.record_chains is not None:
+        registry.set_setting("scanner_record_chains",
+                             "on" if req.record_chains else "off")
     registry.record_event("info", "scanner", "Scanner settings updated")
     return scanner_view()
 

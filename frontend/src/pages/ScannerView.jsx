@@ -112,6 +112,17 @@ export default function ScannerView({ showToast }) {
     load()
   }
 
+  const setRecordChains = async (on) => {
+    await fetch('/scanner/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ record_chains: on }),
+    })
+    showToast && showToast(on
+      ? 'Recording full chains for every shortlisted name'
+      : 'Recording chains only for held (traded) names')
+    load()
+  }
+
   if (!data) return <div className="empty">Loading scanner…</div>
   const scores = data.scores || []
 
@@ -128,6 +139,13 @@ export default function ScannerView({ showToast }) {
           {data.last_sweep ? ` · last sweep ${String(data.last_sweep).slice(11, 19)}` : ''}
         </span>
         <span style={{ color: 'var(--muted)', fontSize: 13 }}>alert ≥ {data.alert_score}</span>
+        <button
+          className="btn"
+          title="Off: only symbols the auto-trader actually holds get their full option chain persisted to disk. On: every shortlisted mover does, for a research dataset — uses more storage/API budget."
+          onClick={() => setRecordChains(!data.record_chains)}
+        >
+          Record shortlist chains: {data.record_chains ? 'on' : 'off'}
+        </button>
         <button className="btn" style={{ marginLeft: 'auto' }} onClick={() => setEnabled(!data.enabled)}>
           {data.enabled ? 'Turn off' : 'Turn on'}
         </button>
