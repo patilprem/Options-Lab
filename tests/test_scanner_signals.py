@@ -47,13 +47,23 @@ def test_get_signal_never_raises():
         signals.register(None)
 
 
-def test_backtest_context_signal_is_none():
-    # A backtest must never see scanner signals even if a provider is set.
+def test_backtest_context_ignores_live_provider():
+    # A backtest must NEVER consult the live scanner provider — it replays
+    # genuinely recorded data instead. With a synthetic store (nothing
+    # recorded) the replay returns None even though a live provider is set,
+    # proving the backtest doesn't peek at the live signal.
+    from datetime import datetime
+
+    from app.core.contract import Bar
+    from app.data.store import SyntheticStore
+    from app.engines import fills as F
     from app.engines.backtest import BacktestContext
     signals.register(_FakeScanner())
     try:
-        ctx = BacktestContext.__new__(BacktestContext)   # signal() ignores state
-        ctx.underlying = "NIFTY"
+        ctx = BacktestContext("NIFTY", SyntheticStore(), 1_000_000,
+                              F.FeeConfig(), F.SlippageConfig())
+        ctx.push_bar(Bar(datetime(2026, 7, 16, 10, 0), 22000, 22010, 21990,
+                         22000, 1000, 0))
         assert ctx.signal("index_bias") is None
     finally:
         signals.register(None)

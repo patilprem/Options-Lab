@@ -23,6 +23,7 @@ from app.core.contract import (Action, Bar, Context, LegSpec, OptionQuote,
                                OptionType, Position, Strategy)
 from app.engines import fills as F
 from app.engines import margin as M
+from app.engines.replay import SignalReplay
 
 # Lot sizes by effective date (new-series dates from NSE/BSE circulars —
 # SEBI's contract-value band forces periodic revisions, so a flat constant
@@ -72,6 +73,8 @@ class BacktestContext(Context):
         self._end: Optional[datetime] = None       # set by run_backtest; enables preload
         self._series: dict = {}                     # leg-key -> (ts_list, rows) cache
         self._contract: dict = {}                   # (strike,type,expiry) -> (ts_list, rows)
+        self._replay = SignalReplay(store)          # F6: point-in-time signal replay
+        self._warmup: list[Bar] = []                # pre-`start` bars for indicator lookback
         self._bars: list[Bar] = []
         self._positions: list[Position] = []
         self.closed: list[Position] = []
@@ -167,14 +170,25 @@ class BacktestContext(Context):
     def option(self, leg: LegSpec) -> Optional[OptionQuote]:
         return self._quote(self.now, leg)
 
-    def history(self, n: int) -> list[Bar]: return self._bars[-n:]
+    def history(self, n: int) -> list[Bar]:
+        # warmup bars (recorded before `start`) prepend the live window so an
+        # indicator strategy has lookback from its very first on_bar — see
+        # _seed_warmup / run_backtest(warmup_bars=...).
+        if self._warmup:
+            return (self._warmup + self._bars)[-n:]
+        return self._bars[-n:]
 
     def signal(self, name: str):
-        """Always None in a backtest (F6): the FNO scanner is a live-time
-        engine with no historical intraday series to replay, so a backtest
-        must not pretend to have seen its signals. Strategies treat None as
-        'unknown' — see docs/FNO_SCANNER_PLAN 'Backtesting honesty'."""
-        return None
+        """Point-in-time replay of recorded scanner signals (F6). Returns the
+        value AS-OF the simulated clock, reconstructed from data the platform
+        genuinely recorded live (index_bias_history, chain_snapshots), or None
+        when nothing was recorded for this name/underlying near this time —
+        strategies treat None as 'unknown'. Only signals backed by a real
+        recorded time series are replayed; tier1/setup (per-stock) stay None.
+        See app/engines/replay.py 'Backtesting honesty, revised'."""
+        if not self._bars:
+            return None
+        return self._replay.signal(self.underlying, name, self.now)
 
     @property
     def positions(self) -> list[Position]:
@@ -273,15 +287,42 @@ class BacktestContext(Context):
 
 # ---------------------------------------------------------------------------
 
+def _seed_warmup(ctx: "BacktestContext", store, underlying: str,
+                 start: datetime, interval: int, n: int) -> None:
+    """Preload the last `n` bars recorded BEFORE `start` into ctx warmup so an
+    indicator strategy has lookback from its first real on_bar (instead of
+    starting cold and trading blind until enough of the window has replayed).
+    These bars are NEVER iterated (no on_bar / no fills / no daily P&L) — they
+    exist only to deepen ctx.history()."""
+    if n <= 0:
+        return
+    from datetime import timedelta
+    per_day = max(1, 375 // max(1, interval))          # ~375 trading min/day
+    lookback_days = max(5, (n // per_day + 2) * 2)     # pad for weekends/holidays
+    prior = store.underlying_bars(underlying, start - timedelta(days=lookback_days),
+                                  start, interval)
+    prior = [b for b in prior if b.ts < start]
+    if prior:
+        ctx._warmup = prior[-n:]
+
+
 def run_backtest(strategy: Strategy, store, start: datetime, end: datetime,
                  capital: float,
                  fee_cfg: F.FeeConfig | None = None,
-                 slip_cfg: F.SlippageConfig | None = None) -> dict:
+                 slip_cfg: F.SlippageConfig | None = None,
+                 warmup_bars: int = 0) -> dict:
     meta = strategy.meta()
     ctx = BacktestContext(meta.underlying, store, capital,
                           fee_cfg or F.FeeConfig(), slip_cfg or F.SlippageConfig())
     ctx._end = end                      # enables in-memory option-series preload
-    bars = store.underlying_bars(meta.underlying, start, end, int(meta.timeframe))
+    interval = int(meta.timeframe)
+    # warmup depth: explicit arg wins; else honor a strategy's declared hint so
+    # existing backtests (no hint) keep their exact current behavior.
+    if warmup_bars <= 0:
+        warmup_bars = int((meta.params or {}).get("warmup_bars", 0) or 0)
+    if warmup_bars > 0:
+        _seed_warmup(ctx, store, meta.underlying, start, interval, warmup_bars)
+    bars = store.underlying_bars(meta.underlying, start, end, interval)
     if not bars:
         return {"error": "no data in store for this range"}
 

@@ -16,6 +16,12 @@ Output ONLY Python code, no explanations, no markdown fences.
 6. Expose every tunable number in `meta().params` and read from
    `self.params` so I can tweak them without regenerating code.
 7. Keep per-bar work light: no heavy loops over long history each bar.
+8. If your logic needs indicator lookback (EMA/RSI/ATR/etc.), set
+   `"warmup_bars": N` in `meta().params` — the engine preloads N bars of
+   history BEFORE the start of a backtest and on a mid-session paper restart,
+   so `ctx.history(n)` is deep enough from your first `on_bar` instead of
+   starting cold. Choose N ≥ your longest lookback (e.g. 60 for a 50-period
+   indicator).
 
 ## The interface you must implement
 
@@ -50,15 +56,18 @@ Read:  `ctx.now`, `ctx.spot`, `ctx.history(n) -> list[Bar]`,
        `ctx.positions -> list[Position]` (only YOUR open positions;
         Position has entry_price, mtm_price, unrealized_pnl, tag, id),
        `ctx.allocated_capital`, `ctx.available_capital`, `ctx.day_pnl`,
-       `ctx.signal(name) -> dict | None` — LIVE FNO-scanner read for your
+       `ctx.signal(name) -> dict | None` — FNO-scanner read for your
         underlying. Names: "index_bias" (NIFTY/BANKNIFTY weighted breadth,
         dict has score in [-1,1] + label), "setup" (this name's composite
         setup score + bias CE/PE), "tier1" (buildup / volume_surge /
         price_change_pct), "tier2" (chain pcr_oi / atm_iv / iv_skew /
-        liquidity). LIVE/PAPER ONLY — it returns None in every backtest (the
-        scanner is a now-signal with no history to replay), so use it ONLY as
-        an optional filter and always handle None; never make a trade depend
-        on it if you want the strategy to be backtestable.
+        liquidity). In paper/live these are the live read. In BACKTEST,
+        "index_bias" and "tier2" are REPLAYED from recorded data as-of the bar
+        (real, not invented) but only for the window the recorder was running —
+        outside it they return None; "tier1"/"setup" are always None in
+        backtest. So ALWAYS handle None as "unknown", and use signals as a
+        filter/confirmation, not the sole trigger, if you want the strategy to
+        backtest cleanly over ranges predating the recording.
 
 Act:   `ctx.enter(legs, tag="", sl_pct=None, target_pct=None) -> bool`
        (multi-leg atomic; returns False if paused / not enough capital;

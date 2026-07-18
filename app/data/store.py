@@ -463,6 +463,68 @@ class DataStore:
                WHERE index_name=? AND CAST(ts AS DATE)=CAST(? AS DATE)
                ORDER BY ts""", [index_name, str(day)])
 
+    def index_bias_asof(self, index_name: str, ts, max_age_min: int = 20):
+        """Point-in-time index_bias read AS-OF `ts` for backtest replay (F6):
+        the most recent recorded reading at or before `ts`, reconstructed into
+        the same dict shape scanner.index_bias() returns (minus `contributors`,
+        which aren't stored). Returns None when nothing was recorded near then —
+        the honest 'unknown' a backtest must show for days/times the live
+        scanner never ran. `max_age_min` rejects a stale carry-over reading
+        (e.g. the last print of a prior session)."""
+        row = self._q1(
+            """SELECT ts, score, buildup_breadth, price_breadth, bull_weight,
+                      bear_weight, coverage, n, spot
+               FROM index_bias_history
+               WHERE index_name=? AND ts <= ?
+               ORDER BY ts DESC LIMIT 1""",
+            [index_name, ts])
+        if not row or row[1] is None:
+            return None
+        if (ts - row[0]).total_seconds() > max_age_min * 60:
+            return None
+        score = row[1]
+        label = ("bullish" if score > 0.3 else
+                 "bearish" if score < -0.3 else "neutral")
+        return {"score": score, "buildup_breadth": row[2],
+                "price_breadth": row[3], "bull_weight": row[4],
+                "bear_weight": row[5], "coverage": row[6], "n": row[7],
+                "label": label, "spot": row[8], "contributors": [],
+                "as_of": row[0].isoformat(sep=" ", timespec="seconds"),
+                "replayed": True}
+
+    def chain_cache_asof(self, underlying: str, ts, max_age_min: int = 10):
+        """Rebuild a hub-shaped chain cache ({(kind, offset, strike_offset,
+        option_type): OptionQuote}) from the recorded chain_snapshots poll
+        nearest at-or-before `ts` — the input scanner.chain_metrics() consumes,
+        so backtest tier2 (PCR / ATM-IV / IV-skew) replays through the SAME pure
+        function the live scanner uses. Returns None when no fresh snapshot
+        exists near `ts`. One poll's targets are written a few seconds apart, so
+        the whole batch in a short window around the latest ts is gathered."""
+        tsrow = self._q1(
+            """SELECT max(ts) FROM chain_snapshots
+               WHERE underlying=? AND ts <= ?""", [underlying, ts])
+        if not tsrow or tsrow[0] is None:
+            return None
+        latest = tsrow[0]
+        if (ts - latest).total_seconds() > max_age_min * 60:
+            return None
+        rows = self._q(
+            """SELECT ts, expiry, expiry_kind, expiry_offset, strike,
+                      strike_offset, option_type, ltp, bid, ask, iv, oi, volume,
+                      delta, theta, vega, gamma
+               FROM chain_snapshots
+               WHERE underlying=? AND ts <= ?
+                 AND ts >= ? - INTERVAL '90 seconds'
+               ORDER BY ts""", [underlying, latest, latest])
+        cache: dict = {}
+        for r in rows:
+            key = (r[2], r[3], r[5], r[6])   # kind, offset, strike_offset, otype
+            cache[key] = OptionQuote(
+                r[0], underlying, r[1], r[4], OptionType(r[6]), ltp=r[7],
+                bid=r[8], ask=r[9], iv=r[10], oi=r[11], volume=r[12],
+                delta=r[13], theta=r[14], vega=r[15], gamma=r[16])
+        return cache or None
+
     def upsert_index_bias_accuracy(self, day, index_name: str, horizon_min: int,
                                    n: int, hits: int, avg_move: float) -> None:
         hit_rate = (hits / n) if n else None
@@ -633,6 +695,8 @@ SyntheticStore.latest_stock_snapshots = lambda self, day=None: []
 SyntheticStore.upsert_index_bias = lambda self, ts, name, bias: None
 SyntheticStore.recent_index_bias = lambda self, name, limit=60: []
 SyntheticStore.index_bias_accuracy = lambda self, name, limit=30: []
+SyntheticStore.index_bias_asof = lambda self, name, ts, max_age_min=20: None
+SyntheticStore.chain_cache_asof = lambda self, u, ts, max_age_min=10: None
 SyntheticStore.latest_spot = lambda self, u, day=None: None
 SyntheticStore.record_setup_flag = lambda self, ts, s, b, sc, sp, ap: None
 SyntheticStore.setup_flags_since = lambda self, since_day: []

@@ -9,11 +9,12 @@ registered provider (the scanner engine) for the current read.
 Deliberately tiny and dependency-free so contract.py / the engines can import
 it without cycles. The provider is registered once at app start.
 
-Honesty rule baked in: only the LIVE-time contexts (paper, live) consult this.
-BacktestContext returns None for every signal — the scanner reflects the market
-NOW, and there is no historical intraday scanner series to replay, so a
-backtest must not pretend to have seen these signals (see docs/FNO_SCANNER_PLAN
-'Backtesting honesty').
+Honesty rule baked in: only the LIVE-time contexts (paper, live) consult this
+live provider. BacktestContext does NOT — it replays genuinely recorded
+point-in-time data instead (index_bias_history, chain_snapshots) via
+app/engines/replay.py, returning None whenever nothing was recorded. Either
+way a backtest never invents a signal it couldn't have known (see
+docs/FNO_SCANNER_PLAN 'Backtesting honesty' and replay.py's header).
 """
 
 from __future__ import annotations

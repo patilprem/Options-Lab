@@ -624,7 +624,8 @@ class PaperContext(Context):
         self.interval = int(interval)  # this strategy's timeframe (minutes)
         self.fee_cfg, self.slip_cfg = F.FeeConfig(), F.SlippageConfig()
         self.paused = record.state != registry.State.RUNNING
-        self._bars: list[Bar] = []
+        self._bars: list[Bar] = []          # live session bars only
+        self._warmup: list[Bar] = []        # pre-session bars for indicator lookback
         self._open: list[Position] = []
         self.closed_today: list[Position] = []
         self._margin_used = 0.0
@@ -696,6 +697,12 @@ class PaperContext(Context):
         return self.hub.quote(self.underlying, self.now, leg)
 
     def history(self, n: int) -> list[Bar]:
+        # warmup bars (loaded from the store at deploy) prepend the live
+        # session so an indicator strategy isn't blind after a mid-session
+        # (re)start — see warmup(). They never affect now/spot/day accounting
+        # (those read _bars only), so persist_day's no-bar guard is preserved.
+        if self._warmup:
+            return (self._warmup + self._bars)[-n:]
         return self._bars[-n:]
 
     def signal(self, name: str):
@@ -824,6 +831,32 @@ class PaperContext(Context):
                 "block" if "blocked" in msg else "strategy")
         registry.record_event(lvl, kind, msg, self.rec.id)
 
+    def warmup(self, store, n: int) -> int:
+        """Seed history() with the last `n` bars recorded BEFORE now from the
+        store, so an indicator strategy has lookback immediately on (re)start
+        instead of trading blind until enough live bars accrue (e.g. a 20-EMA
+        strategy restarted at 09:15 would otherwise be blind until ~10:55).
+
+        Bars only — open positions are recovered separately by restore_state().
+        Loaded into a dedicated list that history() prepends but now/spot/day
+        counters ignore, so no phantom-day risk. No-op if history is already
+        populated or n<=0. Never raises — warmup is best-effort."""
+        if n <= 0 or self._warmup or self._bars:
+            return 0
+        try:
+            now = datetime.now(IST).replace(tzinfo=None)
+            per_day = max(1, 375 // max(1, self.interval))
+            lookback_days = max(5, (n // per_day + 2) * 2)
+            prior = store.underlying_bars(
+                self.underlying, now - timedelta(days=lookback_days), now,
+                self.interval)
+            prior = [b for b in prior if b.ts < now]
+            if prior:
+                self._warmup = prior[-n:]
+            return len(self._warmup)
+        except Exception:
+            return 0
+
     # -- persistence (M4) ------------------------------------------------------
     def persist_state(self) -> None:
         """Snapshot open positions + margin/P&L to SQLite so a restart mid-
@@ -913,6 +946,14 @@ class PaperRunner:
             if n:
                 registry.record_event("info", "engine",
                                       f"recovered {n} open positions", record.id)
+        # warmup: seed indicator lookback from the store (best-effort). A
+        # strategy declares its need via meta.params["warmup_bars"].
+        w = int((meta.params or {}).get("warmup_bars", 0) or 0)
+        if w:
+            seeded = ctx.warmup(self.hub.store, w)
+            if seeded:
+                registry.record_event("info", "engine",
+                                      f"warmup: seeded {seeded} history bars", record.id)
         self.hub.register(meta.underlying, interval)
         await self.hub.ensure_started()
         self._ensure_heartbeat()

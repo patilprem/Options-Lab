@@ -166,16 +166,20 @@ class Context(abc.ABC):
         """Last n underlying bars, oldest first."""
 
     def signal(self, name: str) -> Optional[dict]:
-        """Live FNO-scanner read for THIS strategy's underlying (F6), or None.
+        """FNO-scanner read for THIS strategy's underlying (F6), or None.
 
         Names: "index_bias" (NIFTY/BANKNIFTY constituent-weighted bias),
         "setup" (this name's composite setup score), "tier1" (buildup / volume
         surge / price change), "tier2" (chain PCR / IV / skew / liquidity).
 
-        LIVE-ONLY by design: paper and live contexts return the current read;
-        the backtest context ALWAYS returns None — the scanner reflects the
-        market now and has no historical series to replay, so strategies must
-        treat a None signal as "unknown" and never depend on one to trade.
+        Paper and live contexts return the live scanner read. The backtest
+        context REPLAYS recorded point-in-time data as-of the simulated bar:
+        "index_bias" (from index_bias_history) and "tier2" (from
+        chain_snapshots) come back for days/times the recorder was running, and
+        None otherwise; "tier1"/"setup" are not replayed (always None in
+        backtest). So a signal is None whenever it is genuinely unknown —
+        strategies must always treat None as "unknown", and know that a signal
+        only backtests over the window it was actually recorded for.
         Default here is None so a context without scanner wiring is safe."""
         return None
 
