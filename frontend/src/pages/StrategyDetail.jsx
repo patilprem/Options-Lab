@@ -12,6 +12,8 @@ export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged
   const [renaming, setRenaming] = useState(false)
   const [nameDraft, setNameDraft] = useState('')
   const [editingCode, setEditingCode] = useState(false)
+  const [isLive, setIsLive] = useState(false)
+  const [ctrlBusy, setCtrlBusy] = useState(false)
 
   const load = async () => {
     try {
@@ -20,6 +22,10 @@ export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged
     } catch (e) {
       console.error(e)
     }
+    try {
+      const live = await fetch('/live/status').then(r => r.json())
+      setIsLive((live.deployed || []).includes(id))
+    } catch (e) { /* live status is a bonus for picking the right control path */ }
   }
 
   useEffect(() => { load() }, [id])
@@ -27,6 +33,23 @@ export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged
   if (!strategy) return <div className="panel-body"><div className="empty">Loading...</div></div>
 
   const deployed = DEPLOYED_STATES.includes(strategy.state)
+
+  const control = async (cmd) => {
+    setCtrlBusy(true)
+    try {
+      const path = isLive ? `/strategies/${id}/live/${cmd}` : `/strategies/${id}/${cmd}`
+      const res = await fetch(path, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `${cmd} failed`)
+      showToast?.(`${cmd === 'play' ? 'Running ▶' : cmd === 'pause' ? 'Paused' : 'Stopped'}`)
+      await load()
+      onChanged?.()
+    } catch (e) {
+      showToast?.(e.message)
+    } finally {
+      setCtrlBusy(false)
+    }
+  }
 
   const startRename = () => { setNameDraft(strategy.name); setRenaming(true) }
 
@@ -107,6 +130,15 @@ export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged
         <span className={`badge ${strategy.state}`}>{strategy.state.replace('DEPLOYED_', '')}</span>
         {['VALIDATED', 'STOPPED'].includes(strategy.state) && (
           <button className="btn btn-primary" onClick={() => onDeploy(id)} style={{ marginLeft: '8px' }}>Paper trade</button>
+        )}
+        {strategy.state === 'RUNNING' && (
+          <button className="btn btn-ghost" onClick={() => control('pause')} disabled={ctrlBusy} style={{ marginLeft: '8px' }}>Pause</button>
+        )}
+        {strategy.state === 'DEPLOYED_PAUSED' && (
+          <button className="btn btn-primary" onClick={() => control('play')} disabled={ctrlBusy} style={{ marginLeft: '8px' }}>Play</button>
+        )}
+        {deployed && (
+          <button className="btn btn-ghost" onClick={() => control('stop')} disabled={ctrlBusy} style={{ marginLeft: '8px' }}>Stop</button>
         )}
         <button className="btn btn-live" onClick={() => onLive(id)} style={{ marginLeft: '8px' }}>Trade live</button>
         <button
