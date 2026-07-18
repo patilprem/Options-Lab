@@ -76,6 +76,27 @@ export default function BacktestPanel({ id, underlying }) {
     ? coverage.map(c => `${c.underlying} ${c.from} → ${c.to}`).join(', ')
     : 'none — backfill data first (Data tab)'
 
+  // -- exit-reason breakdown (derived client-side from result.trades) --------
+  // Answers "is the declared stop actually containing losses?" — if very few
+  // exits say stop_loss despite a red strategy, the stop isn't working as
+  // intended (see e.g. backtest.py mark_price's stale-quote fallback when a
+  // strike drifts far outside the recorded ATM-relative window).
+  const trades = result?.trades || []
+  const byReason = {}
+  for (const t of trades) {
+    const r = t.exit_reason || 'unknown'
+    const b = (byReason[r] ??= { n: 0, wins: 0, total: 0 })
+    b.n += 1
+    b.wins += t.pnl > 0 ? 1 : 0
+    b.total += t.pnl
+  }
+  const reasonRows = Object.entries(byReason).sort((a, b) => b[1].n - a[1].n)
+
+  const largest = [...trades].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 6)
+
+  const attribution = result?.attribution || {}
+  const ATTR_LABELS = { iv_rank: 'IV rank', index_bias: 'Index bias', pcr_oi: 'PCR (OI)' }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <div style={{ fontSize: 12, color: 'var(--muted)' }}>Available data: {covText}</div>
@@ -137,8 +158,111 @@ export default function BacktestPanel({ id, underlying }) {
               </tbody>
             </table>
           </div>
+
+          {reasonRows.length > 0 && (
+            <Section title="Exit reasons — is the stop actually working?">
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                <thead>
+                  <tr style={{ color: 'var(--muted)', textAlign: 'left' }}>
+                    <th style={cell}>Reason</th><th style={cell}>Trades</th>
+                    <th style={cell}>Win rate</th><th style={cell}>Total P&L</th>
+                    <th style={cell}>Avg P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reasonRows.map(([reason, b]) => (
+                    <tr key={reason}>
+                      <td style={cell}>{reason}</td>
+                      <td style={cell}>{b.n}</td>
+                      <td style={cell}>{(100 * b.wins / b.n).toFixed(1)}%</td>
+                      <td style={{ ...cell, color: pos(b.total) }}>{inr(b.total)}</td>
+                      <td style={{ ...cell, color: pos(b.total / b.n) }}>{inr(b.total / b.n)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Section>
+          )}
+
+          {Object.keys(attribution).length > 0 && (
+            <Section title="Signal attribution — which data state at entry paid?">
+              {Object.entries(attribution).map(([key, buckets]) => (
+                <div key={key} style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>
+                    {ATTR_LABELS[key] || key}
+                  </div>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ color: 'var(--muted)', textAlign: 'left' }}>
+                        <th style={cell}>Bucket</th><th style={cell}>n</th>
+                        <th style={cell}>Win rate</th><th style={cell}>Avg P&L</th>
+                        <th style={cell}>Total P&L</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(buckets)
+                        .filter(([b]) => b !== 'overall')
+                        .sort((a, b) => b[1].n - a[1].n)
+                        .map(([bucket, v]) => (
+                          <tr key={bucket}>
+                            <td style={cell}>{bucket}</td>
+                            <td style={cell}>{v.n}</td>
+                            <td style={cell}>{v.win_rate}%</td>
+                            <td style={{ ...cell, color: pos(v.avg_pnl) }}>{inr(v.avg_pnl)}</td>
+                            <td style={{ ...cell, color: pos(v.total_pnl) }}>{inr(v.total_pnl)}</td>
+                          </tr>
+                        ))}
+                      {buckets.overall && (
+                        <tr style={{ color: 'var(--muted)' }}>
+                          <td style={cell}>overall</td>
+                          <td style={cell}>{buckets.overall.n}</td>
+                          <td style={cell}>{buckets.overall.win_rate}%</td>
+                          <td style={cell}>{inr(buckets.overall.avg_pnl)}</td>
+                          <td style={cell}>{inr(buckets.overall.total_pnl)}</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+            </Section>
+          )}
+
+          {largest.length > 0 && (
+            <Section title="Largest trades — is P&L concentrated in a few?">
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                <thead>
+                  <tr style={{ color: 'var(--muted)', textAlign: 'left' }}>
+                    <th style={cell}>Entry</th><th style={cell}>Exit</th>
+                    <th style={cell}>Tag</th><th style={cell}>Exit reason</th>
+                    <th style={cell}>P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {largest.map((t, i) => (
+                    <tr key={i}>
+                      <td style={cell}>{t.entry_ts}</td>
+                      <td style={cell}>{t.exit_ts || '—'}</td>
+                      <td style={cell}>{t.tag}</td>
+                      <td style={cell}>{t.exit_reason}</td>
+                      <td style={{ ...cell, color: pos(t.pnl) }}>{inr(t.pnl)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Section>
+          )}
         </>
       )}
+    </div>
+  )
+}
+
+function Section({ title, children }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontSize: 13, color: 'var(--ink)', fontWeight: 600 }}>{title}</div>
+      <div style={{ overflowX: 'auto', maxHeight: 260 }}>{children}</div>
     </div>
   )
 }
