@@ -242,6 +242,8 @@ class BacktestContext(Context):
                      f"{self.available_capital:,.0f} ({tag})")
             return False
         margin_share = est / max(1, len(quotes))
+        from app.engines.attribution import capture_entry_context
+        entry_ctx = capture_entry_context(self)   # data state for attribution
         for leg, q in quotes:
             units = leg.lots * self.lot_size
             res = F.fill_backtest(q.ltp, leg.strike_offset, leg.action,
@@ -254,7 +256,8 @@ class BacktestContext(Context):
                            entry_price=res.price, entry_ts=self.now,
                            mtm_price=res.price, fees_paid=res.fees,
                            tag=tag or leg.tag, stop_loss=sl, target=tgt,
-                           margin_blocked=round(margin_share, 2))
+                           margin_blocked=round(margin_share, 2),
+                           entry_context=dict(entry_ctx))
             self._positions.append(pos)
             self.fills_this_bar.append(pos)
             self._fees_by_day[self.now.date().isoformat()] += res.fees
@@ -421,6 +424,21 @@ def _report(daily: dict, ctx: BacktestContext, capital: float) -> dict:
         mu = sum(rets) / len(rets)
         sd = math.sqrt(sum((r - mu) ** 2 for r in rets) / (len(rets) - 1))
         sharpe = (mu / sd) * math.sqrt(252) if sd > 0 else 0.0
+    # per-trade rows (entry_context + realized P&L) + signal attribution: which
+    # data state at entry actually paid. Empty entry_context (unrecorded
+    # windows) lands in the 'unknown' bucket, so nothing is silently dropped.
+    trades = [{"entry_ts": p.entry_ts.isoformat(sep=" ", timespec="minutes"),
+               "exit_ts": p.exit_ts.isoformat(sep=" ", timespec="minutes")
+                          if p.exit_ts else None,
+               "tag": p.tag, "pnl": round(p.realized_pnl, 2),
+               "exit_reason": p.exit_reason, "entry_context": p.entry_context}
+              for p in ctx.closed]
+    from app.engines.attribution import attribution
+    attr = {
+        "iv_rank": attribution(trades, "iv_rank", bins=[0, 30, 50, 70, 100]),
+        "index_bias": attribution(trades, "index_bias", bins=[-1, -0.3, 0.3, 1]),
+        "pcr_oi": attribution(trades, "pcr_oi", bins=[0, 0.8, 1.2, 3]),
+    }
     return {
         "summary": {
             "capital": capital,
@@ -433,5 +451,7 @@ def _report(daily: dict, ctx: BacktestContext, capital: float) -> dict:
             "total_fees": round(sum(p.fees_paid for p in ctx.closed), 2),
         },
         "daily": days,   # <-- your date-by-date performance
+        "trades": trades,
+        "attribution": attr,   # <-- win-rate/avg-P&L sliced by entry data state
         "logs": ctx.logs[-200:],
     }

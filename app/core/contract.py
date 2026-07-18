@@ -109,6 +109,7 @@ class Position:
     target: Optional[float] = None       # premium level; engine enforces if set
     margin_blocked: float = 0.0          # estimated margin share for this leg
     exit_reason: str = ""                # entry|stop_loss|target|time_exit|signal|squareoff|expiry|pause|manual
+    entry_context: dict = field(default_factory=dict)  # data state at entry (signal attribution)
 
     @property
     def is_open(self) -> bool:

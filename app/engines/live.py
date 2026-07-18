@@ -342,6 +342,8 @@ class LiveContext(Context):
             return False
 
         placed = 0
+        from app.engines.attribution import capture_entry_context
+        entry_ctx = capture_entry_context(self)   # data state for attribution
         for leg, q in quotes:
             units = leg.lots * self.lot_size
             price = q.ask if (leg.action == Action.BUY and q.ask) else \
@@ -364,7 +366,8 @@ class LiveContext(Context):
                 id=oid or str(uuid.uuid4())[:8], leg=leg, underlying=self.underlying,
                 expiry=q.expiry, strike=q.strike, qty=qty, entry_price=round(price, 2),
                 entry_ts=self.now, mtm_price=round(price, 2), fees_paid=fees,
-                tag=tag or leg.tag, stop_loss=sl, target=tgt)
+                tag=tag or leg.tag, stop_loss=sl, target=tgt,
+                entry_context=dict(entry_ctx))
             self._open.append(pos)
             self._fees_today += fees
             self._blotter(pos, leg.action.value, price, fees, "entry",

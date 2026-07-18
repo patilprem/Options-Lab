@@ -80,7 +80,7 @@ def _pos_to_dict(p: Position) -> dict:
             "entry_ts": p.entry_ts.isoformat(), "mtm_price": p.mtm_price,
             "fees_paid": p.fees_paid, "tag": p.tag, "stop_loss": p.stop_loss,
             "target": p.target, "margin_blocked": p.margin_blocked,
-            "exit_reason": p.exit_reason}
+            "exit_reason": p.exit_reason, "entry_context": p.entry_context}
 
 
 def _pos_from_dict(d: dict) -> Position:
@@ -91,7 +91,7 @@ def _pos_from_dict(d: dict) -> Position:
         entry_ts=datetime.fromisoformat(d["entry_ts"]), mtm_price=d["mtm_price"],
         fees_paid=d["fees_paid"], tag=d.get("tag", ""), stop_loss=d.get("stop_loss"),
         target=d.get("target"), margin_blocked=d.get("margin_blocked", 0.0),
-        exit_reason=d.get("exit_reason", ""))
+        exit_reason=d.get("exit_reason", ""), entry_context=d.get("entry_context") or {})
 
 
 class MarketHub:
@@ -835,6 +835,8 @@ class PaperContext(Context):
             self.log(f"enter blocked: margin {est:,.0f} > available {self.available_capital:,.0f}")
             return False
         margin_share = est / max(1, len(quotes))
+        from app.engines.attribution import capture_entry_context
+        entry_ctx = capture_entry_context(self)   # data state for attribution
         for leg, q in quotes:
             units = leg.lots * self.lot_size
             res = F.fill_live(q, leg.action, units, self.fee_cfg, self.slip_cfg)
@@ -845,7 +847,8 @@ class PaperContext(Context):
                 expiry=q.expiry, strike=q.strike, qty=qty,
                 entry_price=res.price, entry_ts=self.now, mtm_price=res.price,
                 fees_paid=res.fees, tag=tag or leg.tag,
-                stop_loss=sl, target=tgt, margin_blocked=round(margin_share, 2))
+                stop_loss=sl, target=tgt, margin_blocked=round(margin_share, 2),
+                entry_context=dict(entry_ctx))
             self._open.append(pos)
             self._fees_today += res.fees
             self._blotter(pos, leg.action.value, res.price, res.fees,
@@ -870,14 +873,17 @@ class PaperContext(Context):
                               f"{side} {abs(p.qty)} {p.underlying} {p.strike:g} "
                               f"{'CE' if p.leg.option_type.value=='CALL' else 'PE'} "
                               f"@ {price} ({reason})", self.rec.id)
-        registry.record_trade(self.rec.id, "PAPER", {
+        row = {
             "ts": self.now.isoformat(sep=" ", timespec="seconds"),
             "contract": (f"{p.underlying} {p.expiry:%d%b%y} "
                          f"{p.strike:g} {'CE' if p.leg.option_type.value == 'CALL' else 'PE'}").upper(),
             "side": side, "qty": abs(p.qty), "price": price,
             "fees": round(fees, 2), "margin": round(margin, 2),
             "reason": reason, "tag": p.tag,
-        })
+        }
+        if reason == "entry" and p.entry_context:
+            row["entry_context"] = p.entry_context   # signal attribution
+        registry.record_trade(self.rec.id, "PAPER", row)
 
     def exit(self, position_id: str, reason: str = "signal") -> bool:
         for p in self._open:
