@@ -160,7 +160,7 @@ export default function WalkForward({ id, params = {} }) {
             <Line data={chartData} options={chartOpts} />
           </div>
 
-          <div style={{ overflowX: 'auto' }}>
+          <div className="table-scroll">
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <thead>
                 <tr style={{ color: 'var(--muted)', textAlign: 'left' }}>

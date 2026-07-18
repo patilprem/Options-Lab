@@ -136,7 +136,7 @@ function Section({ title, children }) {
 
 function Table({ head, rows }) {
   return (
-    <div style={{ overflowX: 'auto', maxHeight: 260 }}>
+    <div className="table-scroll" style={{ maxHeight: 260 }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
         <thead><tr>{head.map((h, i) => <th key={i} style={th}>{h}</th>)}</tr></thead>
         <tbody>{rows.map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j} style={cell}>{c}</td>)}</tr>)}</tbody>
