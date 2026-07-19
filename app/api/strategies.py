@@ -1234,6 +1234,25 @@ def scanner_insights():
     return scanner_engine.trader.reflect()
 
 
+@scanner_router.get("/scanner/adaptation")
+def scanner_adaptation():
+    """The safe self-tuning pipeline's state: active shadow trial, pending
+    proposal (the 'considerable update' prompt), embargo, and tune history."""
+    return scanner_engine.trader.adaptation_status()
+
+
+@scanner_router.post("/scanner/proposal/apply")
+def scanner_proposal_apply():
+    """Human approval of a shadow-validated config change — the ONLY path by
+    which an insight ever changes a trading setting."""
+    return scanner_engine.trader.apply_proposal()
+
+
+@scanner_router.post("/scanner/proposal/dismiss")
+def scanner_proposal_dismiss():
+    return scanner_engine.trader.dismiss_proposal()
+
+
 @scanner_router.get("/scanner/trades")
 def scanner_trades():
     """The positional paper book the scanner is trading: open positions with

@@ -143,6 +143,13 @@ def init_db() -> None:
             kind TEXT NOT NULL,                -- 'exit' (closed round trip)
             data_json TEXT NOT NULL            -- build_round_trip() record
         );
+        CREATE TABLE IF NOT EXISTS insight_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,                 -- reflection day (IST date)
+            engine TEXT NOT NULL,              -- 'scanner' | strategy id
+            rule TEXT NOT NULL,
+            data_json TEXT NOT NULL            -- the suggestion as fired
+        );
         """)
 
 
@@ -518,6 +525,35 @@ def strategy_journal_rows(strategy_id: str, limit: int = 1000,
                 out.append(json.loads(data_json))
             except (TypeError, ValueError):
                 pass
+    return out
+
+
+def record_insight_rules(engine: str, day: str, rules: list[dict]) -> None:
+    """Persist which insight rules fired on a reflection day (idempotent per
+    engine+day) — the adaptation layer's persistence gate reads this."""
+    with _conn() as c:
+        c.execute("DELETE FROM insight_history WHERE engine=? AND day=?",
+                  (engine, day))
+        for r in rules:
+            if r.get("rule"):
+                c.execute("INSERT INTO insight_history (day, engine, rule, "
+                          "data_json) VALUES (?,?,?,?)",
+                          (day, engine, r["rule"], json.dumps(r)))
+
+
+def insight_history_rows(engine: str, since_day: str) -> list[dict]:
+    """Fired-rule history for one engine since a day (inclusive), oldest
+    first: [{day, rule, data}]."""
+    out = []
+    with _conn() as c:
+        for day, rule, data_json in c.execute(
+                "SELECT day, rule, data_json FROM insight_history "
+                "WHERE engine=? AND day>=? ORDER BY day", (engine, since_day)):
+            try:
+                data = json.loads(data_json)
+            except (TypeError, ValueError):
+                data = {}
+            out.append({"day": day, "rule": rule, "data": data})
     return out
 
 

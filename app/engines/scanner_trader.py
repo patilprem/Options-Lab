@@ -33,15 +33,20 @@ EXIT   whichever fires first: hard stop, trailing stop, target, max holding
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone, timedelta
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, datetime, timezone, timedelta
 
 from app.core.contract import Action
+from app.engines import adaptation as A
 from app.engines import fills as F
 
 IST = timezone(timedelta(hours=5, minutes=30))
 STRATEGY_ID = "SCANNER"          # ledger id for all scanner-trader rows
 BOOK_SETTING = "scanner_trader_book"
+CHAL_SETTING = "scanner_challenger"        # active shadow trial (JSON)
+PROPOSAL_SETTING = "scanner_proposal"      # trial that won, awaiting the human
+TUNE_HISTORY_SETTING = "scanner_tune_history"   # applies/discards/dismissals
+EMBARGO_SETTING = "scanner_tune_embargo_until"  # no new trials before this day
 
 
 @dataclass
@@ -307,6 +312,13 @@ class ScannerTrader:
                 f"(score {pos.entry_score})")
             held.add(sym)
 
+        # 2b) step the shadow challenger (if a config trial is running) on the
+        # same scores/quotes — virtual book, never touches the ledger
+        try:
+            self._step_challenger(hub, scanner, now, day)
+        except Exception:
+            pass
+
         # 3) book the day's P&L + persist the open book
         unrealized = sum((p.mtm - p.entry_price) * p.qty_units
                          for p in self.book.values())
@@ -418,9 +430,10 @@ class ScannerTrader:
             "target_pct": cfg.target_pct, "risk_pct": cfg.risk_pct})
 
     def _daily_reflection(self, cfg: TradeConfig, day) -> None:
-        """At most once per day, after a close: if the journal now supports a
-        suggestion, surface it proactively as a scanner event (visible in the
-        Activity view). Never changes settings — only proposes."""
+        """At most once per day, after a close: surface data-backed insights as
+        events, then advance the adaptation pipeline (persistence -> shadow
+        trial -> proposal). Insights and trials PROPOSE; only apply_proposal(),
+        behind the human's click, ever changes a setting."""
         from app.core import registry
         try:
             if registry.setting("scanner_insight_day", "") == day.isoformat():
@@ -433,8 +446,271 @@ class ScannerTrader:
                 registry.record_event(
                     "info", "scanner",
                     f"journal insight: {s['suggestion']} ({s['evidence']})")
+            self._advance_adaptation(cfg, day, real)
         except Exception:
             pass
+
+    # -- adaptation: persistence -> shadow trial -> proposal -> human apply --
+    def _tune_history(self) -> list[dict]:
+        from app.core import registry
+        try:
+            return json.loads(registry.setting(TUNE_HISTORY_SETTING, "") or "[]")
+        except (TypeError, ValueError):
+            return []
+
+    def _save_tune_history(self, hist: list[dict]) -> None:
+        from app.core import registry
+        registry.set_setting(TUNE_HISTORY_SETTING, json.dumps(hist[-50:]))
+
+    def _advance_adaptation(self, cfg: TradeConfig, day, fired: list[dict]) -> None:
+        """One daily tick of the pipeline. Every gate that fails simply waits —
+        nothing here ever mutates trading settings."""
+        from app.core import registry
+        registry.record_insight_rules("scanner", day.isoformat(), fired)
+
+        # 1) measure the last APPLIED change once its post-sample matures;
+        # surface (never auto-revert) if it made things worse
+        hist = self._tune_history()
+        applied = [h for h in hist if h.get("kind") == "apply"]
+        if applied and not applied[-1].get("verdict"):
+            exits = registry.journal_rows(limit=2000, kind="exit")
+            m = A.measure_applied(exits, applied[-1].get("ts") or "")
+            if m["ready"]:
+                applied[-1]["verdict"] = m["verdict"]
+                self._save_tune_history(hist)
+                if m["verdict"] == "worse":
+                    registry.record_event(
+                        "warn", "scanner",
+                        f"adaptive change {applied[-1].get('rule')} is "
+                        f"underperforming its baseline "
+                        f"(post {m['post']['expectancy']}/trade over "
+                        f"{m['post']['n']} vs pre {m['pre']['expectancy']}) — "
+                        "consider reverting it in trade settings")
+
+        # 2) a proposal is already waiting on the human — nothing else to do
+        if registry.setting(PROPOSAL_SETTING, ""):
+            return
+
+        # 3) an active shadow trial: decide it when mature, else keep running
+        raw = registry.setting(CHAL_SETTING, "")
+        if raw:
+            try:
+                st = json.loads(raw)
+            except (TypeError, ValueError):
+                registry.set_setting(CHAL_SETTING, "")
+                return
+            started = st.get("started") or day.isoformat()
+            days_run = (day - date.fromisoformat(started[:10])).days
+            champ = [r for r in registry.journal_rows(limit=2000, kind="exit")
+                     if (r.get("ts") or "") >= started]
+            cmp = A.compare_books(champ, st.get("closed") or [])
+            if days_run >= A.MIN_TRIAL_DAYS and cmp["ready"]:
+                registry.set_setting(CHAL_SETTING, "")
+                if cmp["better"]:
+                    spec = A.ADAPTABLE.get(st.get("rule"), {})
+                    proposal = {
+                        "rule": st.get("rule"),
+                        "overrides": st.get("overrides") or {},
+                        "current": {k: getattr(cfg, k, None)
+                                    for k in (st.get("overrides") or {})},
+                        "suggestion": (f"Shadow trial says: "
+                                       f"{spec.get('label', st.get('rule'))} "
+                                       f"to {st.get('overrides')}"),
+                        "comparison": cmp,
+                        "started": started, "created": day.isoformat(),
+                    }
+                    registry.set_setting(PROPOSAL_SETTING, json.dumps(proposal))
+                    registry.record_event(
+                        "info", "scanner",
+                        f"ADAPTIVE UPDATE READY: {proposal['suggestion']} — "
+                        f"challenger ₹{cmp['challenger']['expectancy']}/trade "
+                        f"({cmp['challenger']['n']}) vs current "
+                        f"₹{cmp['champion']['expectancy']}/trade "
+                        f"({cmp['champion']['n']}) over the same "
+                        f"{days_run} days. Review it on the Scanner page.")
+                else:
+                    hist.append({"kind": "discard", "rule": st.get("rule"),
+                                 "ts": day.isoformat(), "comparison": cmp})
+                    self._save_tune_history(hist)
+                    registry.record_event(
+                        "info", "scanner",
+                        f"shadow trial {st.get('rule')} did not beat the "
+                        f"current config — discarded "
+                        f"(challenger ₹{cmp['challenger']['expectancy']} vs "
+                        f"champion ₹{cmp['champion']['expectancy']}/trade)")
+            elif days_run >= A.MAX_TRIAL_DAYS:
+                registry.set_setting(CHAL_SETTING, "")
+                hist.append({"kind": "discard", "rule": st.get("rule"),
+                             "ts": day.isoformat(), "reason": "inconclusive"})
+                self._save_tune_history(hist)
+                registry.record_event(
+                    "info", "scanner",
+                    f"shadow trial {st.get('rule')} inconclusive after "
+                    f"{days_run} days (too few trades) — discarded")
+            return
+
+        # 4) no trial running: start one only past the embargo, for a rule
+        # that keeps firing, hasn't been tried recently, and has a step left
+        embargo = registry.setting(EMBARGO_SETTING, "")
+        if embargo and day.isoformat() < embargo:
+            return
+        since = (day - timedelta(days=A.PERSIST_WINDOW_DAYS)).isoformat()
+        history = registry.insight_history_rows("scanner", since)
+        blocked = {h.get("rule") for h in hist
+                   if (h.get("ts") or "") >= (day - timedelta(
+                       days=A.RULE_COOLDOWN_DAYS)).isoformat()}
+        for rule in A.persistent_rules(history):
+            if rule in blocked:
+                continue
+            overrides = A.challenger_overrides(asdict(cfg), rule)
+            if not overrides:
+                continue
+            registry.set_setting(CHAL_SETTING, json.dumps({
+                "rule": rule, "overrides": overrides,
+                "started": day.isoformat(), "book": {}, "closed": []}))
+            registry.record_event(
+                "info", "scanner",
+                f"insight '{rule}' persisted {A.MIN_PERSIST_DAYS}+ days — "
+                f"starting a shadow trial of {overrides} alongside the "
+                f"current config (no settings changed)")
+            break
+
+    def _step_challenger(self, hub, scanner, now, day) -> None:
+        """Run the challenger config's virtual book one cycle on the SAME
+        scores and quotes the champion just traded. No ledger, no journal, no
+        events — its closed trades accumulate in its own state until the trial
+        is decided."""
+        from app.core import registry
+        raw = registry.setting(CHAL_SETTING, "")
+        if not raw:
+            return
+        try:
+            st = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        chal_cfg = replace(self._cfg(), **(st.get("overrides") or {}))
+        book = {s: SPosition.from_json(d)
+                for s, d in (st.get("book") or {}).items()}
+        closed = st.get("closed") or []
+        exited: set[str] = set()
+        for sym, pos in list(book.items()):
+            q = self._atm_quote(hub, sym, pos.side)
+            if q is None or not q.ltp:
+                continue
+            premium = q.ltp
+            pos.mtm = premium
+            pos.high_water = max(pos.high_water, premium)
+            pos.low_water = min(pos.low_water or premium, premium)
+            held_days = (day - datetime.fromisoformat(pos.entry_ts).date()).days
+            do_exit, reason = exit_decision(
+                pos, premium, scanner.scores.get(sym), chal_cfg, held_days)
+            if not do_exit:
+                continue
+            fill = F.fill_live(q, Action.SELL, pos.qty_units,
+                               self._fee, self._slip)
+            realized = ((fill.price - pos.entry_price) * pos.qty_units
+                        - pos.entry_fees - fill.fees)
+            closed.append({"symbol": sym, "realized": round(realized, 2),
+                           "reason": reason, "entry_ts": pos.entry_ts,
+                           "ts": now.isoformat()})
+            del book[sym]
+            exited.add(sym)
+        held = set(book) | exited
+        for sym in pick_entries(scanner.ranked_scores(), held, chal_cfg):
+            sc = scanner.scores.get(sym) or {}
+            side = self._side_for(sc.get("bias"))
+            q = self._atm_quote(hub, sym, side)
+            if q is None or not (q.ask or q.ltp):
+                continue
+            lot_size = self._lot_size(scanner, sym)
+            probe = F.fill_live(q, Action.BUY, lot_size or 1,
+                                self._fee, self._slip)
+            lots = size_lots(chal_cfg, probe.price, lot_size)
+            if lots <= 0:
+                continue
+            qty = lots * lot_size
+            fill = F.fill_live(q, Action.BUY, qty, self._fee, self._slip)
+            book[sym] = SPosition(
+                symbol=sym, bias=sc.get("bias"), side=side, strike=q.strike,
+                lots=lots, qty_units=qty, entry_price=fill.price,
+                entry_fees=fill.fees, entry_ts=now.isoformat(),
+                entry_score=sc.get("score") or 0.0, high_water=fill.price,
+                mtm=fill.price, low_water=fill.price)
+            held.add(sym)
+        st["book"] = {s: p.to_json() for s, p in book.items()}
+        st["closed"] = closed
+        registry.set_setting(CHAL_SETTING, json.dumps(st))
+
+    def adaptation_status(self) -> dict:
+        """Backs GET /scanner/adaptation: the running trial, any pending
+        proposal, embargo, tune history and last-apply measurement."""
+        from app.core import registry
+
+        def _load(key):
+            try:
+                raw = registry.setting(key, "")
+                return json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                return None
+
+        chal = _load(CHAL_SETTING)
+        if chal:
+            closed = chal.get("closed") or []
+            chal = {"rule": chal.get("rule"), "overrides": chal.get("overrides"),
+                    "started": chal.get("started"),
+                    "open": len(chal.get("book") or {}), "closed_n": len(closed),
+                    "expectancy": round(sum(t.get("realized") or 0
+                                            for t in closed) / len(closed), 2)
+                    if closed else None}
+        return {"challenger": chal, "proposal": _load(PROPOSAL_SETTING),
+                "embargo_until": registry.setting(EMBARGO_SETTING, "") or None,
+                "history": self._tune_history()[-10:]}
+
+    def apply_proposal(self) -> dict:
+        """The human clicked Apply: take the one bounded step the trial
+        validated, start the embargo, and stamp history so the change is
+        measured against its pre-apply baseline."""
+        from app.core import registry
+        raw = registry.setting(PROPOSAL_SETTING, "")
+        if not raw:
+            return {"ok": False, "error": "no pending proposal"}
+        p = json.loads(raw)
+        cfg = self._cfg()
+        now = datetime.now(IST).replace(tzinfo=None)
+        frm = {k: getattr(cfg, k, None) for k in (p.get("overrides") or {})}
+        for param, val in (p.get("overrides") or {}).items():
+            registry.set_setting(f"scanner_trade_{param}", str(val))
+        hist = self._tune_history()
+        hist.append({"kind": "apply", "rule": p.get("rule"),
+                     "ts": now.isoformat(), "from": frm,
+                     "to": p.get("overrides"),
+                     "comparison": p.get("comparison")})
+        self._save_tune_history(hist)
+        registry.set_setting(
+            EMBARGO_SETTING,
+            (now.date() + timedelta(days=A.EMBARGO_DAYS)).isoformat())
+        registry.set_setting(PROPOSAL_SETTING, "")
+        registry.record_event(
+            "info", "scanner",
+            f"adaptive update APPLIED: {p.get('overrides')} (was {frm}); "
+            f"new trials embargoed {A.EMBARGO_DAYS} days while it is "
+            "measured against the pre-change baseline")
+        return {"ok": True, "applied": p.get("overrides"), "was": frm}
+
+    def dismiss_proposal(self) -> dict:
+        from app.core import registry
+        raw = registry.setting(PROPOSAL_SETTING, "")
+        if not raw:
+            return {"ok": False, "error": "no pending proposal"}
+        p = json.loads(raw)
+        hist = self._tune_history()
+        hist.append({"kind": "dismiss", "rule": p.get("rule"),
+                     "ts": datetime.now(IST).replace(tzinfo=None).isoformat()})
+        self._save_tune_history(hist)
+        registry.set_setting(PROPOSAL_SETTING, "")
+        registry.record_event("info", "scanner",
+                              f"adaptive update dismissed ({p.get('rule')})")
+        return {"ok": True}
 
     def _book_trade(self, sym, pos: SPosition, kind, price, fees, reason, ts):
         from app.core import registry

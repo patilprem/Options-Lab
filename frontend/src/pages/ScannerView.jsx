@@ -67,16 +67,18 @@ export default function ScannerView({ showToast }) {
   const [book, setBook] = useState(null)
   const [insights, setInsights] = useState(null)
   const [journal, setJournal] = useState(null)
+  const [adapt, setAdapt] = useState(null)
 
   const load = useCallback(async () => {
     try {
-      const [d, b, v, tb, ins, jr] = await Promise.all([
+      const [d, b, v, tb, ins, jr, ad] = await Promise.all([
         fetch('/scanner').then(r => r.json()),
         fetch('/scanner/index-bias').then(r => r.json()).catch(() => null),
         fetch('/scanner/validation').then(r => r.json()).catch(() => null),
         fetch('/scanner/trades').then(r => r.json()).catch(() => null),
         fetch('/scanner/insights').then(r => r.json()).catch(() => null),
         fetch('/scanner/journal?kind=exit&limit=15').then(r => r.json()).catch(() => null),
+        fetch('/scanner/adaptation').then(r => r.json()).catch(() => null),
       ])
       setData(d)
       setBias(b)
@@ -84,8 +86,15 @@ export default function ScannerView({ showToast }) {
       setBook(tb)
       setInsights(ins)
       setJournal(jr?.rows || null)
+      setAdapt(ad)
     } catch { showToast && showToast('Failed to load scanner') }
   }, [showToast])
+
+  const decideProposal = async (action) => {
+    await fetch(`/scanner/proposal/${action}`, { method: 'POST' })
+    showToast && showToast(action === 'apply' ? 'Update applied — new trials embargoed while it is measured' : 'Update dismissed')
+    load()
+  }
 
   const setTrading = async (on) => {
     await fetch('/scanner/trade-settings', {
@@ -183,6 +192,31 @@ export default function ScannerView({ showToast }) {
           {valid.by_score?.['70-100']?.n > 0 && (
             <span> · high-score band {Math.round((valid.by_score['70-100'].hit_rate || 0) * 100)}% ({valid.by_score['70-100'].n})</span>
           )}
+        </div>
+      )}
+
+      {/* adaptive update proposal — a shadow-validated config change awaiting approval */}
+      {adapt?.proposal && (
+        <div style={{ border: '1px solid var(--amber)', borderRadius: 8, padding: '12px 14px' }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>Considerable update for the auto-trader</div>
+          <div style={{ fontSize: 13, marginBottom: 4 }}>{adapt.proposal.suggestion}</div>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)', marginBottom: 8 }}>
+            Shadow-tested since {adapt.proposal.started}: challenger ₹{adapt.proposal.comparison?.challenger?.expectancy}/trade
+            ({adapt.proposal.comparison?.challenger?.n} trades) vs current ₹{adapt.proposal.comparison?.champion?.expectancy}/trade
+            ({adapt.proposal.comparison?.champion?.n}) over the same period.
+            Change: {Object.entries(adapt.proposal.current || {}).map(([k, v]) => `${k} ${v} → ${adapt.proposal.overrides?.[k]}`).join(', ')}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-primary" onClick={() => decideProposal('apply')}>Apply update</button>
+            <button className="btn btn-ghost" onClick={() => decideProposal('dismiss')}>Dismiss</button>
+          </div>
+        </div>
+      )}
+      {adapt?.challenger && !adapt?.proposal && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)', border: '1px dashed var(--line)', borderRadius: 8, padding: '8px 12px' }}>
+          Shadow trial running since {adapt.challenger.started}: {Object.entries(adapt.challenger.overrides || {}).map(([k, v]) => `${k}=${v}`).join(', ')} ·
+          {' '}{adapt.challenger.closed_n} closed / {adapt.challenger.open} open (virtual)
+          {adapt.challenger.expectancy != null && ` · ₹${adapt.challenger.expectancy}/trade`} — no settings changed until it wins and you approve.
         </div>
       )}
 

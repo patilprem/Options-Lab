@@ -44,7 +44,23 @@ shortlist, and the on-demand expired-options backfill for flagged names.
   proposes, never mutates settings. Endpoints `GET /scanner/journal` +
   `GET /scanner/insights`; Scanner UI shows the journal + suggestions; after
   a close, at most once a day, the top suggestions are also recorded as
-  scanner events (Activity view) so reflection is proactive, not on-demand. This is the honest home for
+  scanner events (Activity view) so reflection is proactive, not on-demand.
+- **Safe self-tuning** (`engines/adaptation.py`) — closes the loop WITHOUT the
+  auto-tune overfitting trap (tune to your own last N trades → curve-fit →
+  die). Insights only nominate; a change must then survive: rule persists ≥3
+  distinct reflection days → a SHADOW TRIAL (the challenger config runs a
+  virtual book on the same live scores/quotes as the real one — true
+  out-of-sample, since the config was derived from past trades and judged
+  only on future ones; ledger untouched) → challenger beats champion
+  expectancy by ≥10% over ≥14 days with enough trades on both books → a
+  proposal banner on the Scanner page ("Considerable update…") with the trial
+  numbers and Apply/Dismiss. Apply = ONE bounded step inside hard clamps
+  (trail_pct −0.05 floor 0.10, hard_stop_pct −0.05 floor 0.15, entry_score +5
+  cap 85), then a 21-day embargo on further trials while the change is
+  measured against its pre-apply baseline (an underperforming apply raises a
+  revert warning). Discarded/dismissed rules cool down 30 days; behavioural
+  rules (confirmation entry, churn cooldown) never self-tune. Endpoints
+  `GET /scanner/adaptation`, `POST /scanner/proposal/{apply|dismiss}`. This is the honest home for
   "trade whatever high-probability stock the screener finds" — a single
   Strategy can't hop between underlyings, so the multi-symbol book is a
   dedicated engine, not a Strategy subclass.

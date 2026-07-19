@@ -63,6 +63,18 @@ off-hours window; genuinely urgent fixes get the marker.
   feeds backtest run results + `GET /strategies/{id}/insights` (paper) + a
   once-a-day proactive event; journal_insights is the scanner-trader twin
   (`GET /scanner/insights`). Position.mark() tracks MFE/MAE every bar.
+- `app/engines/adaptation.py` — SAFE self-tuning for the scanner-trader
+  (champion-challenger). Insights only NOMINATE; a param change must pass:
+  persistence (rule fires ≥3 distinct days) → shadow trial (challenger config
+  trades a VIRTUAL book on the same live scores/quotes — out-of-sample by
+  construction, ledger untouched) → beat the champion's expectancy by a real
+  margin over ≥14 days → human Apply (Scanner UI banner /
+  `POST /scanner/proposal/apply`). Applies are ONE bounded step inside hard
+  clamps, start a 21-day embargo, and are measured vs the pre-change baseline
+  (a 'worse' verdict surfaces a revert warning). Discarded/dismissed rules
+  cool down 30 days. NEVER auto-applies — the ONLY settings-mutation path is
+  apply_proposal(). Strategies get the same discipline via walkforward.py
+  (derive on IS, validate OOS), not a shadow book.
 - `app/engines/fills.py` — shared fill simulation, Indian option charges
   (brokerage/STT/txn/GST/SEBI/stamp), SL/target level helpers, rough
   margin estimate (estimate_margin now takes a per-underlying `factor`).
