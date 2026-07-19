@@ -1449,6 +1449,18 @@ def scanner_proposal_dismiss():
     return scanner_engine.trader.dismiss_proposal()
 
 
+@scanner_router.get("/adaptation/pending")
+def adaptation_pending():
+    """Which nav areas have an adaptive-update proposal waiting on a human
+    decision — backs the small dot on the Scanner / Strategies nav tabs. The
+    dot clears as soon as the proposal is applied or dismissed (both clear the
+    underlying setting)."""
+    scanner_pending = bool(registry.setting("scanner_proposal", ""))
+    strat_ids = [r.id for r in registry.list_all()
+                 if registry.setting(f"strategy_proposal:{r.id}", "")]
+    return {"scanner": scanner_pending, "strategies": strat_ids}
+
+
 @scanner_router.get("/scanner/trades")
 def scanner_trades():
     """The positional paper book the scanner is trading: open positions with

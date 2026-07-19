@@ -37,6 +37,7 @@ export default function App() {
   const [strategies, setStrategies] = useState([])
   const [summary, setSummary] = useState({ alloc: 0, equity: 0, growth: 0, live: 0 })
   const [toast, setToast] = useState(null)
+  const [pending, setPending] = useState({ scanner: false, strategies: [] })
   const [newModalOpen, setNewModalOpen] = useState(false)
   const [deployModalOpen, setDeployModalOpen] = useState(false)
   const [liveModalOpen, setLiveModalOpen] = useState(false)
@@ -45,6 +46,13 @@ export default function App() {
   const showToast = useCallback(msg => {
     setToast(msg)
     setTimeout(() => setToast(null), 2600)
+  }, [])
+
+  // Which nav tabs carry a pending adaptive-update dot. Polled on a loop and
+  // refreshed immediately after the user acts on a proposal, so the dot
+  // vanishes the moment a decision is taken.
+  const refreshPending = useCallback(async () => {
+    try { setPending(await API.call('/adaptation/pending')) } catch (e) { /* dots degrade gracefully */ }
   }, [])
 
   const loadList = useCallback(async () => {
@@ -70,9 +78,10 @@ export default function App() {
 
   useEffect(() => {
     loadList()
-    const iv = setInterval(loadList, 15000)
+    refreshPending()
+    const iv = setInterval(() => { loadList(); refreshPending() }, 15000)
     return () => clearInterval(iv)
-  }, [loadList])
+  }, [loadList, refreshPending])
 
   // Detail is driven purely by `selectedId`, so `view` keeps remembering where
   // you came from (Dashboard or Strategies) and Back returns you there.
@@ -125,6 +134,7 @@ export default function App() {
             setLiveModalOpen(true)
           }}
           onChanged={loadList}
+          onAdaptDecision={refreshPending}
           showToast={showToast}
         />
       )
@@ -150,7 +160,7 @@ export default function App() {
       case 'data':
         return <DataView showToast={showToast} />
       case 'scanner':
-        return <ScannerView showToast={showToast} />
+        return <ScannerView showToast={showToast} onDecision={refreshPending} />
       case 'history':
         return <HistoryView strategies={strategies} />
       default:
@@ -171,7 +181,7 @@ export default function App() {
         <div className="side-label">Menu</div>
         {/* Nav only — the strategy list lives on its own page so it scales
             past a handful of strategies. */}
-        <Nav view={view} setView={setView} onNavigate={() => setSelectedId(null)} />
+        <Nav view={view} setView={setView} pending={pending} onNavigate={() => setSelectedId(null)} />
       </aside>
 
       <main className="content">

@@ -6,7 +6,7 @@ import EditCodeModal from '../components/EditCodeModal'
 
 const DEPLOYED_STATES = ['RUNNING', 'DEPLOYED_PAUSED']
 
-export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged, showToast }) {
+export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged, onAdaptDecision, showToast }) {
   const [strategy, setStrategy] = useState(null)
   const [tab, setTab] = useState('paper')
   const [renaming, setRenaming] = useState(false)
@@ -181,7 +181,7 @@ export default function StrategyDetail({ id, onBack, onDeploy, onLive, onChanged
           </>
         )}
         {tab === 'paper' && (
-          <PaperPanel id={id} />
+          <PaperPanel id={id} onAdaptDecision={onAdaptDecision} />
         )}
         {tab === 'backtest' && (
           <BacktestPanel id={id} underlying={strategy.meta?.underlying} />

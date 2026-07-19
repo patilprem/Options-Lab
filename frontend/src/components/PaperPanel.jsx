@@ -13,7 +13,7 @@ const inr = n => '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractio
 const cell = { padding: '6px 10px', borderBottom: '1px solid var(--line)', fontFamily: 'var(--mono)', textAlign: 'left' }
 const th = { ...cell, color: 'var(--muted)', fontWeight: 500 }
 
-export default function PaperPanel({ id }) {
+export default function PaperPanel({ id, onAdaptDecision }) {
   const [data, setData] = useState(null)
   const [insights, setInsights] = useState(null)
   const [adapt, setAdapt] = useState(null)
@@ -46,6 +46,7 @@ export default function PaperPanel({ id }) {
   const decide = async (action) => {
     await fetch(`/strategies/${id}/adaptation/${action}`, { method: 'POST' })
     load()
+    onAdaptDecision && onAdaptDecision()   // clear the nav dot immediately
   }
 
   useEffect(() => {

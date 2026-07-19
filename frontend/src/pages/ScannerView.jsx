@@ -57,7 +57,7 @@ function BiasCard({ name, bias }) {
   )
 }
 
-export default function ScannerView({ showToast }) {
+export default function ScannerView({ showToast, onDecision }) {
   const [data, setData] = useState(null)
   const [bias, setBias] = useState(null)
   const [expanded, setExpanded] = useState(null)   // symbol whose detail is open
@@ -94,6 +94,7 @@ export default function ScannerView({ showToast }) {
     await fetch(`/scanner/proposal/${action}`, { method: 'POST' })
     showToast && showToast(action === 'apply' ? 'Update applied — new trials embargoed while it is measured' : 'Update dismissed')
     load()
+    onDecision && onDecision()   // clear the nav dot immediately
   }
 
   const setTrading = async (on) => {
