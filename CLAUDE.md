@@ -75,6 +75,18 @@ off-hours window; genuinely urgent fixes get the marker.
   cool down 30 days. NEVER auto-applies — the ONLY settings-mutation path is
   apply_proposal(). Strategies get the same discipline via walkforward.py
   (derive on IS, validate OOS), not a shadow book.
+- `app/engines/walkforward.py` `adaptive_search` + `app/engines/strategy_adapt.py`
+  — the Strategy twin of the scanner adaptation loop. Persistence (an insight
+  fires ≥3 distinct days) ARMS a scan; the scan builds ONE-step bounded param
+  neighbours, SELECTS the best per fold IN-SAMPLE and REPORTS out-of-sample
+  (never selects on OOS), and only proposes the modal IS-winner if it's
+  preferred in a majority of folds AND beats current params OOS on BOTH the
+  metric and realized P&L. Human Apply sets ONE param override, starts a 21-day
+  embargo, and is measured forward on the strategy_journal vs the pre-apply
+  baseline. Endpoints `GET /strategies/{id}/adaptation`,
+  `POST /strategies/{id}/adaptation/{scan|apply|dismiss}`; PaperPanel shows the
+  proposal / armed-scan / embargo states. The scan is heavy (many backtests) so
+  it's human/schedule-triggered, never in the trading loop.
 - `app/engines/fills.py` — shared fill simulation, Indian option charges
   (brokerage/STT/txn/GST/SEBI/stamp), SL/target level helpers, rough
   margin estimate (estimate_margin now takes a per-underlying `factor`).

@@ -20,6 +20,7 @@ GET    /strategies/{id}/performance    paper daily P&L + open positions
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, date, timedelta
 
 from fastapi import APIRouter, HTTPException
@@ -99,6 +100,17 @@ class WalkForwardReq(BaseModel):
     is_frac: float = 0.7                 # in-sample fraction of each fold
     param_grid: dict = {}                # {param_name: [values, ...]}
     metric: str = "sharpe"               # optimize on this in-sample metric
+    max_runs: int = 200
+
+
+class AdaptScanReq(BaseModel):
+    # all optional — dates default to the underlying's recorded coverage
+    from_date: str = ""
+    to_date: str = ""
+    capital: float = 1_000_000.0
+    folds: int = 4
+    is_frac: float = 0.7
+    metric: str = "sharpe"
     max_runs: int = 200
 
 
@@ -977,6 +989,189 @@ def walkforward(sid: str, req: WalkForwardReq):
                           f"walk-forward done: OOS return "
                           f"{result.get('aggregate_oos', {}).get('return_pct', 0)}%", sid)
     return result
+
+
+@router.get("/{sid}/adaptation")
+def strategy_adaptation(sid: str):
+    """State of the walk-forward self-tuning pipeline for one strategy: whether
+    a scan is armed (an insight has persisted), any pending proposal, the
+    embargo, tune history, and the forward measurement of the last apply."""
+    _rec_or_404(sid)
+    from app.engines import adaptation as A
+    from app.engines import strategy_adapt as SA
+    today = _ist_today()
+
+    def _load(key):
+        raw = registry.setting(key, "")
+        try:
+            return json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            return None
+
+    since = (date.fromisoformat(today) - timedelta(days=A.PERSIST_WINDOW_DAYS)).isoformat()
+    armed = bool(A.persistent_rules(registry.insight_history_rows(sid, since)))
+    hist = _load(f"strategy_tune_history:{sid}") or []
+    embargo = registry.setting(f"strategy_embargo_until:{sid}", "") or None
+
+    # measure the last apply once its post-sample matures (cheap: journal only)
+    applied = [h for h in hist if h.get("kind") == "apply"]
+    if applied and not applied[-1].get("verdict"):
+        rows = registry.strategy_journal_rows(sid, limit=2000)
+        m = SA.measure_forward(rows, applied[-1].get("ts") or "")
+        if m["ready"]:
+            applied[-1]["verdict"] = m["verdict"]
+            registry.set_setting(f"strategy_tune_history:{sid}", json.dumps(hist[-50:]))
+            if m["verdict"] == "worse":
+                registry.record_event(
+                    "warn", "strategy",
+                    f"adaptive change to {applied[-1].get('param')} is "
+                    f"underperforming its baseline (post {m['post']['expectancy']}"
+                    f"/trade over {m['post']['n']} vs pre {m['pre']['expectancy']})"
+                    " — consider reverting it in Params", sid)
+    return {"id": sid, "armed": armed, "embargo_until": embargo,
+            "proposal": _load(f"strategy_proposal:{sid}"),
+            "history": hist[-10:]}
+
+
+@router.post("/{sid}/adaptation/scan")
+def strategy_adaptation_scan(sid: str, req: AdaptScanReq = AdaptScanReq()):
+    """Run the walk-forward param search (persistence-gated, embargo-gated) and,
+    if a bounded change beats the current params out-of-sample with consistency,
+    store it as a proposal for the human to Apply. This is the heavy step —
+    triggered by the user (or a scheduled job), never the trading loop."""
+    rec = _rec_or_404(sid)
+    from app.engines import adaptation as A
+    from app.engines import strategy_adapt as SA
+    today = _ist_today()
+
+    if registry.setting(f"strategy_proposal:{sid}", ""):
+        return {"status": "exists", "message": "a proposal is already pending"}
+    embargo = registry.setting(f"strategy_embargo_until:{sid}", "")
+    if embargo and today < embargo:
+        return {"status": "embargoed", "until": embargo}
+    since = (date.fromisoformat(today) - timedelta(days=A.PERSIST_WINDOW_DAYS)).isoformat()
+    if not A.persistent_rules(registry.insight_history_rows(sid, since)):
+        return {"status": "not_armed",
+                "message": "no insight has persisted enough distinct days yet"}
+
+    def factory(p: dict):
+        obj = _instantiate(rec)
+        if p and hasattr(obj, "params") and isinstance(obj.params, dict):
+            obj.params.update(p)
+        return obj
+
+    # effective params + underlying read from the live instance so it works
+    # even before a strategy's meta snapshot is populated (both already merge
+    # any saved overrides via _instantiate)
+    base = factory({})
+    params = dict(base.params) if getattr(base, "params", None) else {}
+    underlying = rec.meta.get("underlying", "")
+    try:
+        underlying = base.meta().underlying or underlying
+    except Exception:
+        pass
+    if not any(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in params.values()):
+        return {"status": "no_tunable_params",
+                "message": "strategy has no numeric params to tune"}
+
+    # date range: request override, else the underlying's recorded coverage
+    frm, to = (req.from_date if req else ""), (req.to_date if req else "")
+    if not (frm and to) and type(_store).__name__ == "DataStore":
+        for u, lo, hi, _n in _store.coverage()[0]:
+            if u == underlying:
+                frm, to = str(lo)[:10], str(hi)[:10]
+                break
+    if not (frm and to):
+        return {"status": "data_unavailable",
+                "message": f"no recorded coverage for {underlying}"}
+    start = datetime.fromisoformat(frm + " 09:15:00")
+    end = datetime.fromisoformat(to + " 15:30:00")
+
+    registry.record_event("info", "strategy",
+                          "walk-forward adaptation scan started", sid)
+    try:
+        search = wf.adaptive_search(
+            factory, _store, start, end, params,
+            folds=(req.folds if req else 4),
+            is_frac=(req.is_frac if req else 0.7),
+            capital=(req.capital if req else 1_000_000.0),
+            metric=(req.metric if req else "sharpe"),
+            max_runs=(req.max_runs if req else 200))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if search.get("status") != "ok":
+        return {"status": "error", "message": search.get("message")}
+
+    proposal = SA.evaluate_search(search)
+    if not proposal:
+        registry.record_event("info", "strategy",
+                              "adaptation scan found no validated improvement", sid)
+        return {"status": "no_improvement", "search": search}
+    proposal["created"] = today
+    proposal["current"] = {proposal["param"]: params.get(proposal["param"])}
+    registry.set_setting(f"strategy_proposal:{sid}", json.dumps(proposal))
+    d = proposal["delta"][proposal["param"]]
+    registry.record_event(
+        "info", "strategy",
+        f"ADAPTIVE UPDATE READY: {proposal['param']} {d['from']} → {d['to']} — "
+        f"walk-forward OOS {proposal['metric']} {proposal['oos_metric']} vs "
+        f"{proposal['baseline_oos_metric']} (won {int(proposal['is_win_share']*100)}%"
+        f" of folds). Review it on the strategy's Paper tab.", sid)
+    return {"status": "proposed", "proposal": proposal}
+
+
+@router.post("/{sid}/adaptation/apply")
+def strategy_adaptation_apply(sid: str):
+    """Human approval: apply the one validated param override, start the
+    embargo, and stamp history so the change is measured forward. The ONLY path
+    that mutates a strategy's params from the adaptation loop."""
+    _rec_or_404(sid)
+    from app.engines import adaptation as A
+    raw = registry.setting(f"strategy_proposal:{sid}", "")
+    if not raw:
+        return {"ok": False, "error": "no pending proposal"}
+    p = json.loads(raw)
+    param = p["param"]
+    new_val = p["delta"][param]["to"]
+    frm = p["delta"][param]["from"]
+    overrides = {**registry.get_params(sid), param: new_val}
+    registry.set_params(sid, overrides)
+    from app.engines.paper import IST
+    now = datetime.now(IST).replace(tzinfo=None).isoformat()
+    hist = json.loads(registry.setting(f"strategy_tune_history:{sid}", "") or "[]")
+    hist.append({"kind": "apply", "param": param, "from": frm, "to": new_val,
+                 "ts": now, "oos_metric": p.get("oos_metric")})
+    registry.set_setting(f"strategy_tune_history:{sid}", json.dumps(hist[-50:]))
+    registry.set_setting(
+        f"strategy_embargo_until:{sid}",
+        (date.fromisoformat(_ist_today()) + timedelta(days=A.EMBARGO_DAYS)).isoformat())
+    registry.set_setting(f"strategy_proposal:{sid}", "")
+    registry.record_event(
+        "info", "strategy",
+        f"adaptive update APPLIED: {param} {frm} → {new_val} (param override); "
+        f"new scans embargoed {A.EMBARGO_DAYS} days while it is measured. "
+        "Applies to new backtests and the next (re)deploy.", sid)
+    return {"ok": True, "param": param, "from": frm, "to": new_val,
+            "note": "param override set; redeploy the strategy to trade it live-paper"}
+
+
+@router.post("/{sid}/adaptation/dismiss")
+def strategy_adaptation_dismiss(sid: str):
+    _rec_or_404(sid)
+    raw = registry.setting(f"strategy_proposal:{sid}", "")
+    if not raw:
+        return {"ok": False, "error": "no pending proposal"}
+    p = json.loads(raw)
+    from app.engines.paper import IST
+    hist = json.loads(registry.setting(f"strategy_tune_history:{sid}", "") or "[]")
+    hist.append({"kind": "dismiss", "param": p.get("param"),
+                 "ts": datetime.now(IST).replace(tzinfo=None).isoformat()})
+    registry.set_setting(f"strategy_tune_history:{sid}", json.dumps(hist[-50:]))
+    registry.set_setting(f"strategy_proposal:{sid}", "")
+    registry.record_event("info", "strategy",
+                          f"adaptive update dismissed ({p.get('param')})", sid)
+    return {"ok": True}
 
 
 @router.get("/{sid}/backtests")

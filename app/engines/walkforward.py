@@ -123,6 +123,115 @@ def run_walkforward(strategy_factory: Callable[[dict], object], store, underlyin
             "folds": fold_results, "aggregate_oos": aggregate}
 
 
+def _bounded_candidates(current: dict, rel_step: float = 0.25,
+                        max_params: int = 4) -> list[tuple]:
+    """One-param-at-a-time bounded neighbours of `current` — the same "one
+    small step" discipline the auto-trader uses, so a strategy proposal is
+    always a single legible change. Each numeric (non-bool, positive-preserving)
+    param yields an up and a down candidate; others stay fixed. Returns
+    [(label, params), ...] with ('current', current) first."""
+    out = [("current", dict(current))]
+    numeric = [(k, v) for k, v in current.items()
+               if isinstance(v, (int, float)) and not isinstance(v, bool)][:max_params]
+    for k, v in numeric:
+        step = abs(v) * rel_step or 1
+        for sign, name in ((1, "up"), (-1, "down")):
+            nv = v + sign * step
+            nv = int(round(nv)) if isinstance(v, int) else round(nv, 4)
+            if nv == v or (v > 0 and nv <= 0):     # no-op or sign flip -> skip
+                continue
+            c = dict(current)
+            c[k] = nv
+            out.append((f"{k}_{name}", c))
+    return out
+
+
+def adaptive_search(strategy_factory: Callable[[dict], object], store,
+                    start: datetime, end: datetime, current_params: dict, *,
+                    folds: int = 4, is_frac: float = 0.7,
+                    capital: float = 1_000_000.0, metric: str = "sharpe",
+                    rel_step: float = 0.25, max_params: int = 4,
+                    max_runs: int = 200,
+                    on_progress: Optional[Callable[[int, int, str], None]] = None
+                    ) -> dict:
+    """Walk-forward param search that yields at most ONE bounded change to
+    propose. Each fold SELECTS the in-sample-best candidate; out-of-sample is
+    used only to REPORT — never to pick the winner (that would re-introduce the
+    overfitting the fold split exists to prevent). The proposal is the modal
+    IS-winner, plus a stability figure (how many folds preferred it) and its
+    OOS vs the current params' OOS over the same windows, so the caller can
+    demand consistency, not a single lucky fold."""
+    cands = _bounded_candidates(current_params, rel_step, max_params)
+    windows = _windows(start, end, folds, is_frac)
+    if not windows:
+        return {"status": "error", "message": "date range too short for the fold count"}
+    planned = len(windows) * len(cands) * 2       # IS + OOS per candidate/fold
+    if planned > max_runs:
+        raise ValueError(f"{planned} backtests exceeds max_runs={max_runs}; "
+                         "reduce folds, params, or widen rel_step")
+
+    by_label = {label: params for label, params in cands}
+    is_wins: dict[str, int] = {}
+    oos_metric: dict[str, list] = {label: [] for label, _ in cands}
+    oos_realized: dict[str, float] = {label: 0.0 for label, _ in cands}
+    done = 0
+    for fi, (is_s, is_e, oos_s, oos_e) in enumerate(windows, 1):
+        is_best = None
+        for label, params in cands:
+            r = bt.run_backtest(strategy_factory(params), store, is_s, is_e, capital)
+            done += 1
+            if on_progress:
+                on_progress(done, planned, f"fold {fi} IS {label}")
+            summ = r.get("summary") or {}
+            rank = (1 if (summ.get("n_trades") or 0) > 0 else 0, _metric(summ, metric))
+            if is_best is None or rank > is_best[0]:
+                is_best = (rank, label)
+        for label, params in cands:                # OOS: report every candidate
+            r = bt.run_backtest(strategy_factory(params), store, oos_s, oos_e, capital)
+            done += 1
+            if on_progress:
+                on_progress(done, planned, f"fold {fi} OOS {label}")
+            summ = r.get("summary") or {}
+            oos_metric[label].append(_metric(summ, metric))
+            oos_realized[label] += summ.get("total_pnl") or 0.0
+        is_wins[is_best[1]] = is_wins.get(is_best[1], 0) + 1
+
+    def _mean(xs):
+        return round(sum(xs) / len(xs), 4) if xs else 0.0
+
+    n_folds = len(windows)
+    candidates = [{
+        "label": label, "params": by_label[label],
+        "is_wins": is_wins.get(label, 0),
+        "oos_metric_mean": _mean(oos_metric[label]),
+        "oos_realized": round(oos_realized[label], 2),
+    } for label, _ in cands]
+
+    # modal IS-winner among the NON-current candidates (the actual change on
+    # offer); the current params are the baseline it must beat.
+    changed = [c for c in candidates if c["label"] != "current"]
+    modal = max(changed, key=lambda c: (c["is_wins"], c["oos_metric_mean"])) \
+        if changed else None
+    baseline = next(c for c in candidates if c["label"] == "current")
+    recommended = None
+    if modal and modal["is_wins"] > 0:
+        param = modal["label"].rsplit("_", 1)[0]
+        recommended = {
+            "label": modal["label"], "param": param,
+            "params": modal["params"],
+            "delta": {param: {"from": current_params.get(param),
+                              "to": modal["params"].get(param)}},
+            "is_win_share": round(modal["is_wins"] / n_folds, 3),
+            "oos_metric": modal["oos_metric_mean"],
+            "oos_realized": modal["oos_realized"],
+            "baseline_oos_metric": baseline["oos_metric_mean"],
+            "baseline_oos_realized": baseline["oos_realized"],
+        }
+    return {"status": "ok", "metric": metric, "runs": done, "folds": n_folds,
+            "candidates": candidates, "baseline": baseline,
+            "recommended": recommended}
+
+
 def _aggregate_oos(fold_results: list[dict], capital: float, metric: str) -> dict:
     """Chain each fold's OOS realized P&L into one continuous equity curve."""
     curve = []

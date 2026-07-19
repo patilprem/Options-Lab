@@ -1007,6 +1007,20 @@ class PaperContext(Context):
                     "info", "strategy",
                     f"journal insight: {s['suggestion']} ({s['evidence']})",
                     self.rec.id)
+            # accrue persistence for the walk-forward adaptation pipeline; when
+            # a rule has fired enough distinct days, nudge the human to run a
+            # scan (the search itself is too heavy for the trading loop)
+            registry.record_insight_rules(self.rec.id, day.isoformat(), real)
+            if real and not registry.setting(f"strategy_proposal:{self.rec.id}", ""):
+                from app.engines import adaptation as _A
+                since = (day - timedelta(days=_A.PERSIST_WINDOW_DAYS)).isoformat()
+                hist = registry.insight_history_rows(self.rec.id, since)
+                if _A.persistent_rules(hist):
+                    registry.record_event(
+                        "info", "strategy",
+                        "an insight has persisted several days — run a "
+                        "walk-forward adaptation scan to validate a change",
+                        self.rec.id)
         except Exception:
             pass
 
