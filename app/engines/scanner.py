@@ -739,15 +739,11 @@ class StockScanner:
             self._prev_chain[sym] = dict(cache)
             self.tier2[sym] = metrics
             done += 1
-        # Persist full chains to disk. By default this is limited to names the
-        # trader actually holds (needed for MTM/exit reconstruction); every
+        # Persist full chains to disk ONLY for names the trader actually holds
+        # (needed for MTM/exit reconstruction across restarts). Every
         # shortlisted name is already scored/alerted above from the in-memory
-        # cache regardless. Set scanner_record_chains=on to persist the whole
-        # daily shortlist as a research/validation dataset instead.
-        if registry.setting("scanner_record_chains", "off") == "on":
-            to_persist = set(symbols)
-        else:
-            to_persist = set(symbols) & set(held)
+        # cache, so nothing else needs to hit disk — keeps the footprint tiny.
+        to_persist = set(symbols) & set(held)
         if to_persist and hasattr(self.store, "upsert_chain_rows"):
             try:
                 hub.persist_chain_full(self.store, underlyings=to_persist)

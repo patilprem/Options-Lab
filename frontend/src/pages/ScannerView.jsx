@@ -127,17 +127,6 @@ export default function ScannerView({ showToast }) {
     load()
   }
 
-  const setRecordChains = async (on) => {
-    await fetch('/scanner/settings', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ record_chains: on }),
-    })
-    showToast && showToast(on
-      ? 'Recording full chains for every shortlisted name'
-      : 'Recording chains only for held (traded) names')
-    load()
-  }
-
   if (!data) return <div className="empty">Loading scanner…</div>
   const scores = data.scores || []
 
@@ -154,13 +143,6 @@ export default function ScannerView({ showToast }) {
           {data.last_sweep ? ` · last sweep ${String(data.last_sweep).slice(11, 19)}` : ''}
         </span>
         <span style={{ color: 'var(--muted)', fontSize: 13 }}>alert ≥ {data.alert_score}</span>
-        <button
-          className="btn btn-ghost"
-          title="Optional research dataset. Saves the full option chain of EVERY shortlisted mover to disk, not just names the auto-trader holds. NOT needed for scanning, trading, or the reflect/adapt loop (those use tiny trade journals), and signal validation can reconstruct flagged names via on-demand backfill anyway. Leave OFF unless you specifically want to study/backtest names you never traded. Costs disk only — no extra API, since these chains are already fetched to score them."
-          onClick={() => setRecordChains(!data.record_chains)}
-        >
-          Record shortlist chains: {data.record_chains ? 'on' : 'off'}
-        </button>
         <button
           className={`btn ${data.enabled ? 'btn-danger' : 'btn-primary'}`}
           style={{ marginLeft: 'auto' }}
