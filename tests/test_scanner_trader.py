@@ -119,6 +119,14 @@ class _FakeHub:
 class _FakeScanner:
     def __init__(self):
         self.scores = {}
+        self.metrics = {"RELIANCE": {"spot": 1248.5, "ltp": 1250.0,
+                                     "buildup": "long_buildup",
+                                     "price_change_pct": 1.8,
+                                     "volume_surge": 2.4, "range_pos": 0.9}}
+        self.tier2 = {"RELIANCE": {"pcr_oi": 0.8, "atm_iv": 22.5,
+                                   "iv_skew": -1.2,
+                                   "liquidity": {"ok": True,
+                                                 "worst_spread_pct": 0.9}}}
         self._universe = {"RELIANCE": {"lot_size": 500, "spot_security_id": 2885}}
         self.trader = None
 
@@ -170,6 +178,56 @@ def test_step_enters_then_trailing_exits(tmp_path, monkeypatch):
     trades = reg.trades_for(st.STRATEGY_ID, today, "PAPER")
     assert len([t for t in trades if t.get("reason") == "entry"]) == 1
     assert len([t for t in trades if t.get("side") == "SELL"]) == 1
+
+    # the rich journal captured the full round trip
+    entries = reg.journal_rows(kind="entry")
+    exits = reg.journal_rows(kind="exit")
+    assert len(entries) == 1 and len(exits) == 1
+    e, x = entries[0], exits[0]
+    # entry: setup context frozen at fill time
+    assert e["symbol"] == "RELIANCE" and e["entry_price"] == entry
+    assert e["entry_ctx"]["buildup"] == "long_buildup"
+    assert e["entry_ctx"]["spot"] == 1248.5
+    assert e["entry_ctx"]["atm_iv"] == 22.5
+    assert e["entry_ctx"]["config"]["trail_pct"] == 0.25
+    # exit: self-contained round trip with excursions and durations
+    assert x["reason"] == "trail_stop" and x["entry_price"] == entry
+    assert x["realized"] != 0 and x["ret_pct"] is not None
+    assert x["mfe_pct"] > 90                       # premium 20 -> 40 peak
+    assert x["mae_pct"] >= 0 and x["mae_pct"] < 5  # never traded below entry
+    assert x["held_minutes"] is not None and x["held_days"] == 0
+    assert x["exit_score"] == 80                   # score snapshot at exit
+    assert x["entry_ctx"]["volume_surge"] == 2.4   # entry ctx rides along
+    # the daily reflection hook ran (and, with 1 trade, suggested nothing)
+    assert reg.setting("scanner_insight_day") == today
+
+
+def test_analyze_over_real_journal_rows(tmp_path, monkeypatch):
+    """reflect() end-to-end: journal rows written by the trader feed straight
+    into journal_insights.analyze without any adapter."""
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+
+    hub, sc = _FakeHub(), _FakeScanner()
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    trader.step(hub, sc)                            # enter
+    hub.set_atm("RELIANCE", "CALL", ltp=10.0)       # -50% -> hard stop
+    trader.step(hub, sc)
+    assert "RELIANCE" not in trader.book
+
+    res = trader.reflect()
+    assert res["overall"]["n"] == 1
+    assert res["ready"] is False                    # honest below MIN_TRADES
+    assert res["by_reason"]["hard_stop"]["n"] == 1
+    assert res["config"]["hard_stop_pct"] == 0.30
 
 
 def test_step_noop_when_disabled(tmp_path, monkeypatch):

@@ -129,6 +129,13 @@ def init_db() -> None:
             key TEXT PRIMARY KEY,              -- underlying|kind|interval|off|type|ekind|eoff|from|to
             done_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS scanner_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,                  -- IST ISO
+            symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,                -- 'entry' | 'exit'
+            data_json TEXT NOT NULL            -- full trade context snapshot
+        );
         """)
 
 
@@ -437,6 +444,43 @@ def record_trade(strategy_id: str, mode: str, payload: dict, run_id: str = "") -
     with _conn() as c:
         c.execute("INSERT INTO trades VALUES (?,?,?,?,?)",
                   (str(uuid.uuid4()), strategy_id, mode, run_id, json.dumps(payload)))
+
+
+def record_journal(symbol: str, kind: str, data: dict, ts: str = "") -> None:
+    """One rich journal row per scanner-trader entry/exit. Unlike the thin
+    blotter (`trades`), `data` carries the full decision context — score
+    components, chain state, MFE/MAE — so the strategy can be improved from
+    evidence later. `ts` is the trade's IST timestamp (defaults to UTC now)."""
+    with _conn() as c:
+        c.execute("INSERT INTO scanner_journal (ts, symbol, kind, data_json) "
+                  "VALUES (?,?,?,?)",
+                  (ts or _now(), symbol, kind, json.dumps(data)))
+
+
+def journal_rows(limit: int = 500, symbol: str = "", kind: str = "") -> list[dict]:
+    """Newest-first journal rows, each the parsed data dict + ts/symbol/kind."""
+    q = "SELECT ts, symbol, kind, data_json FROM scanner_journal"
+    conds, args = [], []
+    if symbol:
+        conds.append("symbol=?")
+        args.append(symbol)
+    if kind:
+        conds.append("kind=?")
+        args.append(kind)
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    out = []
+    with _conn() as c:
+        for ts, sym, k, data_json in c.execute(q, args).fetchall():
+            try:
+                d = json.loads(data_json)
+            except (TypeError, ValueError):
+                d = {}
+            d.update({"ts": ts, "symbol": sym, "kind": k})
+            out.append(d)
+    return out
 
 
 def purge_phantom_days() -> int:

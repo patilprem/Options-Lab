@@ -30,7 +30,21 @@ shortlist, and the on-demand expired-options backfill for flagged names.
   registry ledger (mode PAPER, id "SCANNER"); runs each Tier-2 cycle, parallel
   to the Strategy/paper engine and never touching it. Endpoints
   `/scanner/trades` + `/scanner/trade-settings`; Scanner UI shows the live
-  book. Gated OFF (`scanner_trade` setting). This is the honest home for
+  book. Gated OFF (`scanner_trade` setting).
+- **Trade journal + insights** — every auto-trader entry/exit also writes a
+  rich row to SQLite `scanner_journal` (full setup context at entry: score
+  reasons, buildup, Tier-2 chain state, option quote/IV/spread, config; at
+  exit: prices, fees, reason, MFE/MAE premium excursions, hold time, score at
+  exit — each exit row is a self-contained round trip).
+  `engines/journal_insights.py` (pure, tested) aggregates closed trades into
+  win rate / expectancy by score band / entry hour / buildup / exit reason,
+  trail giveback, churn re-entries — and derives evidence-backed SUGGESTIONS
+  (raise entry_score, tighten trail, confirmation entry, re-entry cooldown…),
+  each gated on minimum samples so small-N noise never becomes advice. It
+  proposes, never mutates settings. Endpoints `GET /scanner/journal` +
+  `GET /scanner/insights`; Scanner UI shows the journal + suggestions; after
+  a close, at most once a day, the top suggestions are also recorded as
+  scanner events (Activity view) so reflection is proactive, not on-demand. This is the honest home for
   "trade whatever high-probability stock the screener finds" — a single
   Strategy can't hop between underlyings, so the multi-symbol book is a
   dedicated engine, not a Strategy subclass.

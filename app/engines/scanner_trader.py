@@ -72,6 +72,11 @@ class SPosition:
     entry_score: float
     high_water: float                # highest premium seen (for the trail)
     mtm: float = 0.0
+    low_water: float = 0.0           # lowest premium seen (MAE; 0 = unset,
+                                     # for books persisted before this field)
+    entry_ctx: dict = field(default_factory=dict)   # full setup snapshot at
+                                     # entry (score reasons, chain, config) —
+                                     # journaled with the exit for analysis
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -242,6 +247,7 @@ class ScannerTrader:
             premium = q.ltp
             pos.mtm = premium
             pos.high_water = max(pos.high_water, premium)
+            pos.low_water = min(pos.low_water or premium, premium)
             held_days = (day - datetime.fromisoformat(pos.entry_ts).date()).days
             do_exit, reason = exit_decision(
                 pos, premium, scanner.scores.get(sym), cfg, held_days)
@@ -253,12 +259,19 @@ class ScannerTrader:
             realized_today += realized
             fees_today += fill.fees
             self._book_trade(sym, pos, "exit", fill.price, fill.fees, reason, now)
+            self._journal_exit(sym, pos, fill, reason, realized, scanner, now,
+                              held_days)
             registry.record_event(
                 "info", "scanner",
                 f"trade EXIT {sym} {pos.bias} @ {fill.price} ({reason}) "
                 f"P&L ₹{round(realized)}")
             del self.book[sym]
             exited.add(sym)
+
+        # a closed trade is new evidence — reflect on the journal (at most
+        # once a day) and surface any data-backed suggestion as an event
+        if exited:
+            self._daily_reflection(cfg, day)
 
         # 2) open new positions from the freshest ranked setups. Names exited
         # THIS cycle are held out so a trailing-stop exit can't immediately
@@ -282,10 +295,12 @@ class ScannerTrader:
                 lots=lots, qty_units=qty, entry_price=fill.price,
                 entry_fees=fill.fees, entry_ts=now.isoformat(),
                 entry_score=sc.get("score") or 0.0, high_water=fill.price,
-                mtm=fill.price)
+                mtm=fill.price, low_water=fill.price,
+                entry_ctx=self._entry_context(scanner, sym, sc, q, cfg))
             self.book[sym] = pos
             fees_today += fill.fees
             self._book_trade(sym, pos, "entry", fill.price, fill.fees, "entry", now)
+            self._journal_entry(sym, pos, q, now)
             registry.record_event(
                 "info", "scanner",
                 f"trade ENTRY {sym} {pos.bias} x{lots} @ {fill.price} "
@@ -301,6 +316,125 @@ class ScannerTrader:
             registry.save_paper_day(STRATEGY_ID, day.isoformat(),
                                     realized_today, unrealized, fees_today, equity)
         self._persist()
+
+    # -- journal (rich per-trade log for strategy improvement) ---------------
+    @staticmethod
+    def _entry_context(scanner, sym: str, sc: dict, q, cfg: TradeConfig) -> dict:
+        """Everything known about the setup at the moment of entry — Tier-1
+        read, Tier-2 chain state, the option's own quote, and the config that
+        sized the trade. Journaled now and again with the exit, so every
+        closed trade is a self-contained record for later analysis."""
+        t1 = (getattr(scanner, "metrics", None) or {}).get(sym) or {}
+        t2 = (getattr(scanner, "tier2", None) or {}).get(sym) or {}
+        spread_pct = None
+        if q.bid and q.ask and (q.bid + q.ask) > 0:
+            spread_pct = round((q.ask - q.bid) / ((q.ask + q.bid) / 2) * 100, 2)
+        return {
+            "score": sc.get("score"), "reasons": sc.get("reasons") or [],
+            "buildup": sc.get("buildup") or t1.get("buildup"),
+            "spot": t1.get("spot"), "fut_ltp": t1.get("ltp"),
+            "price_change_pct": t1.get("price_change_pct"),
+            "oi_change_pct": t1.get("oi_change_pct"),
+            "volume_surge": t1.get("volume_surge"),
+            "range_pos": t1.get("range_pos"),
+            "pcr_oi": t2.get("pcr_oi"), "atm_iv": t2.get("atm_iv"),
+            "iv_skew": t2.get("iv_skew"),
+            "worst_spread_pct": (t2.get("liquidity") or {}).get("worst_spread_pct"),
+            "opt_bid": q.bid, "opt_ask": q.ask, "opt_ltp": q.ltp,
+            "opt_iv": getattr(q, "iv", None), "opt_oi": q.oi,
+            "opt_spread_pct": spread_pct,
+            "expiry": str(q.expiry) if getattr(q, "expiry", None) else None,
+            "config": {"entry_score": cfg.entry_score,
+                       "exit_score": cfg.exit_score,
+                       "hard_stop_pct": cfg.hard_stop_pct,
+                       "trail_pct": cfg.trail_pct,
+                       "target_pct": cfg.target_pct,
+                       "risk_pct": cfg.risk_pct},
+        }
+
+    def _journal_entry(self, sym: str, pos: SPosition, q, now) -> None:
+        from app.core import registry
+        try:
+            registry.record_journal(sym, "entry", {
+                "bias": pos.bias, "side": pos.side, "strike": pos.strike,
+                "lots": pos.lots, "qty_units": pos.qty_units,
+                "entry_price": pos.entry_price, "entry_fees": pos.entry_fees,
+                "quote_ltp": q.ltp,   # slippage = entry_price - quote_ltp
+                "entry_score": pos.entry_score,
+                "entry_ctx": pos.entry_ctx,
+            }, ts=now.isoformat())
+        except Exception:
+            pass                      # journaling must never block a trade
+
+    def _journal_exit(self, sym: str, pos: SPosition, fill, reason: str,
+                      realized: float, scanner, now, held_days: int) -> None:
+        """One self-contained round-trip record: entry context + exit facts +
+        the excursion stats (MFE/MAE) that entry/stop tuning feeds on."""
+        from app.core import registry
+        try:
+            entry = pos.entry_price
+            lw = pos.low_water or entry
+            held_min = None
+            try:
+                held_min = int((now - datetime.fromisoformat(pos.entry_ts))
+                               .total_seconds() // 60)
+            except (ValueError, TypeError):
+                pass
+            sc_now = (getattr(scanner, "scores", None) or {}).get(sym) or {}
+            t1_now = (getattr(scanner, "metrics", None) or {}).get(sym) or {}
+            registry.record_journal(sym, "exit", {
+                "bias": pos.bias, "side": pos.side, "strike": pos.strike,
+                "lots": pos.lots, "qty_units": pos.qty_units,
+                "entry_ts": pos.entry_ts, "entry_price": entry,
+                "entry_fees": pos.entry_fees, "entry_score": pos.entry_score,
+                "exit_price": fill.price, "exit_fees": fill.fees,
+                "reason": reason, "realized": round(realized, 2),
+                "ret_pct": round((fill.price - entry) / entry * 100, 2)
+                if entry else None,
+                "high_water": pos.high_water, "low_water": lw,
+                "mfe_pct": round((pos.high_water - entry) / entry * 100, 2)
+                if entry else None,
+                "mae_pct": round((entry - lw) / entry * 100, 2)
+                if entry else None,
+                "held_minutes": held_min, "held_days": held_days,
+                "exit_score": sc_now.get("score"),
+                "exit_bias": sc_now.get("bias"),
+                "exit_spot": t1_now.get("spot"),
+                "entry_ctx": pos.entry_ctx,
+            }, ts=now.isoformat())
+        except Exception:
+            pass
+
+    def reflect(self) -> dict:
+        """Analyze every closed trade in the journal -> stats + suggestions.
+        Backs GET /scanner/insights."""
+        from app.core import registry
+        from app.engines import journal_insights
+        cfg = self._cfg()
+        exits = registry.journal_rows(limit=2000, kind="exit")
+        return journal_insights.analyze(exits, config={
+            "entry_score": cfg.entry_score, "exit_score": cfg.exit_score,
+            "hard_stop_pct": cfg.hard_stop_pct, "trail_pct": cfg.trail_pct,
+            "target_pct": cfg.target_pct, "risk_pct": cfg.risk_pct})
+
+    def _daily_reflection(self, cfg: TradeConfig, day) -> None:
+        """At most once per day, after a close: if the journal now supports a
+        suggestion, surface it proactively as a scanner event (visible in the
+        Activity view). Never changes settings — only proposes."""
+        from app.core import registry
+        try:
+            if registry.setting("scanner_insight_day", "") == day.isoformat():
+                return
+            registry.set_setting("scanner_insight_day", day.isoformat())
+            res = self.reflect()
+            real = [s for s in (res.get("suggestions") or [])
+                    if s.get("rule") != "insufficient_data"]
+            for s in real[:2]:        # at most two, most-supported first
+                registry.record_event(
+                    "info", "scanner",
+                    f"journal insight: {s['suggestion']} ({s['evidence']})")
+        except Exception:
+            pass
 
     def _book_trade(self, sym, pos: SPosition, kind, price, fees, reason, ts):
         from app.core import registry

@@ -1206,6 +1206,22 @@ def scanner_backfill(symbol: str, days: int = 30):
     return {"status": "started", "symbol": symbol, "days": days}
 
 
+@scanner_router.get("/scanner/journal")
+def scanner_journal(limit: int = 200, symbol: str = "", kind: str = ""):
+    """The rich per-trade journal (newest first): every entry/exit with the
+    full setup context, prices, times and MFE/MAE excursions."""
+    return {"rows": registry.journal_rows(limit=min(int(limit), 2000),
+                                          symbol=symbol.upper(), kind=kind)}
+
+
+@scanner_router.get("/scanner/insights")
+def scanner_insights():
+    """Aggregated evidence from the closed-trade journal (win rate, expectancy
+    by score band / entry hour / buildup / exit reason, giveback, churn) plus
+    data-backed suggestions for improving the trading strategy."""
+    return scanner_engine.trader.reflect()
+
+
 @scanner_router.get("/scanner/trades")
 def scanner_trades():
     """The positional paper book the scanner is trading: open positions with

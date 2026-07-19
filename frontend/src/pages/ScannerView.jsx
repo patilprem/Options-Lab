@@ -65,19 +65,25 @@ export default function ScannerView({ showToast }) {
 
   const [valid, setValid] = useState(null)
   const [book, setBook] = useState(null)
+  const [insights, setInsights] = useState(null)
+  const [journal, setJournal] = useState(null)
 
   const load = useCallback(async () => {
     try {
-      const [d, b, v, tb] = await Promise.all([
+      const [d, b, v, tb, ins, jr] = await Promise.all([
         fetch('/scanner').then(r => r.json()),
         fetch('/scanner/index-bias').then(r => r.json()).catch(() => null),
         fetch('/scanner/validation').then(r => r.json()).catch(() => null),
         fetch('/scanner/trades').then(r => r.json()).catch(() => null),
+        fetch('/scanner/insights').then(r => r.json()).catch(() => null),
+        fetch('/scanner/journal?kind=exit&limit=15').then(r => r.json()).catch(() => null),
       ])
       setData(d)
       setBias(b)
       setValid(v)
       setBook(tb)
+      setInsights(ins)
+      setJournal(jr?.rows || null)
     } catch { showToast && showToast('Failed to load scanner') }
   }, [showToast])
 
@@ -225,6 +231,70 @@ export default function ScannerView({ showToast }) {
                       <td style={{ ...num, color: 'var(--muted)' }}>{p.stop?.toFixed(2)}</td>
                       <td style={{ ...num, color: p.unrealized >= 0 ? 'var(--green)' : 'var(--red)' }}>
                         {p.unrealized >= 0 ? '+' : ''}{Math.round(p.unrealized).toLocaleString('en-IN')}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* journal insights: evidence from closed trades + suggestions */}
+      {insights?.overall?.n > 0 && (
+        <div style={{ border: '1px solid var(--line)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+            <b>Trade journal</b>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)' }}>
+              {insights.overall.n} closed · win {insights.overall.win_rate == null ? '—' : Math.round(insights.overall.win_rate * 100) + '%'} ·
+              net ₹{Math.round(insights.overall.total || 0).toLocaleString('en-IN')} ·
+              expectancy ₹{Math.round(insights.overall.expectancy || 0).toLocaleString('en-IN')}/trade ·
+              fees ₹{Math.round(insights.overall.total_fees || 0).toLocaleString('en-IN')}
+              {insights.overall.profit_factor != null && ` · PF ${insights.overall.profit_factor}`}
+            </span>
+          </div>
+          {(insights.suggestions || []).length > 0 && (
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {insights.suggestions.map((s, i) => (
+                <div key={i} style={{ fontSize: 12, borderLeft: `3px solid ${s.rule === 'insufficient_data' ? 'var(--muted)' : 'var(--amber)'}`, paddingLeft: 8 }}>
+                  <div>{s.suggestion}</div>
+                  <div style={{ color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 11 }}>{s.evidence}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {journal?.length > 0 && (
+            <div style={{ overflowX: 'auto', marginTop: 10 }}>
+              <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 720 }}>
+                <thead>
+                  <tr>
+                    <th style={th}>Closed</th><th style={th}>Symbol</th><th style={th}>Side</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Entry</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Exit</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Peak</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Worst</th>
+                    <th style={{ ...th, textAlign: 'right' }}>Held</th>
+                    <th style={th}>Why out</th>
+                    <th style={{ ...th, textAlign: 'right' }}>P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {journal.map((t, i) => (
+                    <tr key={i}>
+                      <td style={{ ...cell, color: 'var(--muted)' }}>{String(t.ts || '').slice(5, 16).replace('T', ' ')}</td>
+                      <td style={{ ...cell, fontWeight: 700 }}>{t.symbol}</td>
+                      <td style={cell}><BiasTag bias={t.bias} /></td>
+                      <td style={num}>{t.entry_price?.toFixed(2)}</td>
+                      <td style={num}>{t.exit_price?.toFixed(2)}</td>
+                      <td style={{ ...num, color: 'var(--muted)' }}>{t.mfe_pct == null ? '—' : '+' + t.mfe_pct.toFixed(0) + '%'}</td>
+                      <td style={{ ...num, color: 'var(--muted)' }}>{t.mae_pct == null ? '—' : '-' + t.mae_pct.toFixed(0) + '%'}</td>
+                      <td style={{ ...num, color: 'var(--muted)' }}>
+                        {t.held_minutes == null ? '—' : t.held_minutes < 600 ? `${t.held_minutes}m` : `${t.held_days}d`}
+                      </td>
+                      <td style={{ ...cell, color: 'var(--muted)', fontSize: 12 }}>{t.reason}</td>
+                      <td style={{ ...num, color: (t.realized || 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                        {(t.realized || 0) >= 0 ? '+' : ''}{Math.round(t.realized || 0).toLocaleString('en-IN')}
                       </td>
                     </tr>
                   ))}
