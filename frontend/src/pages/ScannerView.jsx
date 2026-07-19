@@ -156,7 +156,7 @@ export default function ScannerView({ showToast }) {
         <span style={{ color: 'var(--muted)', fontSize: 13 }}>alert ≥ {data.alert_score}</span>
         <button
           className="btn btn-ghost"
-          title="Saves the full option chain of every shortlisted mover to disk for research (richer validation + later replay), not just the names the auto-trader holds. Costs extra DISK only — it does NOT use more API calls, since those chains are already fetched to score them. Worth turning ON during your first few weeks of recording; leave OFF once you're just trading."
+          title="Optional research dataset. Saves the full option chain of EVERY shortlisted mover to disk, not just names the auto-trader holds. NOT needed for scanning, trading, or the reflect/adapt loop (those use tiny trade journals), and signal validation can reconstruct flagged names via on-demand backfill anyway. Leave OFF unless you specifically want to study/backtest names you never traded. Costs disk only — no extra API, since these chains are already fetched to score them."
           onClick={() => setRecordChains(!data.record_chains)}
         >
           Record shortlist chains: {data.record_chains ? 'on' : 'off'}
