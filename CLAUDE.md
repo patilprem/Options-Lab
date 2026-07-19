@@ -46,8 +46,23 @@ off-hours window; genuinely urgent fixes get the marker.
   compiles in a restricted namespace, smoke-tests. Not a true sandbox.
 - `app/core/registry.py` — SQLite: strategies + lifecycle state machine
   (DRAFT→VALIDATED→DEPLOYED_PAUSED⇄RUNNING→STOPPED), daily_pnl (keyed by
-  mode), trades blotter, events log, settings, param overrides, and
-  paper_state (M4: per-strategy live-session snapshot for restart recovery).
+  mode), trades blotter, events log, settings, param overrides,
+  paper_state (M4: per-strategy live-session snapshot for restart recovery),
+  and two trade JOURNALS: scanner_journal (rich scanner-trader entries/exits)
+  + strategy_journal (closed Strategy round trips) that back the insights
+  engines.
+- `app/engines/attribution.py` — entry-context capture (data state at entry,
+  identical across contexts) + `build_round_trip` (a closed Position →
+  self-contained journal record incl. MFE/MAE) + `attribution` (win-rate/P&L
+  bucketed by an entry_context key).
+- `app/engines/strategy_insights.py` + `journal_insights.py` — PURE trade-log
+  analytics: aggregate closed trades (win rate, expectancy, breakdown by exit
+  reason / entry hour / entry data-state, MFE-giveback, churn) into
+  evidence-backed SUGGESTIONS, each gated on a minimum sample so small-N noise
+  never becomes advice; they PROPOSE, never mutate settings. strategy_insights
+  feeds backtest run results + `GET /strategies/{id}/insights` (paper) + a
+  once-a-day proactive event; journal_insights is the scanner-trader twin
+  (`GET /scanner/insights`). Position.mark() tracks MFE/MAE every bar.
 - `app/engines/fills.py` — shared fill simulation, Indian option charges
   (brokerage/STT/txn/GST/SEBI/stamp), SL/target level helpers, rough
   margin estimate (estimate_margin now takes a per-underlying `factor`).

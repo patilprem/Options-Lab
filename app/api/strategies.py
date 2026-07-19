@@ -1112,6 +1112,18 @@ def performance(sid: str):
             "daily": registry.performance_rows(sid, "PAPER")}
 
 
+@router.get("/{sid}/insights")
+def insights(sid: str):
+    """Reflection over this strategy's closed PAPER round trips: win rate,
+    expectancy, breakdown by exit reason / entry hour / entry data-state, and
+    evidence-backed suggestions for improving it. Backtest returns the same
+    block inline in its run result."""
+    _rec_or_404(sid)
+    from app.engines import strategy_insights
+    rows = registry.strategy_journal_rows(sid, limit=2000)
+    return strategy_insights.analyze(rows)
+
+
 # --- FNO stock scanner (F4) -------------------------------------------------
 
 scanner_router = APIRouter(tags=["scanner"])

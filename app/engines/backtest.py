@@ -159,7 +159,7 @@ class BacktestContext(Context):
         for p in self._positions:
             m = self.mark_price(bar.ts, p)
             if m is not None:
-                p.mtm_price = m
+                p.mark(m)
         for p in list(self.positions):
             hit = F.level_hit(p.qty, p.mtm_price, p.stop_loss, p.target)
             if hit:
@@ -469,21 +469,19 @@ def _report(daily: dict, ctx: BacktestContext, capital: float) -> dict:
         mu = sum(rets) / len(rets)
         sd = math.sqrt(sum((r - mu) ** 2 for r in rets) / (len(rets) - 1))
         sharpe = (mu / sd) * math.sqrt(252) if sd > 0 else 0.0
-    # per-trade rows (entry_context + realized P&L) + signal attribution: which
-    # data state at entry actually paid. Empty entry_context (unrecorded
+    # per-trade round trips (entry_context + realized P&L + MFE/MAE) feed both
+    # signal attribution (which data state at entry paid) and the insights
+    # engine (evidence-backed suggestions). Empty entry_context (unrecorded
     # windows) lands in the 'unknown' bucket, so nothing is silently dropped.
-    trades = [{"entry_ts": p.entry_ts.isoformat(sep=" ", timespec="minutes"),
-               "exit_ts": p.exit_ts.isoformat(sep=" ", timespec="minutes")
-                          if p.exit_ts else None,
-               "tag": p.tag, "pnl": round(p.realized_pnl, 2),
-               "exit_reason": p.exit_reason, "entry_context": p.entry_context}
-              for p in ctx.closed]
-    from app.engines.attribution import attribution
+    from app.engines.attribution import attribution, build_round_trip
+    from app.engines import strategy_insights
+    trades = [build_round_trip(p) for p in ctx.closed]
     attr = {
         "iv_rank": attribution(trades, "iv_rank", bins=[0, 30, 50, 70, 100]),
         "index_bias": attribution(trades, "index_bias", bins=[-1, -0.3, 0.3, 1]),
         "pcr_oi": attribution(trades, "pcr_oi", bins=[0, 0.8, 1.2, 3]),
     }
+    insights = strategy_insights.analyze(trades)
     return {
         "summary": {
             "capital": capital,
@@ -498,5 +496,6 @@ def _report(daily: dict, ctx: BacktestContext, capital: float) -> dict:
         "daily": days,   # <-- your date-by-date performance
         "trades": trades,
         "attribution": attr,   # <-- win-rate/avg-P&L sliced by entry data state
+        "insights": insights,  # <-- reflection + evidence-backed suggestions
         "logs": ctx.logs[-200:],
     }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Line } from 'react-chartjs-2'
+import InsightsPanel from './InsightsPanel'
 import {
   Chart, LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Filler,
 } from 'chart.js'
@@ -14,6 +15,7 @@ const th = { ...cell, color: 'var(--muted)', fontWeight: 500 }
 
 export default function PaperPanel({ id }) {
   const [data, setData] = useState(null)
+  const [insights, setInsights] = useState(null)
   const [error, setError] = useState(null)
 
   const load = useCallback(async () => {
@@ -22,6 +24,8 @@ export default function PaperPanel({ id }) {
       const d = await res.json()
       if (!res.ok) throw new Error(d.detail || 'failed to load')
       setData(d)
+      fetch(`/strategies/${id}/insights`).then(r => r.json())
+        .then(setInsights).catch(() => {})
     } catch (e) {
       setError(e.message)
     }
@@ -112,6 +116,8 @@ export default function PaperPanel({ id }) {
             ])} />
         </Section>
       )}
+
+      {insights?.overall?.n > 0 && <InsightsPanel insights={insights} />}
     </div>
   )
 }

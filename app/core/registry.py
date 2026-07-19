@@ -136,6 +136,13 @@ def init_db() -> None:
             kind TEXT NOT NULL,                -- 'entry' | 'exit'
             data_json TEXT NOT NULL            -- full trade context snapshot
         );
+        CREATE TABLE IF NOT EXISTS strategy_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,                  -- IST ISO (exit time)
+            strategy_id TEXT NOT NULL,
+            kind TEXT NOT NULL,                -- 'exit' (closed round trip)
+            data_json TEXT NOT NULL            -- build_round_trip() record
+        );
         """)
 
 
@@ -480,6 +487,37 @@ def journal_rows(limit: int = 500, symbol: str = "", kind: str = "") -> list[dic
                 d = {}
             d.update({"ts": ts, "symbol": sym, "kind": k})
             out.append(d)
+    return out
+
+
+def record_strategy_journal(strategy_id: str, kind: str, data: dict,
+                            ts: str = "") -> None:
+    """One durable round-trip record per closed paper Strategy trade — the
+    build_round_trip() dict (P&L, times, exit reason, entry_context, MFE/MAE).
+    Backtest keeps its trades in-memory and never writes here."""
+    with _conn() as c:
+        c.execute("INSERT INTO strategy_journal (ts, strategy_id, kind, data_json) "
+                  "VALUES (?,?,?,?)",
+                  (ts or _now(), strategy_id, kind, json.dumps(data)))
+
+
+def strategy_journal_rows(strategy_id: str, limit: int = 1000,
+                          kind: str = "exit") -> list[dict]:
+    """Newest-first closed round trips for one strategy (parsed data dicts)."""
+    q = "SELECT data_json FROM strategy_journal WHERE strategy_id=?"
+    args: list = [strategy_id]
+    if kind:
+        q += " AND kind=?"
+        args.append(kind)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    out = []
+    with _conn() as c:
+        for (data_json,) in c.execute(q, args).fetchall():
+            try:
+                out.append(json.loads(data_json))
+            except (TypeError, ValueError):
+                pass
     return out
 
 

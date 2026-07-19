@@ -132,3 +132,11 @@ def test_backtest_report_has_trades_and_attribution():
     # synthetic store has no recorded IV -> all trades in the 'unknown' bucket
     assert res["attribution"]["iv_rank"]["unknown"]["n"] == n
     assert res["attribution"]["iv_rank"]["overall"]["n"] == n
+    # round-trip rows carry excursion + fee/held fields for the insights engine
+    for tr in res["trades"]:
+        assert "mfe" in tr and "mae" in tr and "fees" in tr
+        assert tr["mae"] <= 0 <= tr["mfe"]          # signs by construction
+        assert "held_minutes" in tr and "exit_reason" in tr
+    # the report carries the reflection block, computed over those same rows
+    assert "insights" in res
+    assert res["insights"]["overall"]["n"] == n

@@ -57,6 +57,33 @@ def capture_entry_context(ctx) -> dict:
     return snap
 
 
+def build_round_trip(p) -> dict:
+    """A closed Position -> one self-contained round-trip record for the trade
+    journal / insights: prices, times, realized P&L, fees, exit reason, the
+    entry_context snapshot, and the MFE/MAE excursion. Pure; identical shape
+    across backtest and paper so strategy_insights.analyze() consumes both."""
+    entry = p.entry_price
+    held_min = None
+    try:
+        if p.exit_ts and p.entry_ts:
+            held_min = int((p.exit_ts - p.entry_ts).total_seconds() // 60)
+    except (TypeError, ValueError):
+        pass
+    return {
+        "tag": p.tag, "underlying": p.underlying, "strike": p.strike,
+        "qty": p.qty, "entry_price": entry, "exit_price": p.exit_price,
+        "entry_ts": p.entry_ts.isoformat(sep=" ", timespec="minutes")
+        if p.entry_ts else None,
+        "exit_ts": p.exit_ts.isoformat(sep=" ", timespec="minutes")
+        if p.exit_ts else None,
+        "pnl": round(p.realized_pnl, 2), "fees": round(p.fees_paid, 2),
+        "exit_reason": p.exit_reason or "signal",
+        "mfe": round(p.mfe, 2), "mae": round(p.mae, 2),
+        "held_minutes": held_min,
+        "entry_context": p.entry_context or {},
+    }
+
+
 def _bucket(value, bins) -> str:
     """Label `value` by the half-open interval [edge_i, edge_{i+1}) it falls in.
     Below the first edge -> '<e0'; at/above the last -> '>=e_last'."""

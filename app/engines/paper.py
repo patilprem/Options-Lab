@@ -87,7 +87,8 @@ def _pos_to_dict(p: Position) -> dict:
             "entry_ts": p.entry_ts.isoformat(), "mtm_price": p.mtm_price,
             "fees_paid": p.fees_paid, "tag": p.tag, "stop_loss": p.stop_loss,
             "target": p.target, "margin_blocked": p.margin_blocked,
-            "exit_reason": p.exit_reason, "entry_context": p.entry_context}
+            "exit_reason": p.exit_reason, "entry_context": p.entry_context,
+            "mfe": p.mfe, "mae": p.mae}
 
 
 def _pos_from_dict(d: dict) -> Position:
@@ -98,7 +99,8 @@ def _pos_from_dict(d: dict) -> Position:
         entry_ts=datetime.fromisoformat(d["entry_ts"]), mtm_price=d["mtm_price"],
         fees_paid=d["fees_paid"], tag=d.get("tag", ""), stop_loss=d.get("stop_loss"),
         target=d.get("target"), margin_blocked=d.get("margin_blocked", 0.0),
-        exit_reason=d.get("exit_reason", ""), entry_context=d.get("entry_context") or {})
+        exit_reason=d.get("exit_reason", ""), entry_context=d.get("entry_context") or {},
+        mfe=d.get("mfe", 0.0), mae=d.get("mae", 0.0))
 
 
 class MarketHub:
@@ -772,7 +774,7 @@ class PaperContext(Context):
         for p in self._open:
             q = self.hub.quote_position(self.underlying, bar.ts, p)  # actual contract
             if q:
-                p.mtm_price = q.ltp
+                p.mark(q.ltp)
         self._enforce_levels()
 
     def refresh_mtm(self, ts: datetime) -> None:
@@ -784,7 +786,7 @@ class PaperContext(Context):
         for p in self._open:
             q = self.hub.quote_position(self.underlying, ts, p)
             if q:
-                p.mtm_price = q.ltp
+                p.mark(q.ltp)
 
     def _enforce_levels(self) -> None:
         for p in list(self.positions):
@@ -971,7 +973,42 @@ class PaperContext(Context):
         if not self._open:
             self._margin_used = 0.0
         self._blotter(p, action.value, p.exit_price, fees, 0.0, reason)
+        self._journal_close(p)
         self.persist_state()  # M4: durable on every close
+        self._maybe_reflect(self.now.date())
+
+    def _journal_close(self, p: Position) -> None:
+        """Write the closed round trip to the durable strategy journal (rich
+        record for reflection). Best-effort — must never disrupt a close."""
+        try:
+            from app.engines.attribution import build_round_trip
+            registry.record_strategy_journal(
+                self.rec.id, "exit", build_round_trip(p),
+                ts=self.now.isoformat())
+        except Exception:
+            pass
+
+    def _maybe_reflect(self, day) -> None:
+        """At most once a day, after a close: if the journal now supports a
+        suggestion, surface the top ones as strategy events (Activity view).
+        Proposes only — never changes params."""
+        try:
+            key = f"strategy_insight_day:{self.rec.id}"
+            if registry.setting(key, "") == day.isoformat():
+                return
+            registry.set_setting(key, day.isoformat())
+            from app.engines import strategy_insights
+            rows = registry.strategy_journal_rows(self.rec.id, limit=2000)
+            res = strategy_insights.analyze(rows)
+            real = [s for s in (res.get("suggestions") or [])
+                    if s.get("rule") != "insufficient_data"]
+            for s in real[:2]:
+                registry.record_event(
+                    "info", "strategy",
+                    f"journal insight: {s['suggestion']} ({s['evidence']})",
+                    self.rec.id)
+        except Exception:
+            pass
 
     def log(self, msg: str) -> None:
         print(f"[{self.rec.id} {self.now:%H:%M}] {msg}")

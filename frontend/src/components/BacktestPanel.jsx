@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Line } from 'react-chartjs-2'
+import InsightsPanel from './InsightsPanel'
 import {
   Chart, LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Filler,
 } from 'chart.js'
@@ -76,22 +77,7 @@ export default function BacktestPanel({ id, underlying }) {
     ? coverage.map(c => `${c.underlying} ${c.from} → ${c.to}`).join(', ')
     : 'none — backfill data first (Data tab)'
 
-  // -- exit-reason breakdown (derived client-side from result.trades) --------
-  // Answers "is the declared stop actually containing losses?" — if very few
-  // exits say stop_loss despite a red strategy, the stop isn't working as
-  // intended (see e.g. backtest.py mark_price's stale-quote fallback when a
-  // strike drifts far outside the recorded ATM-relative window).
   const trades = result?.trades || []
-  const byReason = {}
-  for (const t of trades) {
-    const r = t.exit_reason || 'unknown'
-    const b = (byReason[r] ??= { n: 0, wins: 0, total: 0 })
-    b.n += 1
-    b.wins += t.pnl > 0 ? 1 : 0
-    b.total += t.pnl
-  }
-  const reasonRows = Object.entries(byReason).sort((a, b) => b[1].n - a[1].n)
-
   const largest = [...trades].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)).slice(0, 6)
 
   const attribution = result?.attribution || {}
@@ -159,30 +145,7 @@ export default function BacktestPanel({ id, underlying }) {
             </table>
           </div>
 
-          {reasonRows.length > 0 && (
-            <Section title="Exit reasons — is the stop actually working?">
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-                <thead>
-                  <tr style={{ color: 'var(--muted)', textAlign: 'left' }}>
-                    <th style={cell}>Reason</th><th style={cell}>Trades</th>
-                    <th style={cell}>Win rate</th><th style={cell}>Total P&L</th>
-                    <th style={cell}>Avg P&L</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {reasonRows.map(([reason, b]) => (
-                    <tr key={reason}>
-                      <td style={cell}>{reason}</td>
-                      <td style={cell}>{b.n}</td>
-                      <td style={cell}>{(100 * b.wins / b.n).toFixed(1)}%</td>
-                      <td style={{ ...cell, color: pos(b.total) }}>{inr(b.total)}</td>
-                      <td style={{ ...cell, color: pos(b.total / b.n) }}>{inr(b.total / b.n)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </Section>
-          )}
+          {result?.insights && <InsightsPanel insights={result.insights} />}
 
           {Object.keys(attribution).length > 0 && (
             <Section title="Signal attribution — which data state at entry paid?">

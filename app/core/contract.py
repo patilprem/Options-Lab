@@ -110,6 +110,23 @@ class Position:
     margin_blocked: float = 0.0          # estimated margin share for this leg
     exit_reason: str = ""                # entry|stop_loss|target|time_exit|signal|squareoff|expiry|pause|manual
     entry_context: dict = field(default_factory=dict)  # data state at entry (signal attribution)
+    mfe: float = 0.0                     # max favourable excursion: best
+                                         # unrealized ₹ P&L seen over the life
+    mae: float = 0.0                     # max adverse excursion: worst (≤0)
+                                         # unrealized ₹ P&L seen over the life
+
+    def mark(self, price: float) -> None:
+        """Mark to `price` and track the peak/trough unrealized P&L (MFE/MAE)
+        over the position's life. Engines call this every bar instead of
+        assigning mtm_price directly, so the excursion the trade actually
+        offered is captured for journal reflection (targets too far? stops too
+        tight?). Best-effort and side-effect-free beyond these three fields."""
+        self.mtm_price = price
+        u = (price - self.entry_price) * self.qty
+        if u > self.mfe:
+            self.mfe = u
+        if u < self.mae:
+            self.mae = u
 
     @property
     def is_open(self) -> bool:
