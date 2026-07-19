@@ -1,14 +1,26 @@
 import { useEffect, useState } from 'react'
 
-// What a trader needs to see by default: money events (fills/stops/blocks),
-// risk actions, deploy/pause lifecycle, token state, and anything warn/error.
-// Feed/data chatter stays behind the Feed/All chips.
+// Each chip is a distinct lens, not a near-duplicate:
+//   Important — the attention inbox: money, risk, lifecycle, token, coaching
+//     insights, AND real errors, but NOT feed/data plumbing (a feed reconnect
+//     warning is chatter, not something to act on — it lives under Feed).
+//   Insights  — just the coaching notes + adaptive-update prompts (kind
+//     'insight'), so they're never buried among fills.
+//   Trades    — fills / stops / blocks only.
+//   Errors    — every warn/error, feed ones included (the troubleshooting view).
+//   Feed      — feed/data plumbing at any level.
+// Previously warn-level feed events showed up in Important, Errors AND Feed at
+// once, which made the three chips look identical during setup; excluding
+// feed/data from Important's error clause fixes that.
+const PLUMBING = e => e.kind === 'feed' || e.kind === 'data'
+const IS_ERR = e => e.level === 'warn' || e.level === 'error'
 const FILTERS = {
-  Important: e => ['fill', 'stop_loss', 'block', 'risk', 'lifecycle', 'token'].includes(e.kind)
-    || e.level === 'warn' || e.level === 'error',
-  Fills: e => ['fill', 'stop_loss', 'block'].includes(e.kind),
-  Errors: e => e.level === 'warn' || e.level === 'error',
-  Feed: e => e.kind === 'feed' || e.kind === 'data',
+  Important: e => ['fill', 'stop_loss', 'block', 'risk', 'lifecycle', 'token', 'insight'].includes(e.kind)
+    || (IS_ERR(e) && !PLUMBING(e)),
+  Insights: e => e.kind === 'insight',
+  Trades: e => ['fill', 'stop_loss', 'block'].includes(e.kind),
+  Errors: IS_ERR,
+  Feed: PLUMBING,
   All: () => true,
 }
 

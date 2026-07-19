@@ -137,26 +137,33 @@ export default function PaperPanel({ id }) {
       {insights?.overall?.n > 0 && <InsightsPanel insights={insights} />}
 
       {/* walk-forward adaptation: proposal, armed-scan, or running state */}
-      {adapt?.proposal && (
-        <div style={{ border: '1px solid var(--amber)', borderRadius: 8, padding: '12px 14px' }}>
-          <div style={{ fontWeight: 700, marginBottom: 4 }}>Considerable update for this strategy</div>
-          <div style={{ fontSize: 13, marginBottom: 4 }}>
-            {(() => { const p = adapt.proposal; const d = p.delta[p.param]; return `Change ${p.param}: ${d.from} → ${d.to}` })()}
+      {adapt?.proposal && (() => {
+        const p = adapt.proposal
+        const d = p.delta[p.param]
+        const folds = p.folds || 0
+        const won = Math.round((p.is_win_share || 0) * folds)
+        const more = Math.round((p.oos_realized || 0) - (p.baseline_oos_realized || 0))
+        return (
+          <div style={{ border: '1px solid var(--amber)', borderRadius: 8, padding: '12px 14px' }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>A suggested improvement for this strategy</div>
+            <div style={{ fontSize: 13, marginBottom: 6 }}>
+              Change <b>{p.param}</b> from <b>{String(d.from)}</b> to <b>{String(d.to)}</b>.
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 10 }}>
+              This was tested on <b>{folds}</b> separate past stretches of data it wasn't tuned on.
+              It did better than your current setting in <b>{won} of {folds}</b> of them
+              {more > 0 && <> — about <b>{inr(more)}</b> more overall</>}.
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-primary" onClick={() => decide('apply')}>Apply</button>
+              <button className="btn btn-ghost" onClick={() => decide('dismiss')}>Not now</button>
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 8 }}>
+              Applying changes just this one setting and pauses further checks for a few weeks while it's measured on real trades. It takes effect on new backtests and the next time you (re)deploy — it won't change a strategy that's already running mid-session.
+            </div>
           </div>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)', marginBottom: 8 }}>
-            Walk-forward validated: OOS {adapt.proposal.metric} {adapt.proposal.oos_metric} vs {adapt.proposal.baseline_oos_metric} current ·
-            OOS P&L {inr(adapt.proposal.oos_realized)} vs {inr(adapt.proposal.baseline_oos_realized)} ·
-            preferred in {Math.round((adapt.proposal.is_win_share || 0) * 100)}% of folds
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-primary" onClick={() => decide('apply')}>Apply update</button>
-            <button className="btn btn-ghost" onClick={() => decide('dismiss')}>Dismiss</button>
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 6 }}>
-            Applying sets a param override (a bounded step) and starts a {adapt.embargo_until ? '' : '21-day '}embargo; it applies to new backtests and the next (re)deploy.
-          </div>
-        </div>
-      )}
+        )
+      })()}
       {!adapt?.proposal && adapt?.armed && !adapt?.embargo_until && (
         <div style={{ border: '1px dashed var(--line)', borderRadius: 8, padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 13 }}>An insight has persisted across several days — a walk-forward scan can validate a change out-of-sample.</span>

@@ -1004,7 +1004,7 @@ class PaperContext(Context):
                     if s.get("rule") != "insufficient_data"]
             for s in real[:2]:
                 registry.record_event(
-                    "info", "strategy",
+                    "info", "insight",
                     f"journal insight: {s['suggestion']} ({s['evidence']})",
                     self.rec.id)
             # accrue persistence for the walk-forward adaptation pipeline; when
@@ -1017,9 +1017,10 @@ class PaperContext(Context):
                 hist = registry.insight_history_rows(self.rec.id, since)
                 if _A.persistent_rules(hist):
                     registry.record_event(
-                        "info", "strategy",
-                        "an insight has persisted several days — run a "
-                        "walk-forward adaptation scan to validate a change",
+                        "info", "insight",
+                        "a repeating pattern has shown up several days — run "
+                        "an improvement check on this strategy when you have a "
+                        "moment (Paper tab)",
                         self.rec.id)
         except Exception:
             pass

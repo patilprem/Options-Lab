@@ -444,7 +444,7 @@ class ScannerTrader:
                     if s.get("rule") != "insufficient_data"]
             for s in real[:2]:        # at most two, most-supported first
                 registry.record_event(
-                    "info", "scanner",
+                    "info", "insight",
                     f"journal insight: {s['suggestion']} ({s['evidence']})")
             self._advance_adaptation(cfg, day, real)
         except Exception:
@@ -480,7 +480,7 @@ class ScannerTrader:
                 self._save_tune_history(hist)
                 if m["verdict"] == "worse":
                     registry.record_event(
-                        "warn", "scanner",
+                        "warn", "insight",
                         f"adaptive change {applied[-1].get('rule')} is "
                         f"underperforming its baseline "
                         f"(post {m['post']['expectancy']}/trade over "
@@ -521,7 +521,7 @@ class ScannerTrader:
                     }
                     registry.set_setting(PROPOSAL_SETTING, json.dumps(proposal))
                     registry.record_event(
-                        "info", "scanner",
+                        "info", "insight",
                         f"ADAPTIVE UPDATE READY: {proposal['suggestion']} — "
                         f"challenger ₹{cmp['challenger']['expectancy']}/trade "
                         f"({cmp['challenger']['n']}) vs current "
@@ -533,7 +533,7 @@ class ScannerTrader:
                                  "ts": day.isoformat(), "comparison": cmp})
                     self._save_tune_history(hist)
                     registry.record_event(
-                        "info", "scanner",
+                        "info", "insight",
                         f"shadow trial {st.get('rule')} did not beat the "
                         f"current config — discarded "
                         f"(challenger ₹{cmp['challenger']['expectancy']} vs "
@@ -544,7 +544,7 @@ class ScannerTrader:
                              "ts": day.isoformat(), "reason": "inconclusive"})
                 self._save_tune_history(hist)
                 registry.record_event(
-                    "info", "scanner",
+                    "info", "insight",
                     f"shadow trial {st.get('rule')} inconclusive after "
                     f"{days_run} days (too few trades) — discarded")
             return
@@ -569,7 +569,7 @@ class ScannerTrader:
                 "rule": rule, "overrides": overrides,
                 "started": day.isoformat(), "book": {}, "closed": []}))
             registry.record_event(
-                "info", "scanner",
+                "info", "insight",
                 f"insight '{rule}' persisted {A.MIN_PERSIST_DAYS}+ days — "
                 f"starting a shadow trial of {overrides} alongside the "
                 f"current config (no settings changed)")
@@ -691,7 +691,7 @@ class ScannerTrader:
             (now.date() + timedelta(days=A.EMBARGO_DAYS)).isoformat())
         registry.set_setting(PROPOSAL_SETTING, "")
         registry.record_event(
-            "info", "scanner",
+            "info", "insight",
             f"adaptive update APPLIED: {p.get('overrides')} (was {frm}); "
             f"new trials embargoed {A.EMBARGO_DAYS} days while it is "
             "measured against the pre-change baseline")
@@ -708,7 +708,7 @@ class ScannerTrader:
                      "ts": datetime.now(IST).replace(tzinfo=None).isoformat()})
         self._save_tune_history(hist)
         registry.set_setting(PROPOSAL_SETTING, "")
-        registry.record_event("info", "scanner",
+        registry.record_event("info", "insight",
                               f"adaptive update dismissed ({p.get('rule')})")
         return {"ok": True}
 

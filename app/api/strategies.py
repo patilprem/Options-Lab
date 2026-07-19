@@ -1023,11 +1023,11 @@ def strategy_adaptation(sid: str):
             registry.set_setting(f"strategy_tune_history:{sid}", json.dumps(hist[-50:]))
             if m["verdict"] == "worse":
                 registry.record_event(
-                    "warn", "strategy",
-                    f"adaptive change to {applied[-1].get('param')} is "
-                    f"underperforming its baseline (post {m['post']['expectancy']}"
-                    f"/trade over {m['post']['n']} vs pre {m['pre']['expectancy']})"
-                    " — consider reverting it in Params", sid)
+                    "warn", "insight",
+                    f"the change to {applied[-1].get('param')} is doing worse "
+                    f"than before it was applied (₹{m['post']['expectancy']}"
+                    f"/trade over {m['post']['n']} trades vs ₹{m['pre']['expectancy']}"
+                    " before) — consider reverting it in Params", sid)
     return {"id": sid, "armed": armed, "embargo_until": embargo,
             "proposal": _load(f"strategy_proposal:{sid}"),
             "history": hist[-10:]}
@@ -1088,8 +1088,8 @@ def strategy_adaptation_scan(sid: str, req: AdaptScanReq = AdaptScanReq()):
     start = datetime.fromisoformat(frm + " 09:15:00")
     end = datetime.fromisoformat(to + " 15:30:00")
 
-    registry.record_event("info", "strategy",
-                          "walk-forward adaptation scan started", sid)
+    registry.record_event("info", "insight",
+                          "improvement check started (walk-forward)", sid)
     try:
         search = wf.adaptive_search(
             factory, _store, start, end, params,
@@ -1105,19 +1105,23 @@ def strategy_adaptation_scan(sid: str, req: AdaptScanReq = AdaptScanReq()):
 
     proposal = SA.evaluate_search(search)
     if not proposal:
-        registry.record_event("info", "strategy",
-                              "adaptation scan found no validated improvement", sid)
+        registry.record_event("info", "insight",
+                              "improvement check found nothing worth changing", sid)
         return {"status": "no_improvement", "search": search}
     proposal["created"] = today
     proposal["current"] = {proposal["param"]: params.get(proposal["param"])}
     registry.set_setting(f"strategy_proposal:{sid}", json.dumps(proposal))
     d = proposal["delta"][proposal["param"]]
+    folds = proposal.get("folds") or 0
+    won = round((proposal.get("is_win_share") or 0) * folds)
+    more = round((proposal.get("oos_realized") or 0)
+                 - (proposal.get("baseline_oos_realized") or 0))
     registry.record_event(
-        "info", "strategy",
-        f"ADAPTIVE UPDATE READY: {proposal['param']} {d['from']} → {d['to']} — "
-        f"walk-forward OOS {proposal['metric']} {proposal['oos_metric']} vs "
-        f"{proposal['baseline_oos_metric']} (won {int(proposal['is_win_share']*100)}%"
-        f" of folds). Review it on the strategy's Paper tab.", sid)
+        "info", "insight",
+        f"UPDATE READY: change {proposal['param']} from {d['from']} to {d['to']}. "
+        f"Tested on {folds} past stretches it wasn't tuned on — it did better in "
+        f"{won} of them, about ₹{more:,} more overall. Review it on the "
+        "strategy's Paper tab.", sid)
     return {"status": "proposed", "proposal": proposal}
 
 
@@ -1148,10 +1152,10 @@ def strategy_adaptation_apply(sid: str):
         (date.fromisoformat(_ist_today()) + timedelta(days=A.EMBARGO_DAYS)).isoformat())
     registry.set_setting(f"strategy_proposal:{sid}", "")
     registry.record_event(
-        "info", "strategy",
-        f"adaptive update APPLIED: {param} {frm} → {new_val} (param override); "
-        f"new scans embargoed {A.EMBARGO_DAYS} days while it is measured. "
-        "Applies to new backtests and the next (re)deploy.", sid)
+        "info", "insight",
+        f"update APPLIED: {param} changed from {frm} to {new_val}. Further "
+        f"checks paused {A.EMBARGO_DAYS} days while this one is measured. "
+        "Takes effect on new backtests and the next (re)deploy.", sid)
     return {"ok": True, "param": param, "from": frm, "to": new_val,
             "note": "param override set; redeploy the strategy to trade it live-paper"}
 
@@ -1169,8 +1173,8 @@ def strategy_adaptation_dismiss(sid: str):
                  "ts": datetime.now(IST).replace(tzinfo=None).isoformat()})
     registry.set_setting(f"strategy_tune_history:{sid}", json.dumps(hist[-50:]))
     registry.set_setting(f"strategy_proposal:{sid}", "")
-    registry.record_event("info", "strategy",
-                          f"adaptive update dismissed ({p.get('param')})", sid)
+    registry.record_event("info", "insight",
+                          f"update dismissed ({p.get('param')})", sid)
     return {"ok": True}
 
 
