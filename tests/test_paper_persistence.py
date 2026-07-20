@@ -73,7 +73,11 @@ def test_persist_on_fill_and_restore(db):
     n = ctx2.restore_state()
     assert n == 2
     assert ctx2._margin_used == margin
-    assert ctx2._realized_today == realized and ctx2._fees_today == fees
+    # persistence intentionally rounds to paise (round(x, 2)); compare at that
+    # precision rather than raw float equality, which fees' accumulated sum
+    # (e.g. 76.25999999999999) won't hit exactly.
+    assert ctx2._realized_today == round(realized, 2)
+    assert ctx2._fees_today == round(fees, 2)
 
     # positions round-tripped faithfully (ids, strikes, signed qty, sl)
     orig = {p.id: p for p in ctx.positions}
