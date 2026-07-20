@@ -85,7 +85,29 @@ def test_run_and_report_fail_pushes_down(db, monkeypatch):
     monkeypatch.setattr(ivc, "run_full_check",
                         lambda syms, seconds=45: {
                             "passed": False, "verdict": "FAIL",
-                            "lines": ["[3] NIFTY: volume=NO"], "resolved": {}})
+                            "lines": ["[1] resolve_index_futures()",
+                                      "    OK  NIFTY: id=111",
+                                      "[3] NIFTY: volume=NO (first=None last=None "
+                                      "inc=NO) OI=NO"],
+                            "resolved": {}})
     ivc.run_and_report(["NIFTY"], 1)
     assert registry.setting("index_vol_check_result", "").startswith("fail ")
     assert pushed and pushed[0][1] == "down"
+    # the FAIL push must carry the concrete reason, not just "see Activity log"
+    assert "volume=NO" in pushed[0][0]
+
+
+def test_fail_reason_prefers_flagged_lines():
+    reason = ivc._fail_reason([
+        "[1] resolve_index_futures()",
+        "    OK  NIFTY: id=111 expiry=2026-07-31 seg=NSE",
+        "[2] Feed-mode constants",
+        "    MISMATCH  Full (companion): ours=21 sdk=None",
+        "[3] NIFTY: volume=y OI=y",
+    ])
+    assert "MISMATCH" in reason and "OK  NIFTY" not in reason
+
+
+def test_fail_reason_falls_back_to_last_line():
+    assert ivc._fail_reason(["only a summary line"]) == "only a summary line"
+    assert ivc._fail_reason([]) == ""
