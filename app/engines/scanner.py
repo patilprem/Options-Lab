@@ -718,6 +718,18 @@ class StockScanner:
         want = list(dict.fromkeys([d["symbol"] for d in self.shortlist] + held))
         symbols = self._register_chain_cfgs(want)
         if not symbols:
+            # Nothing to deep-dive. Say WHY so an all-Tier-1 board isn't a silent
+            # mystery: an empty shortlist means the market's too quiet to clear
+            # rank_shortlist's min move; a non-empty `want` with no `symbols`
+            # means those names lack a resolvable cash-equity id to poll.
+            if not self.shortlist:
+                registry.record_event("info", "scanner",
+                                      "tier-2 skipped: shortlist empty "
+                                      "(no FnO stock cleared the min intraday move)")
+            else:
+                registry.record_event("warn", "scanner",
+                                      f"tier-2 skipped: {len(want)} shortlisted "
+                                      "but none resolved a cash-equity id to poll")
             return 0
         from app.data.dhan_client import UNDERLYINGS
         client = await loop.run_in_executor(None, dhan_client.get_client)
@@ -781,6 +793,13 @@ class StockScanner:
                 registry.record_event("warn", "scanner", f"trader step: {e!r}")
         if done:
             registry.record_event("info", "scanner", f"tier-2 deep-dive: {done} names")
+        else:
+            # Shortlist had names and we polled, yet every chain came back empty —
+            # a real gap (stock option-chain fetch / expiry_list returning
+            # nothing), not a quiet market. Surface it instead of failing silent.
+            registry.record_event("warn", "scanner",
+                                  f"tier-2 polled {len(symbols)} names but got 0 "
+                                  "chains (stock option-chain fetch returned empty)")
         return done
 
     def ranked_scores(self) -> list[dict]:
