@@ -169,6 +169,23 @@ def run_full_check(symbols, seconds: int = 45) -> dict:
             "lines": lines, "resolved": resolved}
 
 
+# Substrings that mark a FAILING line in run_full_check's output — used to pull
+# the actual reason into the phone push (a bare "See Activity log" is useless
+# when the log lives on the VPS and you're holding your phone).
+_FAIL_MARKERS = ("MISMATCH", "MISSING", "STALE", "EMPTY", "SKIPPED",
+                 "failed", "volume=NO", "inc=NO", "OI=NO", "got 0 ")
+
+
+def _fail_reason(lines) -> str:
+    """One compact line naming what actually failed, for the FAIL push. Prefers
+    the flagged lines (constant mismatch / stale id / no volume|OI); falls back
+    to the last line so the push is never empty."""
+    hits = [ln.strip() for ln in lines
+            if any(m in ln for m in _FAIL_MARKERS)]
+    reason = "; ".join(hits[:2]) if hits else (lines[-1].strip() if lines else "")
+    return reason[:180]
+
+
 def run_and_report(symbols, seconds: int = 45) -> dict:
     """Run the full check and REPORT: events log + ntfy push + persisted result.
     Sync — call via run_in_executor so the socket work stays off the app loop."""
@@ -185,9 +202,14 @@ def run_and_report(symbols, seconds: int = 45) -> dict:
     tail = res["lines"][-1] if res["lines"] else ""
     registry.set_setting("index_vol_check_result",
                          f"{'pass' if res['passed'] else 'fail'} {day} :: {tail}")
-    msg = (f"index-futures volume self-check: {res['verdict']}. "
-           + ("Safe to set index_futures_volume=on."
-              if res["passed"] else "See Activity log for details."))
+    if res["passed"]:
+        msg = ("index-futures volume self-check: PASS. "
+               "Safe to set index_futures_volume=on.")
+    else:
+        # Carry the concrete failure into the push so it's diagnosable from the
+        # phone without opening the Activity log on the VPS.
+        msg = ("index-futures volume self-check: FAIL — "
+               + (_fail_reason(res["lines"]) or "see Activity log for details."))
     registry.record_event("info" if res["passed"] else "warn", "diag", msg)
     try:
         push_ntfy(msg, "recovered" if res["passed"] else "down")
