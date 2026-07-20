@@ -62,6 +62,13 @@ _MASTER_CACHE = Path(__file__).resolve().parents[2] / "scrip_master_mcx.csv"
 # The FNO-stock universe is trimmed from the SAME master, kept separately so
 # its 24h refresh cadence is independent of the MCX one.
 _FNO_MASTER_CACHE = Path(__file__).resolve().parents[2] / "scrip_master_fno.csv"
+# Index FUTURES (FUTIDX) get their OWN trim. They MUST NOT share
+# _FNO_MASTER_CACHE: resolve_fno_universe writes that file keeping only
+# FUTSTK/EQUITY rows (every FUTIDX stripped) and the scanner refreshes it
+# constantly — so a shared cache leaves resolve_index_futures reading a file
+# that never held a single FUTIDX row (observed 2026-07-20:
+# "[1] EMPTY — no FUTIDX rows matched" despite a correct symbol format).
+_IDX_FUT_MASTER_CACHE = Path(__file__).resolve().parents[2] / "scrip_master_idxfut.csv"
 
 
 def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
@@ -138,24 +145,31 @@ def parse_index_futures(rows: list, names, today: str) -> dict:
 
 def resolve_index_futures(max_age_h: float = 24.0) -> dict:
     """Resolve each index's front-month FUTIDX security id from Dhan's scrip
-    master (reuses the FNO master cache). Returns {name: {security_id, expiry,
-    segment}}. Safe to call repeatedly. Network/cache wrapper around the pure
-    parse_index_futures(). Live-verify on the VPS: the FUTIDX trading-symbol
-    format and the correct NSE-FnO feed segment int."""
+    master. Returns {name: {security_id, expiry, segment}}. Safe to call
+    repeatedly. Network/cache wrapper around the pure parse_index_futures().
+
+    Uses a DEDICATED cache (_IDX_FUT_MASTER_CACHE) trimmed to FUTIDX rows only —
+    it deliberately does NOT reuse _FNO_MASTER_CACHE, which the scanner rewrites
+    with FUTSTK/EQUITY rows only and would leave this returning EMPTY. Live-
+    verify on the VPS: the FUTIDX trading-symbol format and the NSE-FnO int."""
     import csv
     import io
     import urllib.request
 
-    if (not _FNO_MASTER_CACHE.exists()
-            or time.time() - _FNO_MASTER_CACHE.stat().st_mtime > max_age_h * 3600):
+    if (not _IDX_FUT_MASTER_CACHE.exists()
+            or time.time() - _IDX_FUT_MASTER_CACHE.stat().st_mtime > max_age_h * 3600):
         raw = urllib.request.urlopen(_SCRIP_MASTER_URL, timeout=120).read() \
             .decode("utf-8", "replace")
         lines = raw.splitlines()
+        # NSE/BSE index-future rows only (SENSEX/BANKEX futures trade on BSE);
+        # "FUTIDX" gates to index futures, mirroring resolve_fno_universe's
+        # "FUTSTK" in ln idiom and keeping the cache tiny.
         keep = [lines[0]] + [ln for ln in lines[1:]
-                             if ln.startswith("NSE,") or ln.startswith("BSE,")]
-        _FNO_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+                             if (ln.startswith("NSE,") or ln.startswith("BSE,"))
+                             and "FUTIDX" in ln]
+        _IDX_FUT_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
     rows = list(csv.DictReader(io.StringIO(
-        _FNO_MASTER_CACHE.read_text(encoding="utf-8"))))
+        _IDX_FUT_MASTER_CACHE.read_text(encoding="utf-8"))))
     today = datetime.now(IST).strftime("%Y-%m-%d")
     return parse_index_futures(rows, INDEX_FUT_NAMES, today)
 

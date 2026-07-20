@@ -44,6 +44,8 @@ optionslab.service
 !deploy/optionslab.service
 dhan_config.json
 scrip_master_mcx.csv
+scrip_master_fno.csv
+scrip_master_idxfut.csv
 
 # generated / packaged artifacts
 app/static/
@@ -58,7 +60,7 @@ ui/
 *.key
 *.pem
 
-# local deploy target (real IP/key path) — never commit
+# local deploy target (real IP/key path) ï¿½ never commit
 deploy/push.local.ps1
 
 # research findings stay local (repo is public)

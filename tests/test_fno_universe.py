@@ -56,6 +56,62 @@ def test_symbol_without_future_is_absent():
     assert "INFY" not in uni
 
 
+_HDR = ("SEM_EXM_EXCH_ID,SEM_SEGMENT,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,"
+        "SEM_EXPIRY_CODE,SEM_TRADING_SYMBOL,SEM_LOT_UNITS,SEM_CUSTOM_SYMBOL,"
+        "SEM_EXPIRY_DATE,SEM_STRIKE_PRICE,SEM_OPTION_TYPE,SEM_TICK_SIZE,"
+        "SEM_EXPIRY_FLAG,SEM_EXCH_INSTRUMENT_TYPE,SEM_SERIES,SM_SYMBOL_NAME")
+# Far-future expiries so "non-expired" is true regardless of the test clock.
+_FAKE_MASTER = "\n".join([
+    _HDR,
+    "NSE,E,2885,EQUITY,0,RELIANCE,1,RELIANCE,,0,,0.05,,ES,EQ,RELIANCE",
+    "NSE,D,46376,FUTSTK,1,RELIANCE-Jul2099-FUT,500,RELIANCE JUL FUT,2099-07-31,0,,0.05,M,FS,,RELIANCE",
+    "NSE,D,35002,FUTIDX,2,NIFTY-Aug2099-FUT,75,NIFTY AUG FUT,2099-08-28,0,,0.05,M,FI,,NIFTY",
+    "NSE,D,35001,FUTIDX,1,NIFTY-Jul2099-FUT,75,NIFTY JUL FUT,2099-07-31,0,,0.05,M,FI,,NIFTY",
+    "BSE,D,824001,FUTIDX,1,SENSEX-Jul2099-FUT,20,SENSEX JUL FUT,2099-07-30,0,,0.05,M,FI,,SENSEX",
+])
+
+
+def _patch_master(monkeypatch, tmp_path):
+    """Point both caches at tmp and serve _FAKE_MASTER for every download."""
+    import urllib.request
+
+    class _Resp:
+        def read(self):
+            return _FAKE_MASTER.encode("utf-8")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(dc, "_FNO_MASTER_CACHE", tmp_path / "fno.csv")
+    monkeypatch.setattr(dc, "_IDX_FUT_MASTER_CACHE", tmp_path / "idxfut.csv")
+
+
+def test_scanner_cache_write_does_not_starve_index_futures(monkeypatch, tmp_path):
+    """Regression (2026-07-20 "[1] EMPTY — no FUTIDX rows matched"): the scanner
+    rewrites its master cache keeping FUTSTK/EQUITY only. If index-futures
+    resolution shared that file it would read zero FUTIDX rows. Separate caches
+    must keep both working no matter the order."""
+    _patch_master(monkeypatch, tmp_path)
+
+    # Scanner runs first and trims its cache to FUTSTK/EQUITY (drops FUTIDX)...
+    uni = dc.resolve_fno_universe(today=date(2026, 7, 16))
+    assert set(uni) == {"RELIANCE"}
+    assert "FUTIDX" not in (tmp_path / "fno.csv").read_text()
+
+    # ...index-futures resolution must STILL find its FUTIDX rows.
+    fut = dc.resolve_index_futures()
+    assert fut["NIFTY"]["security_id"] == 35001        # nearest month, not Aug
+    assert fut["SENSEX"]["security_id"] == 824001       # BSE index future kept
+    assert "FUTIDX" in (tmp_path / "idxfut.csv").read_text()
+
+
+def test_index_futures_cache_holds_only_futidx(monkeypatch, tmp_path):
+    """The dedicated cache is trimmed to FUTIDX rows — no equity/stock-future
+    bloat leaks in, and the scanner's separate cache is untouched."""
+    _patch_master(monkeypatch, tmp_path)
+    dc.resolve_index_futures()
+    body = (tmp_path / "idxfut.csv").read_text()
+    assert "FUTIDX" in body and "FUTSTK" not in body and "EQUITY" not in body
+    assert not (tmp_path / "fno.csv").exists()   # index resolve never wrote it
+
+
 def test_store_roundtrip():
     import threading
 
