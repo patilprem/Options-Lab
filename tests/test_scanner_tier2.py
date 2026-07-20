@@ -116,6 +116,48 @@ def test_liquidity_no_quotes():
     assert scanner.liquidity_screen(_cache(ov))["ok"] is False
 
 
+# --- tier2_once "did nothing" diagnostics -----------------------------------
+
+class _NullStore:
+    pass
+
+
+def _events(monkeypatch):
+    """Capture registry.record_event(level, cat, msg) tuples."""
+    import asyncio
+
+    from app.core import registry
+    seen = []
+    monkeypatch.setattr(registry, "record_event",
+                        lambda lvl, cat, msg: seen.append((lvl, cat, msg)))
+    return seen, asyncio
+
+
+def test_tier2_logs_empty_shortlist(monkeypatch):
+    """A quiet board (no stock clears the min move) must SAY it skipped, not go
+    silent — otherwise an all-Tier-1 scanner looks broken when it's just calm."""
+    seen, asyncio = _events(monkeypatch)
+    sc = scanner.StockScanner(_NullStore())
+    sc.metrics = {"AAA": {"price_change_pct": 0.05, "volume_surge": 1.0,
+                          "buildup": "neutral"}}          # sub-0.3% -> no shortlist
+    done = asyncio.run(sc.tier2_once(hub=None, loop=None))
+    assert done == 0
+    assert any("shortlist empty" in m for _l, _c, m in seen)
+
+
+def test_tier2_logs_shortlist_without_chain_cfg(monkeypatch):
+    """A real mover that can't resolve a cash-equity id is a gap worth a warn,
+    distinct from a quiet market."""
+    seen, asyncio = _events(monkeypatch)
+    sc = scanner.StockScanner(_NullStore())
+    sc.metrics = {"AAA": {"price_change_pct": 2.0, "volume_surge": 3.0,
+                          "buildup": "long_buildup", "range_pos": 0.9}}
+    sc._universe = {"AAA": {"future_security_id": 1, "spot_security_id": None}}
+    done = asyncio.run(sc.tier2_once(hub=None, loop=None))
+    assert done == 0
+    assert any(lvl == "warn" and "cash-equity id" in m for lvl, _c, m in seen)
+
+
 # --- OI shift ---------------------------------------------------------------
 
 def test_oi_shift_ranks_biggest_moves():
