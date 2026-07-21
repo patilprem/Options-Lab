@@ -355,7 +355,9 @@ function FragmentRow({ s, expanded, detail, onToggle }) {
   return (
     <>
       <tr onClick={onToggle} style={{ cursor: 'pointer', background: expanded ? 'var(--bg)' : 'transparent' }}>
-        <td style={{ ...cell, fontWeight: 700 }}>{s.symbol}{!s.deep_dived && <span style={{ color: 'var(--muted)', fontWeight: 400 }}> ·t1</span>}</td>
+        <td style={{ ...cell, fontWeight: 700 }}>{s.symbol}{s.deep_dived
+          ? <span style={{ color: 'var(--green)', fontWeight: 400 }}> ·t2</span>
+          : <span style={{ color: 'var(--muted)', fontWeight: 400 }}> ·t1</span>}</td>
         <td style={num}><ScoreBadge score={s.score} /></td>
         <td style={cell}><BiasTag bias={s.bias} /></td>
         <td style={cell}>{BUILDUP_LABEL[s.buildup] || '—'}</td>

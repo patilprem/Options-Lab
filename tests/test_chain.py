@@ -110,3 +110,64 @@ def test_quote_uses_chain_cache_then_falls_back():
                       expiry_kind=ExpiryKind.WEEKLY, lots=1)
     assert hub.quote("NIFTY", TS, leg_far) == "STORE_FALLBACK"
     assert store.calls == 1
+
+
+# --- _fetch_chain_ratelimited retry ------------------------------------------
+
+def test_fetch_chain_retries_once_on_transient_failure(monkeypatch):
+    """Regression (2026-07-21): Dhan intermittently returns a bare, message-
+    less failure for a ROTATING set of stocks (not the same names twice) —
+    a transient blip, not a per-symbol data problem. A single retry, spaced
+    by the same rate gate, should absorb it."""
+    import asyncio
+
+    from app.data import dhan_client
+
+    calls = {"n": 0}
+
+    def flaky_fetch(client, security_id, segment, expiry):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError({"error_code": None, "error_type": None,
+                                "error_message": None})
+        return {"last_price": 100, "oc": {}}
+
+    monkeypatch.setattr(dhan_client, "fetch_option_chain", flaky_fetch)
+    hub = MarketHub(_Store())
+    hub.CHAIN_MIN_INTERVAL = 0.0   # don't burn 3 real seconds on the retry wait
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        return await hub._fetch_chain_ratelimited(
+            client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
+            expiry="2026-07-31", loop=loop)
+
+    result = asyncio.run(run())
+    assert calls["n"] == 2                # failed once, succeeded on retry
+    assert result == {"last_price": 100, "oc": {}}
+
+
+def test_fetch_chain_raises_after_exhausting_retries(monkeypatch):
+    import asyncio
+
+    from app.data import dhan_client
+
+    def always_fails(client, security_id, segment, expiry):
+        raise RuntimeError({"error_code": None, "error_type": None,
+                            "error_message": None})
+
+    monkeypatch.setattr(dhan_client, "fetch_option_chain", always_fails)
+    hub = MarketHub(_Store())
+    hub.CHAIN_MIN_INTERVAL = 0.0
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        return await hub._fetch_chain_ratelimited(
+            client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
+            expiry="2026-07-31", loop=loop)
+
+    try:
+        asyncio.run(run())
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
