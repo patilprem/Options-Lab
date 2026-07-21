@@ -606,6 +606,18 @@ def _today_day_pnl(rec, ctx, today: str) -> tuple[float, int, list[dict]]:
     return day_pnl, n_open, t_rows
 
 
+def _today_realized(ctx, today: str, rows: list[dict]) -> float:
+    """Today's BOOKED P&L only — same reset-awareness as _today_day_pnl
+    (trust the live ctx once its own clock is on today, else fall back to a
+    persisted row) but with the unrealized mark on still-open positions
+    stripped out. Used for the equity/growth totals: those must move only
+    when a trade actually closes, never on a live quote tick."""
+    if ctx and ctx.now.date().isoformat() == today:
+        return round(ctx._realized_today, 2)
+    today_row = next((r for r in rows if r["trade_date"] == today), None)
+    return round(today_row["realized"] or 0.0, 2) if today_row else 0.0
+
+
 @portfolio_router.get("/portfolio/today")
 def portfolio_today():
     """Combined view across every deployed strategy: today's P&L / ROI,
@@ -650,9 +662,10 @@ def portfolio_today():
             "open_positions": len(open_rows), "trades_today": len(t_rows),
         })
     trades.sort(key=lambda t: t.get("ts", ""))
-    # Portfolio equity: EVERY strategy's allocation + its lifetime realized
-    # P&L (daily rows carry today's realized too once written), plus live
-    # unrealized on open positions. Spans all strategies incl. stopped ones
+    # Portfolio equity: EVERY strategy's allocation + its lifetime BOOKED
+    # (realized) P&L only — never the unrealized mark on positions still
+    # open, which swings with every live quote and must not move equity
+    # until a trade actually closes. Spans all strategies incl. stopped ones
     # so past losses never vanish from the equity card.
     equity = 0.0
     alloc_all = 0.0
@@ -661,8 +674,10 @@ def portfolio_today():
         if cap_i <= 0:
             continue
         alloc_all += cap_i
-        equity += cap_i + registry.cum_pnl(rec.id, "PAPER")
-    equity += sum(p["unrealized"] for p in positions)
+        ctx = runner.contexts.get(rec.id)
+        rows = registry.performance_rows(rec.id, "PAPER")
+        prior_realized = sum((r["realized"] or 0.0) for r in rows if r["trade_date"] != today)
+        equity += cap_i + prior_realized + _today_realized(ctx, today, rows)
     trades_sorted = trades
     return {
         "date": today,
