@@ -51,7 +51,7 @@ export default function PaperPanel({ id, onAdaptDecision }) {
 
   useEffect(() => {
     load()
-    const iv = setInterval(load, 3000)   // live while paper trading runs
+    const iv = setInterval(load, 2000)   // live while paper trading runs
     return () => clearInterval(iv)
   }, [load])
 
