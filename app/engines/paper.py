@@ -1138,7 +1138,7 @@ class PaperRunner:
     """Owns all live strategy tasks. The API layer calls play/pause/stop."""
 
     HEARTBEAT_SEC = 60
-    MTM_REFRESH_SEC = 5
+    MTM_REFRESH_SEC = 1   # cheap in-memory re-mark (no network) — see _mtm_refresh_loop
 
     def __init__(self, hub: MarketHub):
         self.hub = hub
@@ -1212,7 +1212,13 @@ class PaperRunner:
 
     async def _mtm_refresh_loop(self) -> None:
         """Keep displayed P&L moving with live prices between bar closes —
-        see PaperContext.refresh_mtm for why push_bar alone isn't enough."""
+        see PaperContext.refresh_mtm for why push_bar alone isn't enough.
+        Runs every MTM_REFRESH_SEC purely against the in-memory chain cache
+        (no network call — quote_position is a dict scan), so this is cheap
+        and can run at ~1s: it doesn't make quotes arrive faster (still
+        gated by Dhan's 3s-per-request option-chain limit, see
+        MarketHub.CHAIN_MIN_INTERVAL), it just removes any extra lag between
+        a fresh quote landing in _chain_cache and it reaching day_pnl/API."""
         while True:
             await asyncio.sleep(self.MTM_REFRESH_SEC)
             now = datetime.now(IST).replace(tzinfo=None)
