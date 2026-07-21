@@ -18,7 +18,7 @@ export default function PositionsView({ onStrategyClick }) {
       }
     }
     load()
-    const iv = setInterval(load, 10000)   // live dashboard — keep it fresh
+    const iv = setInterval(load, 2000)   // live dashboard — keep it fresh
     return () => clearInterval(iv)
   }, [])
 

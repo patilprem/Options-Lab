@@ -79,7 +79,7 @@ export default function App() {
   useEffect(() => {
     loadList()
     refreshPending()
-    const iv = setInterval(() => { loadList(); refreshPending() }, 15000)
+    const iv = setInterval(() => { loadList(); refreshPending() }, 3000)
     return () => clearInterval(iv)
   }, [loadList, refreshPending])
 

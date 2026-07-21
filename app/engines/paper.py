@@ -124,6 +124,14 @@ class MarketHub:
     # fetch yields every strike_offset for that expiry.
     CHAIN_TARGETS = (("WEEKLY", 0), ("WEEKLY", 1))
     CHAIN_MIN_INTERVAL = 3.0  # Dhan option-chain rate limit: 1 req / 3 s
+    # Requests share one global 3s gate, so every extra (underlying, expiry)
+    # fetch in a cycle directly slows down how often the one that actually
+    # backs live P&L (current-week, offset 0) gets refreshed. Almost all open
+    # positions/entries sit on offset 0; offset 1 ("next week", mainly for
+    # rollover) is polled every cycle for chain-only (MCX recorder) names but
+    # only every SECONDARY_EVERY-th cycle for deployed ones, so a deployed
+    # underlying's marks stay as close to real-time as the 3s gate allows.
+    SECONDARY_EVERY = 3
 
     def __init__(self, store):
         self.store = store
@@ -516,11 +524,15 @@ class MarketHub:
         loop = asyncio.get_running_loop()
         client = None
         warned: set[str] = set()
+        cycle = 0
         while True:
             for u in self._chain_order():
                 cfg = UNDERLYINGS.get(u)
                 if not cfg:
                     continue
+                targets = self.CHAIN_TARGETS
+                if u in self._wanted and cycle % self.SECONDARY_EVERY != 0:
+                    targets = tuple(t for t in targets if t[1] == 0)
                 # Per-underlying isolation: a failing chain (e.g. MCX) must
                 # never break the others' polling. On ANY failure the client is
                 # dropped and rebuilt for the next name — Dhan's error payloads
@@ -530,7 +542,7 @@ class MarketHub:
                 try:
                     if client is None:
                         client = await loop.run_in_executor(None, dhan_client.get_client)
-                    await self._poll_one_chain(u, cfg, client, loop, self.CHAIN_TARGETS)
+                    await self._poll_one_chain(u, cfg, client, loop, targets)
                     warned.discard(u)
                 except Exception as e:
                     if u not in warned:
@@ -540,6 +552,7 @@ class MarketHub:
                     client = None          # rebuild for the next name/cycle
                     await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
             await asyncio.sleep(1.0)
+            cycle += 1
 
     def _chain_order(self) -> list:
         """Underlyings to poll each cycle, DEPLOYED FIRST. Paper fills depend
@@ -1138,7 +1151,7 @@ class PaperRunner:
     """Owns all live strategy tasks. The API layer calls play/pause/stop."""
 
     HEARTBEAT_SEC = 60
-    MTM_REFRESH_SEC = 5
+    MTM_REFRESH_SEC = 1   # cheap in-memory re-mark (no network) — see _mtm_refresh_loop
 
     def __init__(self, hub: MarketHub):
         self.hub = hub
@@ -1212,7 +1225,13 @@ class PaperRunner:
 
     async def _mtm_refresh_loop(self) -> None:
         """Keep displayed P&L moving with live prices between bar closes —
-        see PaperContext.refresh_mtm for why push_bar alone isn't enough."""
+        see PaperContext.refresh_mtm for why push_bar alone isn't enough.
+        Runs every MTM_REFRESH_SEC purely against the in-memory chain cache
+        (no network call — quote_position is a dict scan), so this is cheap
+        and can run at ~1s: it doesn't make quotes arrive faster (still
+        gated by Dhan's 3s-per-request option-chain limit, see
+        MarketHub.CHAIN_MIN_INTERVAL), it just removes any extra lag between
+        a fresh quote landing in _chain_cache and it reaching day_pnl/API."""
         while True:
             await asyncio.sleep(self.MTM_REFRESH_SEC)
             now = datetime.now(IST).replace(tzinfo=None)

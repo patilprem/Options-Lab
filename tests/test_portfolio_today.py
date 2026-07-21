@@ -20,7 +20,9 @@ import pytest
 
 from app.api.strategies import portfolio_today, runner
 from app.core import registry
-from app.engines.paper import IST
+from app.core.contract import Bar, LegSpec, OptionType, Action, Position
+from app.data.store import SyntheticStore
+from app.engines.paper import IST, MarketHub, PaperContext
 
 
 @pytest.fixture
@@ -80,3 +82,52 @@ def test_date_is_ist_not_naive_local(rec):
     midnight offset on any server not clocked to IST."""
     data = portfolio_today()
     assert data["date"] == datetime.now(IST).date().isoformat()
+
+
+def _open_position(entry=100.0, mtm=250.0) -> Position:
+    leg = LegSpec(OptionType.CALL, Action.SELL)
+    pos = Position(id="p1", leg=leg, underlying="NIFTY", expiry=None,
+                   strike=22000, qty=-75, entry_price=entry,
+                   entry_ts=datetime.now(IST).replace(tzinfo=None))
+    pos.mark(mtm)   # big unrealized swing, nothing booked yet
+    return pos
+
+
+def test_equity_and_growth_ignore_unrealized_swings(rec):
+    """A large live mark-to-market swing on a still-open position must NOT
+    move the dashboard's equity/growth totals — those are the BOOKED view
+    and change only when a trade actually closes. (Today's P&L card is the
+    separate, deliberately-live view and is untouched by this guard.)"""
+    hub = MarketHub(SyntheticStore())
+    ctx = PaperContext(rec, "NIFTY", hub, interval=5)
+    today_ts = datetime.now(IST).replace(hour=10, minute=0, second=0,
+                                         microsecond=0, tzinfo=None)
+    ctx.push_bar(Bar(today_ts, 22000, 22010, 21990, 22005, 1000))
+    ctx._open.append(_open_position())   # ₹11,250 unrealized (short, price ran up)
+    runner.contexts[rec.id] = ctx
+
+    data = portfolio_today()
+
+    assert data["totals"]["equity"] == 500_000.0
+    assert data["totals"]["growth"] == 0.0
+    # the live P&L card is untouched — it still reflects the open mark
+    strat = next(s for s in data["strategies"] if s["id"] == rec.id)
+    assert strat["day_pnl"] != 0.0
+
+
+def test_equity_moves_once_a_trade_is_booked(rec):
+    """Once P&L is actually realized (a trade closed), equity/growth must
+    reflect it immediately — the guard is 'ignore unrealized', not 'ignore
+    today'."""
+    hub = MarketHub(SyntheticStore())
+    ctx = PaperContext(rec, "NIFTY", hub, interval=5)
+    today_ts = datetime.now(IST).replace(hour=10, minute=0, second=0,
+                                         microsecond=0, tzinfo=None)
+    ctx.push_bar(Bar(today_ts, 22000, 22010, 21990, 22005, 1000))
+    ctx._realized_today = 1250.0   # a real close, booked today
+    runner.contexts[rec.id] = ctx
+
+    data = portfolio_today()
+
+    assert data["totals"]["equity"] == 501_250.0
+    assert data["totals"]["growth"] == 1250.0
