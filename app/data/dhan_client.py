@@ -224,10 +224,17 @@ def parse_fno_universe(rows, today=None) -> dict:
         if exch != "NSE":
             continue
         inst = (r.get("SEM_INSTRUMENT_NAME") or "").strip()
-        sym = (r.get("SM_SYMBOL_NAME") or "").strip()
-        if not sym:   # fall back to the trading-symbol prefix ("RELIANCE-...")
-            ts = (r.get("SEM_TRADING_SYMBOL") or "").strip()
-            sym = ts.split("-")[0].strip() if ts else ""
+        # SM_SYMBOL_NAME is NOT a reliable join key across row types: real Dhan
+        # master data leaves it BLANK on FUTSTK rows (a "RELIANCE-Jul2026-FUT"
+        # row) but fills it with the full company name on EQUITY rows ("RELIANCE
+        # INDUSTRIES LTD") — joining on that field means spots{} and futs{} never
+        # share a key and every stock silently fails to pair with its cash-equity
+        # id (2026-07-20: Tier-2 shortlisted 15 movers, 0 resolved). Derive the
+        # ticker from SEM_TRADING_SYMBOL instead — for EQUITY it already IS the
+        # plain ticker ("RELIANCE"); for FUTSTK it's "RELIANCE-Jul2026-FUT", so
+        # split on "-" to strip the expiry/contract suffix.
+        ts = (r.get("SEM_TRADING_SYMBOL") or "").strip()
+        sym = ts.split("-")[0].strip() if ts else ""
         if not sym:
             continue
         sid = _to_int(r.get("SEM_SMST_SECURITY_ID"))
