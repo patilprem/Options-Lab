@@ -587,8 +587,14 @@ class MarketHub:
         self._expiries_cache[underlying] = (today, expiries)
         return expiries
 
-    async def _fetch_chain_ratelimited(self, client, cfg, expiry, loop):
+    async def _fetch_chain_ratelimited(self, client, cfg, expiry, loop, retries=1):
+        """Fetch one chain through the shared 3s gate. Dhan intermittently
+        returns a bare, message-less failure (2026-07-21: a rotating set of
+        stocks, not the same names twice, ~1-in-8 requests) that looks like a
+        transient network/server blip rather than a per-symbol data problem —
+        retry once, spaced by the same rate gate, before giving up."""
         from app.data import dhan_client
+        exc = None
         async with self._chain_gate:
             wait = self.CHAIN_MIN_INTERVAL - (time.monotonic() - self._last_chain_ts)
             if wait > 0:
@@ -597,8 +603,13 @@ class MarketHub:
                 return await loop.run_in_executor(
                     None, dhan_client.fetch_option_chain,
                     client, cfg["security_id"], cfg["segment"], expiry)
+            except Exception as e:
+                exc = e
             finally:
                 self._last_chain_ts = time.monotonic()
+        if retries > 0:
+            return await self._fetch_chain_ratelimited(client, cfg, expiry, loop, retries - 1)
+        raise exc
 
     def persist_chain_snapshots(self, store, underlyings=None) -> int:
         """Write the current cached chain quotes into option_bars (snapshot:
