@@ -220,6 +220,33 @@ def feed_status():
 data_router = APIRouter(tags=["data"])
 
 
+@data_router.get("/data/event_window_signals")
+def event_window_signals(date: str, underlying: str = "NIFTY,BANKNIFTY",
+                         events: str = "12:30,13:00", before: int = 20,
+                         after: int = 10, sample: int = 5, top_strikes: int = 8,
+                         max_age_min: int = 10):
+    """OI/PCR/IV/max-pain/index-bias report around given timestamps — "did the
+    options data see this move coming". Reuses the app's already-open store
+    connection (_store), so it works while the app is live; the CLI twin
+    (scripts/event_window_signals.py) can only read this when the app process
+    isn't running, since DuckDB's file lock is exclusive against a second
+    process, readers included. `date`=YYYY-MM-DD, `underlying`/`events` are
+    comma-separated (events as HH:MM, 24h IST)."""
+    from fastapi.responses import PlainTextResponse
+    from app.engines.event_signals import build_report
+    day = datetime.strptime(date, "%Y-%m-%d").date()
+    unds = [u.strip() for u in underlying.split(",") if u.strip()]
+    evs = [e.strip() for e in events.split(",") if e.strip()]
+    parts = []
+    for u in unds:
+        for ev in evs:
+            hh, mm = (int(x) for x in ev.split(":"))
+            event_dt = datetime.combine(day, datetime.min.time()).replace(hour=hh, minute=mm)
+            parts.append(build_report(_store, u, event_dt, before, after,
+                                      sample, top_strikes, max_age_min))
+    return PlainTextResponse("\n".join(parts))
+
+
 @data_router.get("/data/coverage")
 def data_coverage():
     """Backtestable date range per underlying, straight from the store."""
