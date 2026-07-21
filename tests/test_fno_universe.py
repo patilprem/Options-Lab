@@ -50,10 +50,28 @@ def test_expired_contracts_dropped_but_future_ones_kept():
 
 def test_symbol_without_future_is_absent():
     # An equity with no live FUTSTK row should not produce a universe entry.
-    rows = [r for r in _rows() if not (r["SM_SYMBOL_NAME"] == "INFY"
+    rows = [r for r in _rows() if not (r["SEM_TRADING_SYMBOL"].startswith("INFY")
                                        and r["SEM_INSTRUMENT_NAME"] == "FUTSTK")]
     uni = dc.parse_fno_universe(rows, today=TODAY)
     assert "INFY" not in uni
+
+
+def test_spot_pairing_ignores_sm_symbol_name():
+    """Regression (2026-07-20 "15 shortlisted but none resolved a cash-equity
+    id"): real Dhan master data leaves SM_SYMBOL_NAME BLANK on FUTSTK rows but
+    fills it with the full company name on EQUITY rows ("RELIANCE INDUSTRIES
+    LTD" vs "RELIANCE"). Joining spots{}/futs{} on that field means they never
+    share a key. The fixture mirrors that real quirk; parse_fno_universe must
+    key off SEM_TRADING_SYMBOL instead, which is consistent across both."""
+    rows = _rows()
+    eq_row = next(r for r in rows if r["SEM_TRADING_SYMBOL"] == "RELIANCE"
+                  and r["SEM_INSTRUMENT_NAME"] == "EQUITY")
+    fut_row = next(r for r in rows if r["SEM_INSTRUMENT_NAME"] == "FUTSTK"
+                   and r["SEM_TRADING_SYMBOL"].startswith("RELIANCE-Jul"))
+    assert eq_row["SM_SYMBOL_NAME"] != "RELIANCE"   # full company name, not the ticker
+    assert fut_row["SM_SYMBOL_NAME"] == ""           # blank on futures rows
+    uni = dc.parse_fno_universe(rows, today=TODAY)
+    assert uni["RELIANCE"]["spot_security_id"] == 2885
 
 
 _HDR = ("SEM_EXM_EXCH_ID,SEM_SEGMENT,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,"
