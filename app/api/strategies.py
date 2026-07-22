@@ -604,6 +604,36 @@ def trade_history(from_date: str = "", to_date: str = "",
     return {"count": len(rows), "trades": rows}
 
 
+@trades_router.get("/trades/daily")
+def trade_history_daily(from_date: str = "", to_date: str = "",
+                        strategy_id: str = "", mode: str = ""):
+    """Per-day brief for the History view: net P&L (with and without
+    charges) + trade count for every day that actually had a fill in range —
+    the individual fills for a given day are a separate /trades call scoped
+    to that single date (from_date=to_date=that day), so expanding a day's
+    'show trades' costs nothing until the user asks for it. Net P&L here is
+    REALIZED only (booked/closed trades) — a still-open position's live mark
+    belongs on the dashboard, not a historical day's record."""
+    rows = registry.all_trades(from_date, to_date, strategy_id, mode)
+    by_date: dict[str, int] = {}
+    for t in rows:
+        d = str(t.get("ts", ""))[:10]
+        if d:
+            by_date[d] = by_date.get(d, 0) + 1
+    pnl_by_date = registry.daily_pnl_summary(from_date, to_date, strategy_id, mode)
+    dates = sorted(set(by_date) | set(pnl_by_date), reverse=True)
+    days = []
+    for d in dates:
+        pnl = pnl_by_date.get(d, {"realized": 0.0, "fees": 0.0})
+        net = round(pnl["realized"], 2)
+        fees = round(pnl["fees"], 2)
+        days.append({
+            "date": d, "trades": by_date.get(d, 0),
+            "net_pnl": net, "gross_pnl": round(net + fees, 2), "fees": fees,
+        })
+    return {"days": days}
+
+
 portfolio_router = APIRouter(tags=["portfolio"])
 
 
