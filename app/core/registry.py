@@ -625,7 +625,8 @@ def wipe_paper_day(strategy_id: str, day: str) -> dict:
 
 
 def recompute_equity_chain(strategy_id: str, mode: str = "PAPER",
-                           from_date: Optional[str] = None) -> int:
+                           from_date: Optional[str] = None,
+                           capital: Optional[float] = None) -> int:
     """Rebuild equity_eod for every daily_pnl row on/after `from_date` (the
     whole ledger when omitted) by re-chaining stored realized+unrealized day
     over day from the last untouched close (or allocated_capital on day 1).
@@ -633,11 +634,18 @@ def recompute_equity_chain(strategy_id: str, mode: str = "PAPER",
     wipe_paper_day/manual_trade only rewrite the one day they touch; any
     later row was chained off that day's *old* equity_eod and goes stale.
     Call this after either to keep the curve consistent, or directly as a
-    one-off repair for drift left over from before this existed."""
+    one-off repair for drift left over from before this existed.
+
+    `capital` overrides the allocated_capital lookup (which only exists for
+    real Strategy records in the `strategies` table) — pass it explicitly
+    for engines like the scanner auto-trader that aren't Strategy rows."""
     with _conn() as c:
-        cap_row = c.execute("SELECT allocated_capital FROM strategies WHERE id=?",
-                            (strategy_id,)).fetchone()
-        cap = cap_row[0] if cap_row else 0.0
+        if capital is not None:
+            cap = capital
+        else:
+            cap_row = c.execute("SELECT allocated_capital FROM strategies WHERE id=?",
+                                (strategy_id,)).fetchone()
+            cap = cap_row[0] if cap_row else 0.0
         if from_date is None:
             base, start = cap, ""
         else:
@@ -657,6 +665,45 @@ def recompute_equity_chain(strategy_id: str, mode: str = "PAPER",
                       "AND mode=? AND trade_date=?",
                       (base, strategy_id, mode.upper(), trade_date))
         return len(rows)
+
+
+def repair_scanner_daily_pnl(capital: float) -> int:
+    """One-time repair for daily_pnl rows written before ScannerTrader's
+    day-accumulation fix (step() was overwriting each day's row with only
+    the LAST cycle's incremental realized/fees instead of the day's running
+    total). scanner_journal's 'exit' records were never affected by that bug
+    — each one already carries the true realized P&L (net of both legs'
+    fees) for its round trip — so they're the source of truth to recompute
+    from. Recomputes realized/fees per exit date, preserves each day's
+    already-stored `unrealized` (a live-only figure the journal doesn't
+    track), then re-chains equity_eod from `capital`. Safe to re-run
+    (idempotent) — always recomputes from the full journal, never adds onto
+    a previous repair. Returns the number of days repaired."""
+    from app.engines.scanner_trader import STRATEGY_ID as SCANNER_ID
+    by_date: dict[str, dict] = {}
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ts, data_json FROM scanner_journal WHERE kind='exit'").fetchall()
+        existing_unrealized = {
+            r["trade_date"]: r["unrealized"] or 0.0
+            for r in c.execute(
+                "SELECT trade_date, unrealized FROM daily_pnl "
+                "WHERE strategy_id=? AND mode='PAPER'", (SCANNER_ID,)).fetchall()}
+    for ts, data_json in rows:
+        d = str(ts)[:10]
+        try:
+            data = json.loads(data_json)
+        except (TypeError, ValueError):
+            continue
+        bucket = by_date.setdefault(d, {"realized": 0.0, "fees": 0.0})
+        bucket["realized"] += data.get("realized") or 0.0
+        bucket["fees"] += (data.get("entry_fees") or 0.0) + (data.get("exit_fees") or 0.0)
+    for d, totals in by_date.items():
+        save_day(SCANNER_ID, "PAPER", d, round(totals["realized"], 2),
+                round(existing_unrealized.get(d, 0.0), 2),
+                round(totals["fees"], 2), 0.0)   # equity_eod re-chained below
+    recompute_equity_chain(SCANNER_ID, "PAPER", capital=capital)
+    return len(by_date)
 
 
 def count_trades(mode: str = "PAPER") -> int:

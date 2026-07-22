@@ -1678,6 +1678,21 @@ def scanner_trades():
     return scanner_engine.trader.snapshot()
 
 
+@scanner_router.post("/scanner/recompute_daily_pnl")
+def scanner_recompute_daily_pnl():
+    """One-time repair for daily_pnl rows written before ScannerTrader's
+    day-accumulation fix (each day's row was being overwritten with only the
+    last cycle's incremental realized/fees, not the day's running total).
+    Recomputes every day's realized/fees from scanner_journal (never
+    affected by that bug) and re-chains equity_eod. Safe to re-run."""
+    cap = scanner_engine.trader._cfg().capital
+    n = registry.repair_scanner_daily_pnl(cap)
+    registry.record_event(
+        "info", "engine",
+        f"scanner daily_pnl repaired from journal: {n} day(s) recomputed")
+    return {"days_repaired": n}
+
+
 @scanner_router.get("/scanner/{symbol}")
 def scanner_detail(symbol: str):
     """Tier-1 + Tier-2 detail for one symbol."""
