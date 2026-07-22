@@ -247,6 +247,24 @@ def event_window_signals(date: str, underlying: str = "NIFTY,BANKNIFTY",
     return PlainTextResponse("\n".join(parts))
 
 
+@data_router.get("/data/pivot_confluence")
+def pivot_confluence(at: str = "", underlying: str = "NIFTY,BANKNIFTY",
+                     tolerance_pct: float = 0.15, lookback_days: int = 5,
+                     max_age_min: int = 10):
+    """Multi-index pivot-confluence report — is every given underlying
+    currently near one of its own prior-session pivot levels (P/S1-3/R1-3 +
+    CPR), with what candle/chain/index-bias confirmation. Reuses the app's
+    already-open store connection (like /data/event_window_signals). `at` is
+    'YYYY-MM-DD HH:MM' (IST, default: now); `underlying` is comma-separated."""
+    from fastapi.responses import PlainTextResponse
+    from app.engines.confluence import build_confluence_report
+    asof = datetime.strptime(at, "%Y-%m-%d %H:%M") if at else datetime.now()
+    unds = [u.strip() for u in underlying.split(",") if u.strip()]
+    text = build_confluence_report(_store, unds, asof, tolerance_pct,
+                                   lookback_days, max_age_min)
+    return PlainTextResponse(text)
+
+
 @data_router.get("/data/coverage")
 def data_coverage():
     """Backtestable date range per underlying, straight from the store."""
