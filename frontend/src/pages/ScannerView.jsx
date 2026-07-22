@@ -224,37 +224,9 @@ export default function ScannerView({ showToast, onDecision }) {
               {book.enabled ? 'Stop' : 'Start (paper)'}
             </button>
           </div>
-          {book.positions?.length > 0 && (
-            <div style={{ overflowX: 'auto', marginTop: 8 }}>
-              <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 560 }}>
-                <thead>
-                  <tr>
-                    <th style={th}>Symbol</th><th style={th}>Side</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Lots</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Entry</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Mark</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Stop</th>
-                    <th style={{ ...th, textAlign: 'right' }}>P&L</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {book.positions.map(p => (
-                    <tr key={p.symbol}>
-                      <td style={{ ...cell, fontWeight: 700 }}>{p.symbol}</td>
-                      <td style={cell}><BiasTag bias={p.bias} /></td>
-                      <td style={num}>{p.lots}</td>
-                      <td style={num}>{p.entry?.toFixed(2)}</td>
-                      <td style={num}>{p.mtm?.toFixed(2)}</td>
-                      <td style={{ ...num, color: 'var(--muted)' }}>{p.stop?.toFixed(2)}</td>
-                      <td style={{ ...num, color: p.unrealized >= 0 ? 'var(--green)' : 'var(--red)' }}>
-                        {p.unrealized >= 0 ? '+' : ''}{Math.round(p.unrealized).toLocaleString('en-IN')}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+          {/* the open-positions table lives on the Dashboard now (unified
+              with Strategy positions there) — this panel is just the
+              on/off control + aggregate P&L, not a duplicate listing */}
         </div>
       )}
 

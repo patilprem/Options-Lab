@@ -87,9 +87,13 @@ def test_daily_pnl_summary_empty_mode_means_all_modes(db):
     assert summary["2026-07-22"]["fees"] == pytest.approx(7.0)
 
 
-def test_trades_daily_endpoint_merges_counts_and_pnl(db):
+def test_trades_daily_endpoint_counts_closed_round_trips_not_fill_legs(db):
+    """The trade count is CLOSED round trips (one journal 'exit' row), not
+    raw fill legs — a round trip books 2 fills (entry + exit) but must count
+    as 1 trade, matching the day's Net P&L (also realized/closed-only)."""
     from app.api.strategies import trade_history_daily
 
+    # one round trip = 2 fills in the blotter, but only 1 journal exit
     db.record_trade("SCANNER", "PAPER", {
         "ts": "2026-07-22 10:30:00", "contract": "RELIANCE 1250 CALL",
         "side": "BUY", "qty": 500, "price": 20.0, "fees": 30.0,
@@ -100,20 +104,58 @@ def test_trades_daily_endpoint_merges_counts_and_pnl(db):
         "side": "SELL", "qty": 500, "price": 22.0, "fees": 45.0,
         "margin": 0.0, "reason": "setup_gone", "tag": "scanner:CE",
     })
+    db.record_journal("RELIANCE", "entry", {"entry_price": 20.0}, ts="2026-07-22T10:30:00")
+    db.record_journal("RELIANCE", "exit", {
+        "entry_price": 20.0, "exit_price": 22.0, "realized": 925.0,
+    }, ts="2026-07-22T11:00:00")
     db.save_paper_day("SCANNER", "2026-07-22", 925.0, 0.0, 75.0, 500_925.0)
     db.save_paper_day("SCANNER", "2026-07-21", 300.0, 0.0, 40.0, 500_300.0)
-    # yesterday had a booked round trip but (say) its fills predate the
-    # window we query for trade-count purposes below
+    # yesterday had a booked round trip but (say) it predates the window we
+    # query for trade-count purposes below
 
     data = trade_history_daily(from_date="2026-07-22", to_date="2026-07-22")
 
     assert len(data["days"]) == 1
     day = data["days"][0]
     assert day["date"] == "2026-07-22"
-    assert day["trades"] == 2
+    assert day["trades"] == 1                  # ONE round trip, not 2 fills
     assert day["net_pnl"] == 925.0
     assert day["fees"] == 75.0
     assert day["gross_pnl"] == pytest.approx(1000.0)   # net + fees
+
+
+def test_trades_daily_endpoint_counts_strategy_round_trips_too(db):
+    """Same closed-round-trip counting for a Strategy, sourced from
+    strategy_journal rather than scanner_journal."""
+    from app.api.strategies import trade_history_daily
+
+    r = db.create("PBK Confluence", "x")
+    db.record_strategy_journal(r.id, "exit", {
+        "underlying": "NIFTY", "entry_price": 100.0, "exit_price": 80.0,
+        "pnl": 1500.0,
+    }, ts="2026-07-22T10:15:00")
+    db.save_paper_day(r.id, "2026-07-22", 1500.0, 0.0, 45.0, 501_500.0)
+
+    data = trade_history_daily(from_date="2026-07-22", to_date="2026-07-22")
+
+    day = next(d for d in data["days"] if d["date"] == "2026-07-22")
+    assert day["trades"] == 1
+    assert day["net_pnl"] == 1500.0
+
+
+def test_trades_daily_endpoint_live_mode_excludes_journal_counts(db):
+    """scanner_journal/strategy_journal are paper-only — a mode=LIVE query
+    must not count PAPER round trips as if they were LIVE trades."""
+    from app.api.strategies import trade_history_daily
+
+    db.record_journal("RELIANCE", "exit", {"realized": 925.0}, ts="2026-07-22T11:00:00")
+    db.save_day("SCANNER", "LIVE", "2026-07-22", 500.0, 0.0, 10.0, 0.0)
+
+    data = trade_history_daily(from_date="2026-07-22", to_date="2026-07-22", mode="LIVE")
+
+    day = next(d for d in data["days"] if d["date"] == "2026-07-22")
+    assert day["trades"] == 0
+    assert day["net_pnl"] == 500.0             # the daily_pnl side still works
 
 
 def test_trades_daily_endpoint_sorted_newest_first(db):
