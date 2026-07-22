@@ -14,6 +14,20 @@ note — SSH to the VPS, dump `scanner_journal` rows for the day (see chat
 history for the exact `sqlite3`/python3 one-liners), pull the day's option
 charts from the broker app, then do the write-up below.
 
+**2026-07-23+:** `entry_ctx` now also logs `opt_dist_to_vwap_pct` and
+`opt_dist_to_lower_bb_pct` — the option premium's own distance from its
+session VWAP / lower Bollinger band at entry, computed from an in-memory
+rolling window of the scanner's own premium samples (`ScannerTrader._prem_hist`
+in `app/engines/scanner_trader.py`). Same field for CE and PE: the strategy
+only ever buys premium, so "cheap relative to its own session" is the same
+test either way. Both are `null` until that (symbol, side) has built up
+enough same-day samples (Bollinger needs ≥5). This turns the "chased an
+already-extended move" read from earlier days from a chart-eyeball into a
+number — check whether entries with a strongly negative `opt_dist_to_vwap_pct`
+/ `opt_dist_to_lower_bb_pct` (bought below their own recent average) win more
+than entries near/above it, across enough days to clear the ≥3-distinct-day
+persistence bar before treating it as a real signal.
+
 ---
 
 ## 2026-07-22

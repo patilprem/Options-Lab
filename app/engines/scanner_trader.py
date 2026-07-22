@@ -36,9 +36,10 @@ import json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone, timedelta
 
-from app.core.contract import Action
+from app.core.contract import Action, Bar
 from app.engines import adaptation as A
 from app.engines import fills as F
+from app.engines import indicators as IND
 
 IST = timezone(timedelta(hours=5, minutes=30))
 STRATEGY_ID = "SCANNER"          # ledger id for all scanner-trader rows
@@ -165,6 +166,10 @@ class ScannerTrader:
         self.book: dict[str, SPosition] = {}
         self._fee = F.FeeConfig()
         self._slip = F.SlippageConfig()
+        self._prem_hist: dict[tuple[str, str], list] = {}  # (symbol, side) ->
+                                     # session's own premium samples (in-memory
+                                     # only, for entry_ctx's VWAP/BB distance —
+                                     # not used by any trading decision)
         self._restore()
 
     # -- config / persistence ------------------------------------------------
@@ -230,6 +235,22 @@ class ScannerTrader:
         u = scanner._universe.get(symbol) or {}
         return int(u.get("lot_size") or 0)
 
+    def _sample_premium(self, sym: str, side: str, ts, ltp) -> None:
+        """Append this cycle's option LTP to the (symbol, side)'s in-session
+        rolling window, feeding VWAP/Bollinger for entry_ctx. Cleared across a
+        date change so a restart or an overnight hold never mixes sessions."""
+        if not ltp:
+            return
+        store = getattr(self, "_prem_hist", None)
+        if store is None:
+            store = self._prem_hist = {}
+        hist = store.setdefault((sym, side), [])
+        if hist and hist[-1].ts.date() != ts.date():
+            hist.clear()
+        hist.append(Bar(ts=ts, open=ltp, high=ltp, low=ltp, close=ltp))
+        if len(hist) > 60:
+            del hist[:-60]
+
     # -- the step ------------------------------------------------------------
     def step(self, hub, scanner) -> None:
         """One management pass: mark + exit open positions, then open new ones.
@@ -250,6 +271,7 @@ class ScannerTrader:
             if q is None or not q.ltp:
                 continue                               # no live quote -> hold
             premium = q.ltp
+            self._sample_premium(sym, pos.side, now, premium)
             pos.mtm = premium
             pos.high_water = max(pos.high_water, premium)
             pos.low_water = min(pos.low_water or premium, premium)
@@ -288,6 +310,7 @@ class ScannerTrader:
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
                 continue
+            self._sample_premium(sym, side, now, q.ltp or q.ask)
             lot_size = self._lot_size(scanner, sym)
             probe = F.fill_live(q, Action.BUY, lot_size or 1, self._fee, self._slip)
             lots = size_lots(cfg, probe.price, lot_size)
@@ -330,8 +353,7 @@ class ScannerTrader:
         self._persist()
 
     # -- journal (rich per-trade log for strategy improvement) ---------------
-    @staticmethod
-    def _entry_context(scanner, sym: str, sc: dict, q, cfg: TradeConfig) -> dict:
+    def _entry_context(self, scanner, sym: str, sc: dict, q, cfg: TradeConfig) -> dict:
         """Everything known about the setup at the moment of entry — Tier-1
         read, Tier-2 chain state, the option's own quote, and the config that
         sized the trade. Journaled now and again with the exit, so every
@@ -341,6 +363,20 @@ class ScannerTrader:
         spread_pct = None
         if q.bid and q.ask and (q.bid + q.ask) > 0:
             spread_pct = round((q.ask - q.bid) / ((q.ask + q.bid) / 2) * 100, 2)
+        # How "cheap" is this premium relative to its OWN session so far —
+        # we only ever buy premium (CE or PE), so a good entry is one near
+        # the option's own VWAP / lower Bollinger band, same test both ways.
+        hist = (getattr(self, "_prem_hist", None) or {}).get(
+            (sym, self._side_for(sc.get("bias"))), [])
+        vwap_val = IND.vwap(hist) if hist else None
+        bb = IND.bollinger(hist, n=min(20, len(hist))) if len(hist) >= 5 else None
+        opt_ltp = q.ltp
+        opt_dist_to_vwap_pct = (
+            round((opt_ltp - vwap_val) / vwap_val * 100, 2)
+            if vwap_val and opt_ltp else None)
+        opt_dist_to_lower_bb_pct = (
+            round((opt_ltp - bb["lower"]) / bb["lower"] * 100, 2)
+            if bb and bb["lower"] and opt_ltp else None)
         return {
             "score": sc.get("score"), "reasons": sc.get("reasons") or [],
             "buildup": sc.get("buildup") or t1.get("buildup"),
@@ -355,6 +391,8 @@ class ScannerTrader:
             "opt_bid": q.bid, "opt_ask": q.ask, "opt_ltp": q.ltp,
             "opt_iv": getattr(q, "iv", None), "opt_oi": q.oi,
             "opt_spread_pct": spread_pct,
+            "opt_dist_to_vwap_pct": opt_dist_to_vwap_pct,
+            "opt_dist_to_lower_bb_pct": opt_dist_to_lower_bb_pct,
             "expiry": str(q.expiry) if getattr(q, "expiry", None) else None,
             "config": {"entry_score": cfg.entry_score,
                        "exit_score": cfg.exit_score,
