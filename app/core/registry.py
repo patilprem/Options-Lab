@@ -471,42 +471,6 @@ def daily_pnl_summary(from_date: str = "", to_date: str = "",
             for r in rows}
 
 
-def journal_exit_counts_by_date(from_date: str = "", to_date: str = "") -> dict[str, int]:
-    """Count of scanner_journal 'exit' rows (CLOSED round trips) per calendar
-    day. Backs the History view's day-brief trade count — deliberately
-    closed-round-trips, not raw fill legs (the trades blotter has 2 rows per
-    round trip: one entry, one exit), so it lines up with the day's Net P&L,
-    which is realized/closed-only too."""
-    q = "SELECT substr(ts,1,10) AS d, COUNT(*) AS n FROM scanner_journal WHERE kind='exit'"
-    args: list = []
-    if from_date:
-        q += " AND substr(ts,1,10)>=?"; args.append(from_date)
-    if to_date:
-        q += " AND substr(ts,1,10)<=?"; args.append(to_date)
-    q += " GROUP BY d"
-    with _conn() as c:
-        rows = c.execute(q, args).fetchall()
-    return {r["d"]: r["n"] for r in rows}
-
-
-def strategy_journal_exit_counts_by_date(from_date: str = "", to_date: str = "",
-                                         strategy_id: str = "") -> dict[str, int]:
-    """Same as journal_exit_counts_by_date() but for Strategy round trips
-    (strategy_journal); `ts` there is the exit time too."""
-    q = "SELECT substr(ts,1,10) AS d, COUNT(*) AS n FROM strategy_journal WHERE kind='exit'"
-    args: list = []
-    if strategy_id:
-        q += " AND strategy_id=?"; args.append(strategy_id)
-    if from_date:
-        q += " AND substr(ts,1,10)>=?"; args.append(from_date)
-    if to_date:
-        q += " AND substr(ts,1,10)<=?"; args.append(to_date)
-    q += " GROUP BY d"
-    with _conn() as c:
-        rows = c.execute(q, args).fetchall()
-    return {r["d"]: r["n"] for r in rows}
-
-
 def save_paper_state(strategy_id: str, snapshot: dict) -> None:
     """Persist a paper strategy's live session snapshot (open positions +
     margin/P&L) so a process restart can recover it. One row per strategy."""
