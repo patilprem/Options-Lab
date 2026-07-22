@@ -762,7 +762,9 @@ def _scanner_today(today: str) -> dict | None:
         open_rows.append({
             "strategy": "Scanner Auto-Trader", "strategy_id": SCANNER_ID,
             "symbol": pos.symbol,
-            "tag": pos.bias, "type": pos.side, "strike": pos.strike,
+            "tag": pos.bias, "type": pos.side,
+            "action": "BUY",   # the scanner only ever buys premium, never writes
+            "strike": pos.strike,
             "expiry": pos.entry_ctx.get("expiry"), "qty": pos.qty_units,
             "entry": pos.entry_price, "mtm": pos.mtm,
             "stop_loss": round(_scanner_stop(pos.entry_price, pos.high_water, cfg), 2),
@@ -818,6 +820,7 @@ def portfolio_today():
                     "strategy": rec.name, "strategy_id": rec.id,
                     "symbol": p.underlying,
                     "tag": p.tag, "type": p.leg.option_type.value,
+                    "action": "BUY" if p.qty >= 0 else "SELL",
                     "strike": p.strike, "expiry": str(p.expiry), "qty": p.qty,
                     "entry": p.entry_price, "mtm": p.mtm_price,
                     "stop_loss": p.stop_loss, "target": p.target,

@@ -68,9 +68,10 @@ export default function PositionsView({ onStrategyClick }) {
             <tr>
               <th>Source</th>
               <th>Contract</th>
+              <th>Type</th>
               <th>Qty</th>
               <th>Entry</th>
-              <th>MTM</th>
+              <th>LTP</th>
               <th>Unrealized</th>
               <th>Stop</th>
             </tr>
@@ -82,8 +83,10 @@ export default function PositionsView({ onStrategyClick }) {
                   onClick={() => drillable(p) && onStrategyClick(p.strategy_id)}>
                 <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{p.strategy}</td>
                 <td style={{ textAlign: 'left' }}>
-                  {p.symbol ? `${p.symbol} ` : ''}{p.strike ? `${p.strike} ` : ''}{p.type}{p.tag ? ` · ${p.tag}` : ''}
+                  {p.symbol ? `${p.symbol} ` : ''}{p.strike ? `${p.strike} ` : ''}{p.type}
+                  {p.tag && p.tag !== 'CE' && p.tag !== 'PE' ? ` · ${p.tag}` : ''}
                 </td>
+                <td className={p.action === 'SELL' ? 'neg' : 'pos'}>{p.action}</td>
                 <td>{p.qty}</td>
                 <td>{fmt2(p.entry)}</td>
                 <td>{fmt2(p.mtm)}</td>
