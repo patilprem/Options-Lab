@@ -30,6 +30,7 @@ export default function PositionsView({ onStrategyClick }) {
   const openRows = pf.open_positions || []
   // newest first — a live trades feed reads top-down
   const tradeRows = [...(pf.trades_today || [])].reverse()
+  const closedRows = [...(pf.closed_positions_today || [])].reverse()
   // the scanner auto-trader isn't a Strategy record, so it has no detail
   // page to drill into — only strategy-sourced rows are clickable
   const drillable = row => row.strategy_id && row.strategy_id !== SCANNER_ID
@@ -97,6 +98,47 @@ export default function PositionsView({ onStrategyClick }) {
         </table></div>
       ) : (
         <div className="empty">No open positions right now.</div>
+      )}
+
+      <h3 className="sec">Closed positions (today)</h3>
+      {closedRows.length ? (
+        <div className="table-scroll"><table>
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Contract</th>
+              <th>Qty</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>P&amp;L</th>
+              <th>Held</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            {closedRows.map((c, i) => (
+              <tr key={`${c.strategy_id}-${c.exit_ts}-${i}`}
+                  style={drillable(c) ? { cursor: 'pointer' } : undefined}
+                  onClick={() => drillable(c) && onStrategyClick(c.strategy_id)}>
+                <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{c.strategy}</td>
+                <td style={{ textAlign: 'left' }}>
+                  {c.symbol ? `${c.symbol} ` : ''}{c.strike ? `${c.strike} ` : ''}{c.side || ''}
+                </td>
+                <td>{c.qty}</td>
+                <td>{fmt2(c.entry_price)}</td>
+                <td>{fmt2(c.exit_price)}</td>
+                <td className={pnlCls(c.pnl)}>{sign(c.pnl)}</td>
+                <td>{c.held_minutes != null ? `${c.held_minutes}m` : '—'}</td>
+                <td style={{ textAlign: 'left' }}>{c.reason || ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      ) : (
+        <div className="empty">
+          Nothing closed yet today — once a position exits, it moves here
+          with its entry/exit price and realized P&amp;L.
+        </div>
       )}
 
       <h3 className="sec">Today's trades</h3>

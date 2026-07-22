@@ -257,3 +257,69 @@ def test_scanner_position_carries_overnight_into_a_new_day(scanner_db):
     # and never the still-open position's unrealized swing
     assert data["totals"]["equity"] == pytest.approx(500_000.0 + 1500.0)
     assert data["totals"]["growth"] == pytest.approx(1500.0)
+
+
+# --- closed round trips (entry/exit price + realized P&L, not just fills) --
+
+def test_scanner_closed_trade_appears_with_entry_exit_and_pnl(scanner_db):
+    """A position that CLOSED today must show up in closed_positions_today
+    with its entry/exit price and realized P&L — the raw fills blotter
+    (trades_today) only carries individual BUY/SELL legs, not a round trip,
+    so this is a separate, richer view sourced from scanner_journal."""
+    today = _today()
+    registry.set_setting("scanner_trade", "on")
+    registry.record_journal("DRREDDY", "entry", {
+        "bias": "PE", "side": "PUT", "strike": 1170.0, "qty_units": 625,
+        "entry_price": 19.75,
+    }, ts=f"{today}T14:13:04")
+    registry.record_journal("DRREDDY", "exit", {
+        "bias": "PE", "side": "PUT", "strike": 1170.0, "qty_units": 625,
+        "entry_ts": f"{today}T14:13:04", "entry_price": 19.75,
+        "exit_price": 21.20, "reason": "setup_gone", "realized": 781.25,
+        "held_minutes": 52,
+    }, ts=f"{today}T15:05:04")
+
+    data = portfolio_today()
+
+    closed = data["closed_positions_today"]
+    assert len(closed) == 1
+    c = closed[0]
+    assert c["strategy_id"] == SCANNER_ID and c["strategy"] == "Scanner Auto-Trader"
+    assert c["symbol"] == "DRREDDY"
+    assert c["entry_price"] == 19.75 and c["exit_price"] == 21.20
+    assert c["pnl"] == 781.25
+    assert c["reason"] == "setup_gone"
+    assert c["held_minutes"] == 52
+
+
+def test_scanner_closed_trade_excludes_other_days(scanner_db):
+    registry.set_setting("scanner_trade", "on")
+    registry.record_journal("DRREDDY", "exit", {
+        "entry_price": 19.75, "exit_price": 21.20, "realized": 781.25,
+    }, ts="2026-01-01T15:05:04")
+
+    data = portfolio_today()
+
+    assert data["closed_positions_today"] == []
+
+
+def test_strategy_closed_trade_appears_with_entry_exit_and_pnl(rec):
+    """Same shape/behavior for a Strategy's closed round trip, sourced from
+    strategy_journal (build_round_trip) rather than the fills blotter."""
+    today = _today()
+    registry.record_strategy_journal(rec.id, "exit", {
+        "tag": "leg1", "underlying": "NIFTY", "strike": 25100,
+        "qty": -75, "entry_price": 100.0, "exit_price": 80.0,
+        "entry_ts": f"{today} 09:30", "exit_ts": f"{today} 10:15",
+        "pnl": 1500.0, "fees": 45.0, "exit_reason": "target",
+        "held_minutes": 45,
+    }, ts=f"{today}T10:15:00")
+
+    data = portfolio_today()
+
+    closed = data["closed_positions_today"]
+    assert len(closed) == 1
+    c = closed[0]
+    assert c["strategy_id"] == rec.id and c["strategy"] == rec.name
+    assert c["symbol"] == "NIFTY" and c["pnl"] == 1500.0
+    assert c["reason"] == "target"
