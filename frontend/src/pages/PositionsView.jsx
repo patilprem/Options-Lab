@@ -4,7 +4,6 @@ const fmt = n => '₹' + (n || 0).toLocaleString('en-IN', { maximumFractionDigit
 const fmt2 = n => '₹' + (n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const pnlCls = n => n >= 0 ? 'pos' : 'neg'
 const sign = n => (n >= 0 ? '+' : '') + fmt2(n)
-const timeOf = ts => (ts || '').slice(11, 19) || ts
 const SCANNER_ID = 'SCANNER'
 
 export default function PositionsView({ onStrategyClick }) {
@@ -28,8 +27,6 @@ export default function PositionsView({ onStrategyClick }) {
 
   const t = pf.totals
   const openRows = pf.open_positions || []
-  // newest first — a live trades feed reads top-down
-  const tradeRows = [...(pf.trades_today || [])].reverse()
   const closedRows = [...(pf.closed_positions_today || [])].reverse()
   // the scanner auto-trader isn't a Strategy record, so it has no detail
   // page to drill into — only strategy-sourced rows are clickable
@@ -58,9 +55,9 @@ export default function PositionsView({ onStrategyClick }) {
           <div className="sub">on {fmt(t.margin_used)} deployed</div>
         </div>
         <div className="metric">
-          <div className="k">Open / trades</div>
-          <div className="v">{t.open_positions} / {t.trades}</div>
-          <div className="sub">positions / fills today — strategies + scanner</div>
+          <div className="k">Open / closed</div>
+          <div className="v">{t.open_positions} / {closedRows.length}</div>
+          <div className="sub">positions / closed today — strategies + scanner</div>
         </div>
       </div>
 
@@ -138,43 +135,6 @@ export default function PositionsView({ onStrategyClick }) {
         <div className="empty">
           Nothing closed yet today — once a position exits, it moves here
           with its entry/exit price and realized P&amp;L.
-        </div>
-      )}
-
-      <h3 className="sec">Today's trades</h3>
-      {tradeRows.length ? (
-        <div className="table-scroll"><table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Source</th>
-              <th>Contract</th>
-              <th>Side</th>
-              <th>Qty</th>
-              <th>Price</th>
-              <th>Reason</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tradeRows.map((tr, i) => (
-              <tr key={`${tr.strategy_id}-${tr.ts}-${i}`}
-                  style={drillable(tr) ? { cursor: 'pointer' } : undefined}
-                  onClick={() => drillable(tr) && onStrategyClick(tr.strategy_id)}>
-                <td>{timeOf(tr.ts)}</td>
-                <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{tr.strategy}</td>
-                <td style={{ textAlign: 'left' }}>{tr.contract}</td>
-                <td className={tr.side === 'BUY' ? 'pos' : 'neg'}>{tr.side}</td>
-                <td>{tr.qty}</td>
-                <td>{fmt2(tr.price)}</td>
-                <td>{tr.reason}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table></div>
-      ) : (
-        <div className="empty">
-          Nothing traded yet today — fills from both strategies and the
-          scanner auto-trader will show up here.
         </div>
       )}
     </div>
