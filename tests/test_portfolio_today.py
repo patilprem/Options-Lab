@@ -114,6 +114,9 @@ def test_equity_and_growth_ignore_unrealized_swings(rec):
     # the live P&L card is untouched — it still reflects the open mark
     strat = next(s for s in data["strategies"] if s["id"] == rec.id)
     assert strat["day_pnl"] != 0.0
+    # the underlying/company name must be on the row — the frontend has
+    # nothing to render a "Contract" column with otherwise
+    assert data["open_positions"][0]["symbol"] == "NIFTY"
 
 
 def test_equity_moves_once_a_trade_is_booked(rec):
@@ -184,6 +187,10 @@ def test_scanner_on_joins_totals_positions_and_trades(scanner_db):
     assert scan["day_pnl"] == pytest.approx(3000.0)
     assert any(p["strategy_id"] == SCANNER_ID for p in data["open_positions"])
     assert any(t["strategy_id"] == SCANNER_ID for t in data["trades_today"])
+    # the underlying/company name (RELIANCE) must be on the row — the
+    # frontend has nothing to render a "Contract" column with otherwise
+    scan_pos = next(p for p in data["open_positions"] if p["strategy_id"] == SCANNER_ID)
+    assert scan_pos["symbol"] == "RELIANCE"
     assert data["totals"]["allocated_capital"] == pytest.approx(500_000.0)
     # equity includes the scanner's capital + BOOKED realized only — the open
     # position's unrealized swing must not move it (same guard as Strategies)

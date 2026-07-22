@@ -715,6 +715,7 @@ def _scanner_today(today: str) -> dict | None:
         unrealized += pnl
         open_rows.append({
             "strategy": "Scanner Auto-Trader", "strategy_id": SCANNER_ID,
+            "symbol": pos.symbol,
             "tag": pos.bias, "type": pos.side, "strike": pos.strike,
             "expiry": pos.entry_ctx.get("expiry"), "qty": pos.qty_units,
             "entry": pos.entry_price, "mtm": pos.mtm,
@@ -767,6 +768,7 @@ def portfolio_today():
             for p in ctx.positions:
                 open_rows.append({
                     "strategy": rec.name, "strategy_id": rec.id,
+                    "symbol": p.underlying,
                     "tag": p.tag, "type": p.leg.option_type.value,
                     "strike": p.strike, "expiry": str(p.expiry), "qty": p.qty,
                     "entry": p.entry_price, "mtm": p.mtm_price,

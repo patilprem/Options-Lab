@@ -84,7 +84,7 @@ export default function PositionsView({ onStrategyClick }) {
                   onClick={() => drillable(p) && onStrategyClick(p.strategy_id)}>
                 <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{p.strategy}</td>
                 <td style={{ textAlign: 'left' }}>
-                  {p.strike ? `${p.strike} ` : ''}{p.type}{p.tag ? ` · ${p.tag}` : ''}
+                  {p.symbol ? `${p.symbol} ` : ''}{p.strike ? `${p.strike} ` : ''}{p.type}{p.tag ? ` · ${p.tag}` : ''}
                 </td>
                 <td>{p.qty}</td>
                 <td>{fmt2(p.entry)}</td>
