@@ -49,7 +49,7 @@ live_runner = LiveRunner(hub)   # M8: LIVE ledgers only; paper is untouched
 scanner_engine = StockScanner(_store)   # F2/F3 FNO stock scanner (shared store)
 from app.engines import signals as _signals
 _signals.register(scanner_engine)       # F6: ctx.signal() reads from the scanner
-from app.engines.scanner_trader import ScannerTrader
+from app.engines.scanner_trader import ScannerTrader, STRATEGY_ID as SCANNER_ID, effective_stop as _scanner_stop
 scanner_engine.trader = ScannerTrader(_store)   # positional paper book on screener picks
 
 
@@ -663,10 +663,61 @@ def _today_realized(ctx, today: str, rows: list[dict]) -> float:
     return round(today_row["realized"] or 0.0, 2) if today_row else 0.0
 
 
+def _scanner_today(today: str) -> dict | None:
+    """Same-shape read of the scanner auto-trader's today — gated on the
+    scanner_trade toggle, so its allocated capital and P&L only join the
+    portfolio totals while the scanner is actually turned on (never a stale
+    contribution from a toggled-off engine). Mirrors _today_day_pnl's
+    reset-awareness: daily_pnl naturally has no row for a new calendar date,
+    so 'today' always starts fresh with no separate reset logic needed."""
+    if registry.setting("scanner_trade", "off") != "on":
+        return None
+    trader = scanner_engine.trader
+    cfg = trader._cfg()
+    cap = cfg.capital or 0.0
+    t_rows = registry.trades_for(SCANNER_ID, today, "PAPER")
+    perf_rows = registry.performance_rows(SCANNER_ID, "PAPER")
+    today_row = next((r for r in perf_rows if r["trade_date"] == today), None)
+    open_rows = []
+    unrealized = 0.0
+    for pos in trader.book.values():
+        pnl = (pos.mtm - pos.entry_price) * pos.qty_units
+        unrealized += pnl
+        open_rows.append({
+            "strategy": "Scanner Auto-Trader", "strategy_id": SCANNER_ID,
+            "tag": pos.bias, "type": pos.side, "strike": pos.strike,
+            "expiry": pos.entry_ctx.get("expiry"), "qty": pos.qty_units,
+            "entry": pos.entry_price, "mtm": pos.mtm,
+            "stop_loss": round(_scanner_stop(pos.entry_price, pos.high_water, cfg), 2),
+            "target": None, "margin": 0.0,
+            "unrealized": round(pnl, 2),
+        })
+    day_realized = (today_row["realized"] or 0.0) if today_row else 0.0
+    day_pnl = round(day_realized + unrealized, 2)
+    if not t_rows and not open_rows:
+        day_pnl = 0.0
+    prior_realized = sum((r["realized"] or 0.0) for r in perf_rows if r["trade_date"] != today)
+    return {
+        "cap": cap, "day_pnl": day_pnl, "open_rows": open_rows,
+        "trades": [{**t, "strategy": "Scanner Auto-Trader", "strategy_id": SCANNER_ID}
+                   for t in t_rows],
+        "equity_contrib": cap + prior_realized + day_realized,
+        "summary": {
+            "id": SCANNER_ID, "name": "Scanner Auto-Trader", "state": "RUNNING",
+            "allocated_capital": cap, "day_pnl": day_pnl,
+            "day_roi_pct": round(100 * day_pnl / cap, 2) if cap > 0 else 0.0,
+            "open_positions": len(open_rows), "trades_today": len(t_rows),
+        },
+    }
+
+
 @portfolio_router.get("/portfolio/today")
 def portfolio_today():
-    """Combined view across every deployed strategy: today's P&L / ROI,
-    all open positions, all trades — plus a per-strategy breakdown."""
+    """Combined view across every deployed strategy PLUS the scanner
+    auto-trader (when it's on): today's P&L / ROI, all open positions, all
+    trades — plus a per-engine breakdown. The scanner's allocated capital and
+    realized P&L join `equity`/`growth` the same way a Strategy's do, gated
+    on the `scanner_trade` toggle."""
     today = _ist_today()
     strategies_out, positions, trades = [], [], []
     total_alloc = total_day = total_margin = 0.0
@@ -706,6 +757,13 @@ def portfolio_today():
             "day_roi_pct": round(100 * day_pnl / cap, 2) if cap > 0 else 0.0,
             "open_positions": len(open_rows), "trades_today": len(t_rows),
         })
+    scanner_today = _scanner_today(today)
+    if scanner_today:
+        positions.extend(scanner_today["open_rows"])
+        trades.extend(scanner_today["trades"])
+        total_alloc += scanner_today["cap"]
+        total_day += scanner_today["day_pnl"]
+        strategies_out.append(scanner_today["summary"])
     trades.sort(key=lambda t: t.get("ts", ""))
     # Portfolio equity: EVERY strategy's allocation + its lifetime BOOKED
     # (realized) P&L only — never the unrealized mark on positions still
@@ -723,6 +781,9 @@ def portfolio_today():
         rows = registry.performance_rows(rec.id, "PAPER")
         prior_realized = sum((r["realized"] or 0.0) for r in rows if r["trade_date"] != today)
         equity += cap_i + prior_realized + _today_realized(ctx, today, rows)
+    if scanner_today:
+        alloc_all += scanner_today["cap"]
+        equity += scanner_today["equity_contrib"]
     trades_sorted = trades
     return {
         "date": today,

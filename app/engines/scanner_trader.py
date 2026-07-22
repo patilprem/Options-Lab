@@ -252,19 +252,26 @@ class ScannerTrader:
             del hist[:-60]
 
     # -- the step ------------------------------------------------------------
-    def step(self, hub, scanner) -> None:
-        """One management pass: mark + exit open positions, then open new ones.
-        Called each Tier-2 cycle. No-op unless `scanner_trade` is on."""
+    def manage(self, hub, scanner) -> set[str]:
+        """Mark every open position to its live premium and exit whichever
+        fires a stop/target/score-decay/max-hold rule, then book the day's
+        P&L. Pure position upkeep — no shortlist/discovery, no new entries —
+        so unlike the full step() (which needs a freshly re-ranked shortlist
+        and only runs once per ~5-min Tier-2 cycle), this is safe and cheap to
+        call far more often. scanner.py's run_position_mtm() does exactly
+        that for just the held symbols, so today's P&L and stop/target checks
+        stay close to real time between full Tier-2 cycles instead of lagging
+        up to TIER2_INTERVAL behind. Returns the set of symbols exited this
+        call. No-op (returns empty) unless `scanner_trade` is on."""
         from app.core import registry
         if registry.setting("scanner_trade", "off") != "on":
-            return
+            return set()
         cfg = self._cfg()
         now = datetime.now(IST).replace(tzinfo=None)
         day = now.date()
         realized_today = 0.0
         fees_today = 0.0
 
-        # 1) manage / exit existing positions
         exited: set[str] = set()
         for sym, pos in list(self.book.items()):
             q = self._atm_quote(hub, sym, pos.side)
@@ -300,10 +307,58 @@ class ScannerTrader:
         if exited:
             self._daily_reflection(cfg, day)
 
-        # 2) open new positions from the freshest ranked setups. Names exited
+        self._book_day(cfg, day, realized_today, fees_today)
+        return exited
+
+    def _book_day(self, cfg: TradeConfig, day, realized_delta: float,
+                  fees_delta: float) -> None:
+        """Accumulate this call's fresh realized/fees onto today's daily_pnl
+        row and persist the open book. daily_pnl is a single row per
+        (strategy, mode, date) that a save REPLACES wholesale — so, since
+        manage() may now be called many times a day (the fast loop) as well
+        as once per Tier-2 cycle, we must read today's existing row back and
+        add this call's delta onto it, never overwrite it with just this
+        call's delta. Reading from the DB (rather than tracking a running
+        total in memory) means the day's total is correct even across a
+        mid-day restart, and — since a new calendar date simply has no row
+        yet — the day's total starts fresh at midnight with no separate
+        reset logic needed."""
+        from app.core import registry
+        unrealized = sum((p.mtm - p.entry_price) * p.qty_units
+                         for p in self.book.values())
+        if realized_delta or fees_delta or self.book:
+            today_iso = day.isoformat()
+            today_row = next((r for r in registry.performance_rows(STRATEGY_ID, "PAPER")
+                              if r["trade_date"] == today_iso), None)
+            realized_day_total = (today_row["realized"] if today_row else 0.0) or 0.0
+            realized_day_total += realized_delta
+            fees_day_total = (today_row["fees"] if today_row else 0.0) or 0.0
+            fees_day_total += fees_delta
+            cum = registry.cum_pnl(STRATEGY_ID) + realized_delta
+            equity = cfg.capital + cum + unrealized
+            registry.save_paper_day(STRATEGY_ID, today_iso,
+                                    realized_day_total, unrealized, fees_day_total, equity)
+        self._persist()
+
+    def step(self, hub, scanner) -> None:
+        """Full cycle: manage() (mark/exit, see above) then open new positions
+        from the freshest ranked setups. New entries need a fresh shortlist/
+        score, so — unlike manage() — this can't run any faster than the
+        Tier-2 cycle that computed them (~every TIER2_INTERVAL). No-op unless
+        `scanner_trade` is on."""
+        from app.core import registry
+        if registry.setting("scanner_trade", "off") != "on":
+            return
+        cfg = self._cfg()
+        now = datetime.now(IST).replace(tzinfo=None)
+        day = now.date()
+        exited = self.manage(hub, scanner)
+
+        # open new positions from the freshest ranked setups. Names exited
         # THIS cycle are held out so a trailing-stop exit can't immediately
         # re-buy the same name on the still-elevated score (churn).
         held = set(self.book) | exited
+        fees_today = 0.0
         for sym in pick_entries(scanner.ranked_scores(), held, cfg):
             sc = scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
@@ -335,22 +390,15 @@ class ScannerTrader:
                 f"(score {pos.entry_score})")
             held.add(sym)
 
-        # 2b) step the shadow challenger (if a config trial is running) on the
+        # step the shadow challenger (if a config trial is running) on the
         # same scores/quotes — virtual book, never touches the ledger
         try:
             self._step_challenger(hub, scanner, now, day)
         except Exception:
             pass
 
-        # 3) book the day's P&L + persist the open book
-        unrealized = sum((p.mtm - p.entry_price) * p.qty_units
-                         for p in self.book.values())
-        if realized_today or fees_today or self.book:
-            cum = registry.cum_pnl(STRATEGY_ID) + realized_today
-            equity = cfg.capital + cum + unrealized
-            registry.save_paper_day(STRATEGY_ID, day.isoformat(),
-                                    realized_today, unrealized, fees_today, equity)
-        self._persist()
+        # book the entries' fees too (manage() already booked the exits above)
+        self._book_day(cfg, day, 0.0, fees_today)
 
     # -- journal (rich per-trade log for strategy improvement) ---------------
     def _entry_context(self, scanner, sym: str, sc: dict, q, cfg: TradeConfig) -> dict:

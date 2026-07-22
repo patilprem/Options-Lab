@@ -158,6 +158,72 @@ def test_tier2_logs_shortlist_without_chain_cfg(monkeypatch):
     assert any(lvl == "warn" and "cash-equity id" in m for lvl, _c, m in seen)
 
 
+# --- position_mtm_once: the fast, held-positions-only mark/exit loop --------
+# (the guard/skip paths, matching the tier2_once diagnostics above — the
+# "successfully polled a held symbol" happy path is thin async glue wired the
+# same way tier2_once's own happy path is, and isn't separately unit tested
+# either, to avoid mutating the shared dhan_client.UNDERLYINGS registry.)
+
+def _iso_registry(tmp_path, monkeypatch):
+    from app.core import registry
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "test.db")
+    registry.init_db()
+    return registry
+
+
+def test_position_mtm_noop_without_a_trader(tmp_path, monkeypatch):
+    import asyncio
+    _iso_registry(tmp_path, monkeypatch)
+    sc = scanner.StockScanner(_NullStore())
+    sc.trader = None
+    assert asyncio.run(sc.position_mtm_once(hub=None, loop=None)) == 0
+
+
+def test_position_mtm_noop_when_scanner_trade_off(tmp_path, monkeypatch):
+    import asyncio
+
+    class _Trader:
+        def held_symbols(self):
+            return ["AAA"]        # would be non-empty if the guard didn't fire
+
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "off")
+    sc = scanner.StockScanner(_NullStore())
+    sc.trader = _Trader()
+    assert asyncio.run(sc.position_mtm_once(hub=None, loop=None)) == 0
+
+
+def test_position_mtm_noop_when_nothing_open(tmp_path, monkeypatch):
+    import asyncio
+
+    class _Trader:
+        def held_symbols(self):
+            return []
+
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    sc = scanner.StockScanner(_NullStore())
+    sc.trader = _Trader()
+    assert asyncio.run(sc.position_mtm_once(hub=None, loop=None)) == 0
+
+
+def test_position_mtm_skips_oversized_book_with_a_warning(tmp_path, monkeypatch):
+    """A book bigger than MAX_FAST_MTM_SYMBOLS must not queue that many
+    requests onto the shared rate gate every ~20s — it skips (falling back to
+    the next Tier-2 cycle) and says why, rather than silently over-polling."""
+    class _Trader:
+        def held_symbols(self):
+            return [f"S{i}" for i in range(scanner.MAX_FAST_MTM_SYMBOLS + 1)]
+
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    seen, asyncio = _events(monkeypatch)
+    sc = scanner.StockScanner(_NullStore())
+    sc.trader = _Trader()
+    assert asyncio.run(sc.position_mtm_once(hub=None, loop=None)) == 0
+    assert any(lvl == "warn" and "exceeds" in m for lvl, _c, m in seen)
+
+
 # --- OI shift ---------------------------------------------------------------
 
 def test_oi_shift_ranks_biggest_moves():
