@@ -608,18 +608,24 @@ def trade_history(from_date: str = "", to_date: str = "",
 def trade_history_daily(from_date: str = "", to_date: str = "",
                         strategy_id: str = "", mode: str = ""):
     """Per-day brief for the History view: net P&L (with and without
-    charges) + trade count for every day that actually had a fill in range —
-    the individual fills for a given day are a separate /trades call scoped
-    to that single date (from_date=to_date=that day), so expanding a day's
-    'show trades' costs nothing until the user asks for it. Net P&L here is
-    REALIZED only (booked/closed trades) — a still-open position's live mark
-    belongs on the dashboard, not a historical day's record."""
-    rows = registry.all_trades(from_date, to_date, strategy_id, mode)
+    charges) + trade count for every day that actually had a CLOSED round
+    trip in range — the individual fills for a given day are a separate
+    /trades call scoped to that single date (from_date=to_date=that day), so
+    expanding a day's 'show trades' costs nothing until the user asks for it.
+    Both net P&L and the trade count are REALIZED/CLOSED only (booked round
+    trips, from each engine's journal) — a still-open position's live mark
+    belongs on the dashboard, not a historical day's record, and counting
+    raw fill legs would double-count every round trip (one entry + one exit
+    row each)."""
     by_date: dict[str, int] = {}
-    for t in rows:
-        d = str(t.get("ts", ""))[:10]
-        if d:
-            by_date[d] = by_date.get(d, 0) + 1
+    if mode != "LIVE":   # scanner_journal/strategy_journal are paper-only
+        if not strategy_id or strategy_id == SCANNER_ID:
+            for d, n in registry.journal_exit_counts_by_date(from_date, to_date).items():
+                by_date[d] = by_date.get(d, 0) + n
+        if strategy_id != SCANNER_ID:
+            for d, n in registry.strategy_journal_exit_counts_by_date(
+                    from_date, to_date, strategy_id).items():
+                by_date[d] = by_date.get(d, 0) + n
     pnl_by_date = registry.daily_pnl_summary(from_date, to_date, strategy_id, mode)
     dates = sorted(set(by_date) | set(pnl_by_date), reverse=True)
     days = []
