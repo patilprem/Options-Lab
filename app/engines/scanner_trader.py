@@ -36,9 +36,10 @@ import json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone, timedelta
 
-from app.core.contract import Action
+from app.core.contract import Action, Bar
 from app.engines import adaptation as A
 from app.engines import fills as F
+from app.engines import indicators as IND
 
 IST = timezone(timedelta(hours=5, minutes=30))
 STRATEGY_ID = "SCANNER"          # ledger id for all scanner-trader rows
@@ -165,6 +166,10 @@ class ScannerTrader:
         self.book: dict[str, SPosition] = {}
         self._fee = F.FeeConfig()
         self._slip = F.SlippageConfig()
+        self._prem_hist: dict[tuple[str, str], list] = {}  # (symbol, side) ->
+                                     # session's own premium samples (in-memory
+                                     # only, for entry_ctx's VWAP/BB distance —
+                                     # not used by any trading decision)
         self._restore()
 
     # -- config / persistence ------------------------------------------------
@@ -230,26 +235,50 @@ class ScannerTrader:
         u = scanner._universe.get(symbol) or {}
         return int(u.get("lot_size") or 0)
 
+    def _sample_premium(self, sym: str, side: str, ts, ltp) -> None:
+        """Append this cycle's option LTP to the (symbol, side)'s in-session
+        rolling window, feeding VWAP/Bollinger for entry_ctx. Cleared across a
+        date change so a restart or an overnight hold never mixes sessions."""
+        if not ltp:
+            return
+        store = getattr(self, "_prem_hist", None)
+        if store is None:
+            store = self._prem_hist = {}
+        hist = store.setdefault((sym, side), [])
+        if hist and hist[-1].ts.date() != ts.date():
+            hist.clear()
+        hist.append(Bar(ts=ts, open=ltp, high=ltp, low=ltp, close=ltp))
+        if len(hist) > 60:
+            del hist[:-60]
+
     # -- the step ------------------------------------------------------------
-    def step(self, hub, scanner) -> None:
-        """One management pass: mark + exit open positions, then open new ones.
-        Called each Tier-2 cycle. No-op unless `scanner_trade` is on."""
+    def manage(self, hub, scanner) -> set[str]:
+        """Mark every open position to its live premium and exit whichever
+        fires a stop/target/score-decay/max-hold rule, then book the day's
+        P&L. Pure position upkeep — no shortlist/discovery, no new entries —
+        so unlike the full step() (which needs a freshly re-ranked shortlist
+        and only runs once per ~5-min Tier-2 cycle), this is safe and cheap to
+        call far more often. scanner.py's run_position_mtm() does exactly
+        that for just the held symbols, so today's P&L and stop/target checks
+        stay close to real time between full Tier-2 cycles instead of lagging
+        up to TIER2_INTERVAL behind. Returns the set of symbols exited this
+        call. No-op (returns empty) unless `scanner_trade` is on."""
         from app.core import registry
         if registry.setting("scanner_trade", "off") != "on":
-            return
+            return set()
         cfg = self._cfg()
         now = datetime.now(IST).replace(tzinfo=None)
         day = now.date()
         realized_today = 0.0
         fees_today = 0.0
 
-        # 1) manage / exit existing positions
         exited: set[str] = set()
         for sym, pos in list(self.book.items()):
             q = self._atm_quote(hub, sym, pos.side)
             if q is None or not q.ltp:
                 continue                               # no live quote -> hold
             premium = q.ltp
+            self._sample_premium(sym, pos.side, now, premium)
             pos.mtm = premium
             pos.high_water = max(pos.high_water, premium)
             pos.low_water = min(pos.low_water or premium, premium)
@@ -278,16 +307,65 @@ class ScannerTrader:
         if exited:
             self._daily_reflection(cfg, day)
 
-        # 2) open new positions from the freshest ranked setups. Names exited
+        self._book_day(cfg, day, realized_today, fees_today)
+        return exited
+
+    def _book_day(self, cfg: TradeConfig, day, realized_delta: float,
+                  fees_delta: float) -> None:
+        """Accumulate this call's fresh realized/fees onto today's daily_pnl
+        row and persist the open book. daily_pnl is a single row per
+        (strategy, mode, date) that a save REPLACES wholesale — so, since
+        manage() may now be called many times a day (the fast loop) as well
+        as once per Tier-2 cycle, we must read today's existing row back and
+        add this call's delta onto it, never overwrite it with just this
+        call's delta. Reading from the DB (rather than tracking a running
+        total in memory) means the day's total is correct even across a
+        mid-day restart, and — since a new calendar date simply has no row
+        yet — the day's total starts fresh at midnight with no separate
+        reset logic needed."""
+        from app.core import registry
+        unrealized = sum((p.mtm - p.entry_price) * p.qty_units
+                         for p in self.book.values())
+        if realized_delta or fees_delta or self.book:
+            today_iso = day.isoformat()
+            today_row = next((r for r in registry.performance_rows(STRATEGY_ID, "PAPER")
+                              if r["trade_date"] == today_iso), None)
+            realized_day_total = (today_row["realized"] if today_row else 0.0) or 0.0
+            realized_day_total += realized_delta
+            fees_day_total = (today_row["fees"] if today_row else 0.0) or 0.0
+            fees_day_total += fees_delta
+            cum = registry.cum_pnl(STRATEGY_ID) + realized_delta
+            equity = cfg.capital + cum + unrealized
+            registry.save_paper_day(STRATEGY_ID, today_iso,
+                                    realized_day_total, unrealized, fees_day_total, equity)
+        self._persist()
+
+    def step(self, hub, scanner) -> None:
+        """Full cycle: manage() (mark/exit, see above) then open new positions
+        from the freshest ranked setups. New entries need a fresh shortlist/
+        score, so — unlike manage() — this can't run any faster than the
+        Tier-2 cycle that computed them (~every TIER2_INTERVAL). No-op unless
+        `scanner_trade` is on."""
+        from app.core import registry
+        if registry.setting("scanner_trade", "off") != "on":
+            return
+        cfg = self._cfg()
+        now = datetime.now(IST).replace(tzinfo=None)
+        day = now.date()
+        exited = self.manage(hub, scanner)
+
+        # open new positions from the freshest ranked setups. Names exited
         # THIS cycle are held out so a trailing-stop exit can't immediately
         # re-buy the same name on the still-elevated score (churn).
         held = set(self.book) | exited
+        fees_today = 0.0
         for sym in pick_entries(scanner.ranked_scores(), held, cfg):
             sc = scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
                 continue
+            self._sample_premium(sym, side, now, q.ltp or q.ask)
             lot_size = self._lot_size(scanner, sym)
             probe = F.fill_live(q, Action.BUY, lot_size or 1, self._fee, self._slip)
             lots = size_lots(cfg, probe.price, lot_size)
@@ -312,26 +390,18 @@ class ScannerTrader:
                 f"(score {pos.entry_score})")
             held.add(sym)
 
-        # 2b) step the shadow challenger (if a config trial is running) on the
+        # step the shadow challenger (if a config trial is running) on the
         # same scores/quotes — virtual book, never touches the ledger
         try:
             self._step_challenger(hub, scanner, now, day)
         except Exception:
             pass
 
-        # 3) book the day's P&L + persist the open book
-        unrealized = sum((p.mtm - p.entry_price) * p.qty_units
-                         for p in self.book.values())
-        if realized_today or fees_today or self.book:
-            cum = registry.cum_pnl(STRATEGY_ID) + realized_today
-            equity = cfg.capital + cum + unrealized
-            registry.save_paper_day(STRATEGY_ID, day.isoformat(),
-                                    realized_today, unrealized, fees_today, equity)
-        self._persist()
+        # book the entries' fees too (manage() already booked the exits above)
+        self._book_day(cfg, day, 0.0, fees_today)
 
     # -- journal (rich per-trade log for strategy improvement) ---------------
-    @staticmethod
-    def _entry_context(scanner, sym: str, sc: dict, q, cfg: TradeConfig) -> dict:
+    def _entry_context(self, scanner, sym: str, sc: dict, q, cfg: TradeConfig) -> dict:
         """Everything known about the setup at the moment of entry — Tier-1
         read, Tier-2 chain state, the option's own quote, and the config that
         sized the trade. Journaled now and again with the exit, so every
@@ -341,6 +411,20 @@ class ScannerTrader:
         spread_pct = None
         if q.bid and q.ask and (q.bid + q.ask) > 0:
             spread_pct = round((q.ask - q.bid) / ((q.ask + q.bid) / 2) * 100, 2)
+        # How "cheap" is this premium relative to its OWN session so far —
+        # we only ever buy premium (CE or PE), so a good entry is one near
+        # the option's own VWAP / lower Bollinger band, same test both ways.
+        hist = (getattr(self, "_prem_hist", None) or {}).get(
+            (sym, self._side_for(sc.get("bias"))), [])
+        vwap_val = IND.vwap(hist) if hist else None
+        bb = IND.bollinger(hist, n=min(20, len(hist))) if len(hist) >= 5 else None
+        opt_ltp = q.ltp
+        opt_dist_to_vwap_pct = (
+            round((opt_ltp - vwap_val) / vwap_val * 100, 2)
+            if vwap_val and opt_ltp else None)
+        opt_dist_to_lower_bb_pct = (
+            round((opt_ltp - bb["lower"]) / bb["lower"] * 100, 2)
+            if bb and bb["lower"] and opt_ltp else None)
         return {
             "score": sc.get("score"), "reasons": sc.get("reasons") or [],
             "buildup": sc.get("buildup") or t1.get("buildup"),
@@ -355,6 +439,8 @@ class ScannerTrader:
             "opt_bid": q.bid, "opt_ask": q.ask, "opt_ltp": q.ltp,
             "opt_iv": getattr(q, "iv", None), "opt_oi": q.oi,
             "opt_spread_pct": spread_pct,
+            "opt_dist_to_vwap_pct": opt_dist_to_vwap_pct,
+            "opt_dist_to_lower_bb_pct": opt_dist_to_lower_bb_pct,
             "expiry": str(q.expiry) if getattr(q, "expiry", None) else None,
             "config": {"entry_score": cfg.entry_score,
                        "exit_score": cfg.exit_score,

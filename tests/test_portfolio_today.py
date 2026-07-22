@@ -18,11 +18,12 @@ from datetime import datetime
 
 import pytest
 
-from app.api.strategies import portfolio_today, runner
+from app.api.strategies import portfolio_today, runner, scanner_engine
 from app.core import registry
 from app.core.contract import Bar, LegSpec, OptionType, Action, Position
 from app.data.store import SyntheticStore
 from app.engines.paper import IST, MarketHub, PaperContext
+from app.engines.scanner_trader import SPosition, STRATEGY_ID as SCANNER_ID
 
 
 @pytest.fixture
@@ -131,3 +132,121 @@ def test_equity_moves_once_a_trade_is_booked(rec):
 
     assert data["totals"]["equity"] == 501_250.0
     assert data["totals"]["growth"] == 1250.0
+
+
+# --- scanner auto-trader joining the portfolio totals -----------------------
+
+@pytest.fixture
+def scanner_db(tmp_path, monkeypatch):
+    """Isolated DB for scanner-integration tests; always cleans up the
+    module-level scanner_engine's book so nothing leaks into later tests."""
+    monkeypatch.setattr(registry, "DB_PATH", tmp_path / "test_scanner.db")
+    registry.init_db()
+    yield
+    scanner_engine.trader.book.clear()
+
+
+def test_scanner_off_contributes_nothing(scanner_db):
+    """scanner_trade defaults to off — the scanner must not appear anywhere
+    in the portfolio, not even as a zero row."""
+    data = portfolio_today()
+    assert not any(s["id"] == SCANNER_ID for s in data["strategies"])
+    assert not any(p.get("strategy_id") == SCANNER_ID for p in data["open_positions"])
+    assert data["totals"]["allocated_capital"] == 0.0
+
+
+def test_scanner_on_joins_totals_positions_and_trades(scanner_db):
+    """With scanner_trade on, its capital/day P&L join the same totals a
+    Strategy's do, and its open position + today's fill show up in the
+    unified positions/trades lists (no more per-strategy-only view)."""
+    today = _today()
+    registry.set_setting("scanner_trade", "on")
+    registry.set_setting("scanner_trade_capital", "500000")
+    registry.save_paper_day(SCANNER_ID, today, 2000.0, 0.0, 60.0, 502_000.0)
+    registry.record_trade(SCANNER_ID, "PAPER", {
+        "ts": f"{today} 10:30:00", "contract": "RELIANCE 1250 CALL",
+        "side": "BUY", "qty": 500, "price": 20.0, "fees": 30.0,
+        "margin": 0.0, "reason": "entry", "tag": "scanner:CE",
+    })
+    scanner_engine.trader.book["RELIANCE"] = SPosition(
+        symbol="RELIANCE", bias="CE", side="CALL", strike=1250, lots=1,
+        qty_units=500, entry_price=20.0, entry_fees=30.0,
+        entry_ts=f"{today}T10:30:00", entry_score=80.0,
+        high_water=22.0, mtm=22.0, low_water=20.0,
+        entry_ctx={"expiry": "2026-07-31"})
+
+    data = portfolio_today()
+
+    scan = next(s for s in data["strategies"] if s["id"] == SCANNER_ID)
+    assert scan["allocated_capital"] == 500_000.0
+    assert scan["open_positions"] == 1
+    # day_pnl = booked realized (2000) + open unrealized ((22-20)*500 = 1000)
+    assert scan["day_pnl"] == pytest.approx(3000.0)
+    assert any(p["strategy_id"] == SCANNER_ID for p in data["open_positions"])
+    assert any(t["strategy_id"] == SCANNER_ID for t in data["trades_today"])
+    assert data["totals"]["allocated_capital"] == pytest.approx(500_000.0)
+    # equity includes the scanner's capital + BOOKED realized only — the open
+    # position's unrealized swing must not move it (same guard as Strategies)
+    assert data["totals"]["equity"] == pytest.approx(500_000.0 + 2000.0)
+    assert data["totals"]["growth"] == pytest.approx(2000.0)
+
+
+def test_scanner_stale_row_zeroed_when_no_activity_today(scanner_db):
+    """Same stale-row guard as Strategies: a leftover daily_pnl row for today
+    with nothing open and nothing traded must read as zero, not the stale
+    value — otherwise a scanner that was on yesterday and toggled off (or
+    just idle) would show a phantom P&L forever."""
+    registry.set_setting("scanner_trade", "on")
+    registry.save_paper_day(SCANNER_ID, _today(), -999.0, 0.0, 0.0, 499_001.0)
+
+    data = portfolio_today()
+
+    scan = next(s for s in data["strategies"] if s["id"] == SCANNER_ID)
+    assert scan["day_pnl"] == 0.0
+
+
+def test_scanner_position_carries_overnight_into_a_new_day(scanner_db):
+    """The scanner is positional (see exit_decision's max_hold_days, not an
+    intraday square-off) — a position opened yesterday and still open today
+    must (a) keep showing in open_positions, (b) keep its live mark-to-market
+    reflected in TODAY's P&L card even though it wasn't entered today, and
+    (c) NOT lose yesterday's already-booked realized P&L, which must still
+    count permanently toward equity — while today's OWN daily_pnl row starts
+    fresh at zero with no separate reset logic needed (no row exists for
+    today yet)."""
+    from datetime import timedelta
+    today = _today()
+    yesterday = (datetime.now(IST).date() - timedelta(days=1)).isoformat()
+    registry.set_setting("scanner_trade", "on")
+    registry.set_setting("scanner_trade_capital", "500000")
+    # yesterday's day already closed out with a booked win — must never vanish
+    registry.save_paper_day(SCANNER_ID, yesterday, 1500.0, 0.0, 40.0, 501_500.0)
+    registry.record_trade(SCANNER_ID, "PAPER", {
+        "ts": f"{yesterday} 14:13:00", "contract": "DRREDDY 1170 PUT",
+        "side": "BUY", "qty": 625, "price": 19.75, "fees": 29.15,
+        "margin": 0.0, "reason": "entry", "tag": "scanner:PE",
+    })
+    # the position from that entry is STILL OPEN today (never squared off)
+    scanner_engine.trader.book["DRREDDY"] = SPosition(
+        symbol="DRREDDY", bias="PE", side="PUT", strike=1170, lots=1,
+        qty_units=625, entry_price=19.75, entry_fees=29.15,
+        entry_ts=f"{yesterday}T14:13:00", entry_score=88.9,
+        high_water=22.0, mtm=22.0, low_water=19.75,
+        entry_ctx={"expiry": "2026-07-28"})
+
+    data = portfolio_today()
+
+    scan = next(s for s in data["strategies"] if s["id"] == SCANNER_ID)
+    # (a) still open, still on the dashboard
+    assert scan["open_positions"] == 1
+    assert any(p["strategy_id"] == SCANNER_ID and p["strategy"] == "Scanner Auto-Trader"
+              for p in data["open_positions"])
+    # (b) today's P&L reflects the live mark on the carried position even
+    # though today's OWN booked realized is zero (nothing closed today)
+    assert scan["day_pnl"] == pytest.approx((22.0 - 19.75) * 625)
+    # yesterday's fill does NOT reappear in today's trade list
+    assert not any(t["strategy_id"] == SCANNER_ID for t in data["trades_today"])
+    # (c) yesterday's booked win is permanent — equity/growth include it,
+    # and never the still-open position's unrealized swing
+    assert data["totals"]["equity"] == pytest.approx(500_000.0 + 1500.0)
+    assert data["totals"]["growth"] == pytest.approx(1500.0)

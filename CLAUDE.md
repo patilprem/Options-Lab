@@ -241,3 +241,21 @@ ids in dhan_client.UNDERLYINGS. Flip live on only via /live/settings ON the VPS.
   contract and that a Full subscription actually streams increasing volume+OI —
   run `venv/bin/python -m scripts.verify_index_futures`. Flip the setting on
   only after that passes.
+- Scanner auto-trader now joins the main portfolio: `GET /portfolio/today`
+  includes its allocated capital (`scanner_trade_capital`, default 5L) and
+  P&L in `equity`/`growth`/totals whenever `scanner_trade` is on, and its
+  open positions + today's fills appear in the unified `open_positions`/
+  `trades_today` lists (PositionsView.jsx renders these directly now, no
+  more per-strategy-only "By strategy" table). Fixed a real bug in the same
+  pass: `ScannerTrader.step()` was overwriting daily_pnl's realized/fees for
+  today with only the LAST cycle's incremental amount instead of the day's
+  running total (`ScannerTrader._book_day` now reads-modifies-writes against
+  the existing row). Also split `step()` into `manage()` (mark/exit only) +
+  a new fast `run_position_mtm` loop (scanner.py, ~20s cadence, held-symbols-
+  only, capped at `MAX_FAST_MTM_SYMBOLS`) so open scanner positions' P&L and
+  stop/target checks don't lag up to `TIER2_INTERVAL` (5 min) behind real
+  time. STILL VPS-pending during market hours: that the new loop's chain
+  polling behaves under the real 3s rate gate alongside the existing pollers
+  without starving them, and that `daily_pnl` accumulates correctly across
+  a full live session with real order volume (only unit-tested offline so
+  far, see tests/test_scanner_trader.py / test_scanner_tier2.py).

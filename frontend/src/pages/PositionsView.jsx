@@ -4,6 +4,8 @@ const fmt = n => '₹' + (n || 0).toLocaleString('en-IN', { maximumFractionDigit
 const fmt2 = n => '₹' + (n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const pnlCls = n => n >= 0 ? 'pos' : 'neg'
 const sign = n => (n >= 0 ? '+' : '') + fmt2(n)
+const timeOf = ts => (ts || '').slice(11, 19) || ts
+const SCANNER_ID = 'SCANNER'
 
 export default function PositionsView({ onStrategyClick }) {
   const [pf, setPf] = useState(null)
@@ -25,7 +27,13 @@ export default function PositionsView({ onStrategyClick }) {
   if (!pf) return <div className="panel-body"><div className="empty">Loading...</div></div>
 
   const t = pf.totals
-  const hasStrategies = !!pf.strategies?.length
+  const openRows = pf.open_positions || []
+  // newest first — a live trades feed reads top-down
+  const tradeRows = [...(pf.trades_today || [])].reverse()
+  // the scanner auto-trader isn't a Strategy record, so it has no detail
+  // page to drill into — only strategy-sourced rows are clickable
+  const drillable = row => row.strategy_id && row.strategy_id !== SCANNER_ID
+
   return (
     <div className="panel-body">
       <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
@@ -51,43 +59,80 @@ export default function PositionsView({ onStrategyClick }) {
         <div className="metric">
           <div className="k">Open / trades</div>
           <div className="v">{t.open_positions} / {t.trades}</div>
-          <div className="sub">positions / fills today</div>
+          <div className="sub">positions / fills today — strategies + scanner</div>
         </div>
       </div>
-      <h3 className="sec">By strategy — click to drill in</h3>
-      {hasStrategies ? (
+
+      <h3 className="sec">Open positions</h3>
+      {openRows.length ? (
         <div className="table-scroll"><table>
           <thead>
             <tr>
-              <th>Strategy</th>
-              <th>State</th>
-              <th>Capital</th>
-              <th>Day P&L</th>
-              <th>Day ROI</th>
-              <th>Open</th>
-              <th>Trades</th>
+              <th>Source</th>
+              <th>Contract</th>
+              <th>Qty</th>
+              <th>Entry</th>
+              <th>MTM</th>
+              <th>Unrealized</th>
+              <th>Stop</th>
             </tr>
           </thead>
           <tbody>
-            {pf.strategies.map(s => (
-              <tr key={s.id} style={{ cursor: 'pointer' }} onClick={() => onStrategyClick(s.id)}>
-                <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{s.name}</td>
+            {openRows.map((p, i) => (
+              <tr key={`${p.strategy_id}-${i}`}
+                  style={drillable(p) ? { cursor: 'pointer' } : undefined}
+                  onClick={() => drillable(p) && onStrategyClick(p.strategy_id)}>
+                <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{p.strategy}</td>
                 <td style={{ textAlign: 'left' }}>
-                  <span className={`badge ${s.state}`}>{s.state.replace('DEPLOYED_', '')}</span>
+                  {p.strike ? `${p.strike} ` : ''}{p.type}{p.tag ? ` · ${p.tag}` : ''}
                 </td>
-                <td>{fmt(s.allocated_capital)}</td>
-                <td className={pnlCls(s.day_pnl)}>{sign(s.day_pnl)}</td>
-                <td className={pnlCls(s.day_roi_pct)}>{s.day_roi_pct}%</td>
-                <td>{s.open_positions}</td>
-                <td>{s.trades_today}</td>
+                <td>{p.qty}</td>
+                <td>{fmt2(p.entry)}</td>
+                <td>{fmt2(p.mtm)}</td>
+                <td className={pnlCls(p.unrealized)}>{sign(p.unrealized)}</td>
+                <td>{p.stop_loss != null ? fmt2(p.stop_loss) : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      ) : (
+        <div className="empty">No open positions right now.</div>
+      )}
+
+      <h3 className="sec">Today's trades</h3>
+      {tradeRows.length ? (
+        <div className="table-scroll"><table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Source</th>
+              <th>Contract</th>
+              <th>Side</th>
+              <th>Qty</th>
+              <th>Price</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tradeRows.map((tr, i) => (
+              <tr key={`${tr.strategy_id}-${tr.ts}-${i}`}
+                  style={drillable(tr) ? { cursor: 'pointer' } : undefined}
+                  onClick={() => drillable(tr) && onStrategyClick(tr.strategy_id)}>
+                <td>{timeOf(tr.ts)}</td>
+                <td style={{ fontFamily: 'var(--body)', fontWeight: '600' }}>{tr.strategy}</td>
+                <td style={{ textAlign: 'left' }}>{tr.contract}</td>
+                <td className={tr.side === 'BUY' ? 'pos' : 'neg'}>{tr.side}</td>
+                <td>{tr.qty}</td>
+                <td>{fmt2(tr.price)}</td>
+                <td>{tr.reason}</td>
               </tr>
             ))}
           </tbody>
         </table></div>
       ) : (
         <div className="empty">
-          Nothing deployed yet — deploy a strategy for paper trading and today's
-          P&amp;L will fill in here.
+          Nothing traded yet today — fills from both strategies and the
+          scanner auto-trader will show up here.
         </div>
       )}
     </div>

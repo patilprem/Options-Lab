@@ -408,6 +408,15 @@ def get_params(strategy_id: str) -> dict:
     return json.loads(raw) if raw else {}
 
 
+# The scanner auto-trader books its fills under this fixed id (see
+# scanner_trader.STRATEGY_ID) but — unlike a Strategy — never has a row in
+# the `strategies` table, so all_trades()'s LEFT JOIN gives it a NULL name.
+# Hardcoded here (rather than importing scanner_trader) to keep this
+# foundational module free of engine imports.
+_SCANNER_STRATEGY_ID = "SCANNER"
+_SCANNER_DISPLAY_NAME = "Scanner Auto-Trader"
+
+
 def all_trades(from_date: str = "", to_date: str = "",
                strategy_id: str = "", mode: str = "") -> list[dict]:
     q = ("SELECT t.strategy_id, s.name AS strategy, t.mode, t.payload_json "
@@ -427,9 +436,39 @@ def all_trades(from_date: str = "", to_date: str = "",
             continue
         if to_date and d > to_date:
             continue
-        out.append({**t, "strategy": r["strategy"], "strategy_id": r["strategy_id"],
+        name = r["strategy"]
+        if name is None and r["strategy_id"] == _SCANNER_STRATEGY_ID:
+            name = _SCANNER_DISPLAY_NAME
+        out.append({**t, "strategy": name, "strategy_id": r["strategy_id"],
                     "mode": r["mode"]})
     return sorted(out, key=lambda t: t.get("ts", ""), reverse=True)
+
+
+def daily_pnl_summary(from_date: str = "", to_date: str = "",
+                      strategy_id: str = "", mode: str = "") -> dict:
+    """Booked (realized) P&L + fees per calendar day, summed across every
+    strategy AND the scanner auto-trader (same daily_pnl table, no separate
+    join needed) unless `strategy_id` narrows it to one. Keyed by
+    trade_date. Backs the History view's per-day brief — deliberately
+    REALIZED only (closed trades), not the live unrealized mark a still-open
+    position carries, since this is a historical record, not the live
+    dashboard card. Empty `mode` (the default) means every mode, matching
+    all_trades()'s convention — NOT a literal empty-string filter."""
+    q = "SELECT trade_date, SUM(realized) AS realized, SUM(fees) AS fees FROM daily_pnl WHERE 1=1"
+    args: list = []
+    if mode:
+        q += " AND mode=?"; args.append(mode.upper())
+    if strategy_id:
+        q += " AND strategy_id=?"; args.append(strategy_id)
+    if from_date:
+        q += " AND trade_date>=?"; args.append(from_date)
+    if to_date:
+        q += " AND trade_date<=?"; args.append(to_date)
+    q += " GROUP BY trade_date"
+    with _conn() as c:
+        rows = c.execute(q, args).fetchall()
+    return {r["trade_date"]: {"realized": r["realized"] or 0.0, "fees": r["fees"] or 0.0}
+            for r in rows}
 
 
 def save_paper_state(strategy_id: str, snapshot: dict) -> None:

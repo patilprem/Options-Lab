@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
+import pytest
+
 from app.core.contract import OptionQuote, OptionType
 from app.engines import scanner_trader as st
 from app.engines.scanner_trader import SPosition, TradeConfig
@@ -200,6 +202,138 @@ def test_step_enters_then_trailing_exits(tmp_path, monkeypatch):
     assert x["entry_ctx"]["volume_surge"] == 2.4   # entry ctx rides along
     # the daily reflection hook ran (and, with 1 trade, suggested nothing)
     assert reg.setting("scanner_insight_day") == today
+
+
+def test_daily_pnl_accumulates_across_cycles_same_day(tmp_path, monkeypatch):
+    """daily_pnl is one row per (strategy, mode, date) that step() rewrites
+    every cycle — two round trips closed in two SEPARATE cycles the same day
+    must SUM in that row. A naive per-cycle overwrite would leave only the
+    second exit's realized, silently erasing the first."""
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_entry_score", "65")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+
+    hub, scanner = _FakeHub(), _FakeScanner()
+    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+
+    # round trip 1: enter, run up, trailing-exit in profit
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, scanner)
+    hub.set_atm("RELIANCE", "CALL", ltp=40.0)
+    trader.step(hub, scanner)
+    hub.set_atm("RELIANCE", "CALL", ltp=25.0)          # below trail (30) -> exit
+    trader.step(hub, scanner)
+    assert "RELIANCE" not in trader.book
+
+    # round trip 2: enter again, hard-stop out — same day, separate cycles
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, scanner)
+    hub.set_atm("RELIANCE", "CALL", ltp=13.0)          # 35% down -> hard stop
+    trader.step(hub, scanner)
+    assert "RELIANCE" not in trader.book
+
+    exits = reg.journal_rows(kind="exit")
+    assert len(exits) == 2
+    expected_total = sum(e["realized"] for e in exits)
+
+    today = datetime.now(st.IST).date().isoformat()
+    row = next(r for r in reg.performance_rows(st.STRATEGY_ID, "PAPER")
+              if r["trade_date"] == today)
+    assert row["realized"] == pytest.approx(expected_total, abs=0.01)
+
+
+def test_manage_marks_and_exits_without_opening_new_positions(tmp_path, monkeypatch):
+    """manage() is the fast, frequently-callable half of step() — it must mark
+    and exit existing positions exactly like step() does, but NEVER open a
+    new one even when a qualifying candidate is sitting right there. Only the
+    full step() (gated behind the slower Tier-2 cycle) does discovery."""
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_entry_score", "65")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+
+    hub, scanner = _FakeHub(), _FakeScanner()
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+
+    exited = trader.manage(hub, scanner)
+    assert exited == set()
+    assert "RELIANCE" not in trader.book       # no entry from manage() alone
+
+    # now the same candidate opens fine through the real step()
+    trader.step(hub, scanner)
+    assert "RELIANCE" in trader.book
+
+    # mark it up, then have manage() alone catch the trailing-stop exit
+    hub.set_atm("RELIANCE", "CALL", ltp=40.0)
+    trader.manage(hub, scanner)
+    hub.set_atm("RELIANCE", "CALL", ltp=25.0)   # below trail (30) -> exit
+    exited2 = trader.manage(hub, scanner)
+    assert exited2 == {"RELIANCE"}
+    assert "RELIANCE" not in trader.book
+    today = datetime.now(st.IST).date().isoformat()
+    row = next(r for r in reg.performance_rows(st.STRATEGY_ID, "PAPER")
+              if r["trade_date"] == today)
+    assert row["realized"] > 0                  # the trailing exit was booked
+
+
+def test_entry_ctx_premium_distance_needs_history(tmp_path, monkeypatch):
+    """opt_dist_to_vwap_pct / opt_dist_to_lower_bb_pct in entry_ctx read the
+    OPTION's OWN recent premium prints. We only ever buy premium (CE or PE),
+    so 'cheap relative to its own session' is the same test either way — no
+    separate upper-band case for PE. Fields are None until there's enough
+    history for that (symbol, side); populated once there is."""
+    import dataclasses
+    from app.core.contract import Bar
+
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_entry_score", "65")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+
+    hub, scanner = _FakeHub(), _FakeScanner()
+    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+
+    # first-ever cycle for this (symbol, side): history is just this quote,
+    # so VWAP trivially equals it (0% away) and Bollinger needs >=5 samples
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, scanner)
+    ctx = trader.book["RELIANCE"].entry_ctx
+    assert ctx["opt_dist_to_vwap_pct"] == 0.0
+    assert ctx["opt_dist_to_lower_bb_pct"] is None
+
+    # seed a session window with a clear average around ~23-24, then price a
+    # fresh entry well below it — a real pullback, not a chase
+    trader._prem_hist[("RELIANCE", "CALL")] = [
+        Bar(ts=datetime(2026, 7, 22, 10, m), open=p, high=p, low=p, close=p)
+        for m, p in enumerate((24.0, 23.0, 25.0, 22.0, 26.0, 21.0))
+    ]
+    q = hub._chain_cache["RELIANCE"][("MONTHLY", 0, 0, "CALL")]
+    q = dataclasses.replace(q, ltp=18.0)              # today's cheapest print
+    cfg = trader._cfg()
+    ctx2 = trader._entry_context(
+        scanner, "RELIANCE", scanner.scores["RELIANCE"], q, cfg)
+    assert ctx2["opt_dist_to_vwap_pct"] < 0           # below its own VWAP
+    assert ctx2["opt_dist_to_lower_bb_pct"] is not None
 
 
 def test_analyze_over_real_journal_rows(tmp_path, monkeypatch):

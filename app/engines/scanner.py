@@ -37,6 +37,16 @@ TIER2_INTERVAL = 300.0    # re-rank + re-poll the shortlist every 5 min
 # Indian stock options are MONTHLY (no weeklies) — poll the nearest month.
 STOCK_CHAIN_TARGETS = (("MONTHLY", 0),)
 
+# The scanner-trader's OPEN positions don't need a fresh shortlist to be
+# marked/exited (see ScannerTrader.manage()) — only new entries do — so they
+# get their own much tighter polling loop, independent of TIER2_INTERVAL.
+# Bounded (MAX_FAST_MTM_SYMBOLS) so this never queues more requests onto the
+# shared 3s-gate than max_positions is meant to allow; a book bigger than
+# that (an unusually high max_positions setting) falls back to the normal
+# Tier-2 cadence for marking rather than risk hammering the rate limit.
+POSITION_MTM_INTERVAL = 20.0
+MAX_FAST_MTM_SYMBOLS = 10
+
 # Directional read of each buildup regime for an option-BUYING bias.
 _BIAS = {"long_buildup": "CE", "short_covering": "CE",
          "short_buildup": "PE", "long_unwinding": "PE"}
@@ -802,6 +812,44 @@ class StockScanner:
                                   "chains (stock option-chain fetch returned empty)")
         return done
 
+    async def position_mtm_once(self, hub, loop) -> int:
+        """Re-poll ONLY the scanner-trader's currently held symbols' chains
+        (through the hub's shared 3s gate) and mark/exit them via
+        ScannerTrader.manage() — independent of the heavy Tier-2 shortlist
+        re-rank. Returns how many symbols were marked (0 if there's nothing
+        open, the trader is off, or the book is unusually large — see
+        MAX_FAST_MTM_SYMBOLS)."""
+        from app.core import registry
+        if not self.trader or registry.setting("scanner_trade", "off") != "on":
+            return 0
+        held = self.trader.held_symbols()
+        if not held:
+            return 0                              # nothing open -> zero API cost
+        if len(held) > MAX_FAST_MTM_SYMBOLS:
+            registry.record_event(
+                "warn", "scanner",
+                f"position-mtm: {len(held)} open positions exceeds "
+                f"{MAX_FAST_MTM_SYMBOLS} — skipping the fast mark this cycle "
+                "(falls back to the next Tier-2 cycle)")
+            return 0
+        symbols = self._register_chain_cfgs(held)
+        if not symbols:
+            return 0
+        from app.data import dhan_client
+        from app.data.dhan_client import UNDERLYINGS
+        client = await loop.run_in_executor(None, dhan_client.get_client)
+        marked = 0
+        for sym in symbols:
+            cfg = UNDERLYINGS.get(sym)
+            try:
+                await hub._poll_one_chain(sym, cfg, client, loop, STOCK_CHAIN_TARGETS)
+                marked += 1
+            except Exception as e:
+                registry.record_event("warn", "scanner", f"position-mtm chain [{sym}]: {e!r}")
+                continue
+        self.trader.manage(hub, self)
+        return marked
+
     def ranked_scores(self) -> list[dict]:
         """All current setup scores, highest first — backs GET /scanner. Falls
         back to a Tier-1-only score for names not yet deep-dived."""
@@ -891,6 +939,26 @@ class StockScanner:
             except Exception as e:
                 registry.record_event("warn", "scanner", f"tier2 loop: {e!r}")
             await asyncio.sleep(TIER2_INTERVAL)
+
+    async def run_position_mtm(self, hub) -> None:
+        """Long-lived fast loop: every POSITION_MTM_INTERVAL, re-mark/exit
+        just the scanner-trader's currently held positions (see
+        position_mtm_once) — independent of the much slower TIER2_INTERVAL
+        shortlist re-rank, so today's P&L and stop/target checks don't lag
+        behind real time between full Tier-2 cycles. A no-op (cheap sleep,
+        zero API calls) whenever nothing is open."""
+        from app.core import registry
+        loop = asyncio.get_running_loop()
+        await asyncio.sleep(30)   # let the first Tier-2 cycle establish a book
+        while True:
+            try:
+                if (registry.setting("scanner", "off") == "on"
+                        and _session_open() and hasattr(self.store, "con")):
+                    await hub.ensure_started()
+                    await self.position_mtm_once(hub, loop)
+            except Exception as e:
+                registry.record_event("warn", "scanner", f"position-mtm loop: {e!r}")
+            await asyncio.sleep(POSITION_MTM_INTERVAL)
 
     async def run(self) -> None:
         """Long-lived poll loop. Market-hours gated; rebuilds the Dhan client
