@@ -693,6 +693,52 @@ def _today_realized(ctx, today: str, rows: list[dict]) -> float:
     return round(today_row["realized"] or 0.0, 2) if today_row else 0.0
 
 
+def _strategy_closed_today(rec, today: str) -> list[dict]:
+    """Today's closed round trips for one Strategy, from strategy_journal
+    (build_round_trip's entry/exit price + realized P&L) rather than the
+    thin trades blotter, which only has individual fill legs — normalized to
+    the same shape _scanner_closed_today() returns so the Dashboard can show
+    both engines' closed trades in one list."""
+    out = []
+    for r in registry.strategy_journal_rows(rec.id, kind="exit"):
+        exit_ts = r.get("exit_ts") or ""
+        if not str(exit_ts).startswith(today):
+            continue
+        out.append({
+            "strategy": rec.name, "strategy_id": rec.id,
+            "symbol": r.get("underlying"), "strike": r.get("strike"),
+            "side": None, "qty": r.get("qty"),
+            "entry_price": r.get("entry_price"), "exit_price": r.get("exit_price"),
+            "pnl": r.get("pnl"), "reason": r.get("exit_reason"),
+            "entry_ts": r.get("entry_ts"), "exit_ts": exit_ts,
+            "held_minutes": r.get("held_minutes"),
+        })
+    return out
+
+
+def _scanner_closed_today(today: str) -> list[dict]:
+    """Today's closed round trips for the scanner auto-trader, from its rich
+    journal (scanner_journal) — that's where entry/exit price and realized
+    P&L actually live; the trades blotter only has individual fill legs."""
+    if registry.setting("scanner_trade", "off") != "on":
+        return []
+    out = []
+    for r in registry.journal_rows(kind="exit", limit=300):
+        ts = r.get("ts") or ""
+        if not str(ts).startswith(today):
+            continue
+        out.append({
+            "strategy": "Scanner Auto-Trader", "strategy_id": SCANNER_ID,
+            "symbol": r.get("symbol"), "strike": r.get("strike"),
+            "side": r.get("side"), "qty": r.get("qty_units"),
+            "entry_price": r.get("entry_price"), "exit_price": r.get("exit_price"),
+            "pnl": r.get("realized"), "reason": r.get("reason"),
+            "entry_ts": r.get("entry_ts"), "exit_ts": ts,
+            "held_minutes": r.get("held_minutes"),
+        })
+    return out
+
+
 def _scanner_today(today: str) -> dict | None:
     """Same-shape read of the scanner auto-trader's today — gated on the
     scanner_trade toggle, so its allocated capital and P&L only join the
@@ -746,11 +792,13 @@ def _scanner_today(today: str) -> dict | None:
 def portfolio_today():
     """Combined view across every deployed strategy PLUS the scanner
     auto-trader (when it's on): today's P&L / ROI, all open positions, all
-    trades — plus a per-engine breakdown. The scanner's allocated capital and
-    realized P&L join `equity`/`growth` the same way a Strategy's do, gated
-    on the `scanner_trade` toggle."""
+    trades, all CLOSED round trips (entry/exit price + realized P&L, from
+    each engine's rich journal rather than the thin fills blotter) — plus a
+    per-engine breakdown. The scanner's allocated capital and realized P&L
+    join `equity`/`growth` the same way a Strategy's do, gated on the
+    `scanner_trade` toggle."""
     today = _ist_today()
-    strategies_out, positions, trades = [], [], []
+    strategies_out, positions, trades, closed = [], [], [], []
     total_alloc = total_day = total_margin = 0.0
     for rec in registry.list_all():
         deployed = rec.state in (State.RUNNING, State.DEPLOYED_PAUSED)
@@ -780,6 +828,7 @@ def portfolio_today():
         positions.extend(open_rows)
         for t in t_rows:
             trades.append({**t, "strategy": rec.name, "strategy_id": rec.id})
+        closed.extend(_strategy_closed_today(rec, today))
         cap = rec.allocated_capital or 0.0
         total_alloc += cap
         total_day += day_pnl
@@ -796,7 +845,9 @@ def portfolio_today():
         total_alloc += scanner_today["cap"]
         total_day += scanner_today["day_pnl"]
         strategies_out.append(scanner_today["summary"])
+    closed.extend(_scanner_closed_today(today))
     trades.sort(key=lambda t: t.get("ts", ""))
+    closed.sort(key=lambda c: c.get("exit_ts") or "")
     # Portfolio equity: EVERY strategy's allocation + its lifetime BOOKED
     # (realized) P&L only — never the unrealized mark on positions still
     # open, which swings with every live quote and must not move equity
@@ -840,6 +891,7 @@ def portfolio_today():
         "strategies": strategies_out,
         "open_positions": positions,
         "trades_today": trades,
+        "closed_positions_today": closed,
     }
 
 
