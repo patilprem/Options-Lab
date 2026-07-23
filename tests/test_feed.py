@@ -239,6 +239,79 @@ def test_stalled_socket_forces_reconnect(monkeypatch):
     assert any("socket presumed dead" in m for _, m in events)
 
 
+def test_is_rate_limit_block_classifier():
+    """Dhan's per-IP WS connection-limit block (HTTP 429 'client id is blocked')
+    must be recognised so the driver waits out the cooldown; ordinary drops and
+    stalls must NOT be, so they keep the fast reconnect."""
+    from app.engines.feed import LiveFeed
+    blk = LiveFeed._is_rate_limit_block
+    assert blk(RuntimeError(
+        "InvalidStatus(Response(status_code=429, reason_phrase='Too Many "
+        "Requests', body=b'Too many requests from this IP hence client id is "
+        "blocked'))")) is True
+    assert blk(RuntimeError("HTTP 429 Too Many Requests")) is True
+    assert blk(RuntimeError("no packets for 120s — socket presumed dead")) is False
+    assert blk(ConnectionResetError("connection reset by peer")) is False
+
+
+def test_rate_limit_block_backs_off_long(monkeypatch):
+    """A 429 'client id is blocked' at connect must trigger the long cooldown
+    backoff and a distinct 'blocked by Dhan' event — not the fast 30s reconnect
+    loop that keeps hammering (and can extend) the block."""
+    import sys
+    import types
+    from app.engines.feed import LiveFeed
+
+    class BlockedFeed:
+        def __init__(self, ctx, instruments, version):
+            pass
+
+        async def connect(self):
+            raise RuntimeError(
+                "InvalidStatus(Response(status_code=429, reason_phrase='Too "
+                "Many Requests', body=b'Too many requests from this IP hence "
+                "client id is blocked'))")
+
+        async def get_instrument_data(self):
+            await asyncio.sleep(3600)
+
+        def _is_ws_closed(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "dhanhq",
+                        types.SimpleNamespace(MarketFeed=BlockedFeed))
+
+    events = []
+    lf = LiveFeed(context_factory=lambda: None,
+                  instruments=lambda: [(0, "13", 15)],
+                  sec_to_underlying=lambda: {13: "NIFTY"},
+                  on_tick=lambda *a: None,
+                  on_event=lambda lvl, msg: events.append((lvl, msg)))
+    lf.BLOCKED_BACKOFF_S = 0.05      # don't actually wait out 5 real minutes
+    lf._running = True
+
+    async def run():
+        task = asyncio.get_running_loop().create_task(lf._driver())
+        for _ in range(200):
+            if any("blocked by Dhan" in m for _, m in events):
+                break
+            await asyncio.sleep(0.01)
+        lf._running = False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    asyncio.run(run())
+
+    assert any("blocked by Dhan" in m for _, m in events), events
+    # the ordinary "reconnecting in Ns" line must NOT be used for a block
+    assert not any("reconnecting in" in m for _, m in events), events
+
+
 def test_enable_chain_resubscribes_live_socket(tmp_path, monkeypatch):
     """An MCX name enabled AFTER the WS connected must force a resubscribe
     (observed 2026-07-15: canary missing until an unrelated reconnect)."""
