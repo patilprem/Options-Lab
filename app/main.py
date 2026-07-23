@@ -258,6 +258,23 @@ async def startup_event():
     except Exception as e:
         registry.record_event("error", "engine", f"paper restore_all failed: {e!r}")
 
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    # Release the Dhan WebSocket cleanly BEFORE this process exits. On a restart
+    # (systemctl restart / deploy) the new process connects within seconds; if
+    # the dying process just drops its socket, Dhan still counts the stale
+    # session and blocks the client id ("too many requests from this IP", HTTP
+    # 429) — the restart feed outage. A clean disconnect frees the slot so the
+    # new process connects without colliding. Runs on SIGTERM (systemd's default
+    # stop signal); a hard SIGKILL/crash can't run it, but the feed's 429 backoff
+    # then self-heals within the cooldown.
+    try:
+        await hub.stop()
+        registry.record_event("info", "engine", "OptionsLab shutdown: live feed released")
+    except Exception as e:
+        registry.record_event("warn", "engine", f"shutdown: feed release failed: {e!r}")
+
 # Mount React build at root, with fallback to index.html for SPA routing
 if STATIC.exists():
     app.mount("/", SPAStaticFiles(directory=str(STATIC), html=True), name="static")

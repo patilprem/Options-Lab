@@ -179,8 +179,15 @@ class LiveFeed:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the feed. Disconnects the Dhan WebSocket and WAITS for the close
+        frame to flush (and the feed thread to unwind), so a process restart
+        doesn't leave a stale session that Dhan 429-blocks the new process
+        against ('too many requests from this IP / client id blocked')."""
         self._running = False
-        self._close_current_feed()
+        self._close_current_feed(wait=True)
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3)
 
     def refresh(self) -> None:
         """Force a reconnect so a newly-registered underlying gets subscribed
@@ -352,11 +359,13 @@ class LiveFeed:
             return 0.0, oi
         return cum - prev, oi
 
-    def _close_current_feed(self) -> None:
+    def _close_current_feed(self, wait: bool = False) -> None:
         feed, loop = self._feed, self._feed_loop
         if feed is not None and loop is not None:
             try:
-                asyncio.run_coroutine_threadsafe(feed.disconnect(), loop)
+                fut = asyncio.run_coroutine_threadsafe(feed.disconnect(), loop)
+                if wait:
+                    fut.result(timeout=3)   # let the WS close frame actually flush
             except Exception:
                 pass
 
