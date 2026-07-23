@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
@@ -131,6 +132,13 @@ class LiveFeed:
 
     STALL_S = 120       # no packets this long DURING market hours = dead socket
     IDLE_POLL_S = 600   # off-hours: wake periodically to re-check the clock
+    # Dhan blocks the client id (HTTP 429) when too many WS connections come
+    # from one IP in a short window — a reconnect storm at restart/restore trips
+    # it. A 30s reconnect just keeps hitting the block, so wait out the cooldown.
+    BLOCKED_BACKOFF_S = 300
+    # Coalesce a burst of registration-driven refresh() calls into ONE reconnect
+    # (each first-time register()/enable_chain() forces a reconnect otherwise).
+    RECONNECT_DEBOUNCE_S = 3
 
     def __init__(self, context_factory: Callable[[], object],
                  instruments: Callable[[], list],
@@ -156,6 +164,7 @@ class LiveFeed:
         self._app_loop: Optional[asyncio.AbstractEventLoop] = None
         self._feed = None
         self._feed_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._refresh_ts = 0.0   # last refresh() request (for reconnect debounce)
         # health surface for the dashboard's Feed pill
         self.connected = False
         self.last_tick: Optional[datetime] = None
@@ -175,7 +184,10 @@ class LiveFeed:
 
     def refresh(self) -> None:
         """Force a reconnect so a newly-registered underlying gets subscribed
-        (the driver rebuilds the instrument list on each connect)."""
+        (the driver rebuilds the instrument list on each connect). The driver
+        debounces these: a burst of registrations at startup/restore coalesces
+        into ONE reconnect so we don't trip Dhan's per-IP connection limit."""
+        self._refresh_ts = time.monotonic()
         self._close_current_feed()
 
     # -- thread internals ----------------------------------------------------
@@ -192,8 +204,26 @@ class LiveFeed:
     async def _driver(self) -> None:
         from dhanhq import MarketFeed
         backoff = 1
+        blocked = False
         while self._running:
             instruments = self._instruments()
+            if not instruments:
+                await asyncio.sleep(1)
+                continue
+            # Coalesce reconnect storms: a burst of first-time registrations at
+            # startup/restore each calls refresh() (one WS reconnect apiece), and
+            # fired back-to-back they trip Dhan's per-IP connection limit ("too
+            # many requests ... client id is blocked", HTTP 429). If a refresh
+            # was just requested, wait until registrations have been quiet for
+            # RECONNECT_DEBOUNCE_S, then connect ONCE with the settled list. A
+            # drop-triggered reconnect sets no _refresh_ts, so it isn't delayed.
+            while self._running and self._refresh_ts and (
+                    time.monotonic() - self._refresh_ts) < self.RECONNECT_DEBOUNCE_S:
+                await asyncio.sleep(0.25)
+            if not self._running:
+                break
+            self._refresh_ts = 0.0
+            instruments = self._instruments()   # re-read after the quiet period
             if not instruments:
                 await asyncio.sleep(1)
                 continue
@@ -207,6 +237,7 @@ class LiveFeed:
                                 for _seg, sid, *_ in instruments})
                 self._event("info", f"live feed connected: {', '.join(map(str, names))}")
                 backoff = 1
+                blocked = False
                 while self._running and not feed._is_ws_closed():
                     # A half-open TCP socket dies SILENTLY: recv blocks
                     # forever, no error, 'connected' forever true (observed
@@ -227,6 +258,7 @@ class LiveFeed:
                     self._handle_packet(pkt)
             except Exception as e:  # network/auth/parse — reconnect
                 self._event("warn", f"live feed error: {e!r}")
+                blocked = self._is_rate_limit_block(e)
             finally:
                 if feed is not None:
                     try:
@@ -237,9 +269,26 @@ class LiveFeed:
                 self.connected = False
             if not self._running:
                 break
-            self._event("warn", f"live feed disconnected; reconnecting in {backoff}s")
-            await asyncio.sleep(backoff)
+            # Dhan's connection-limit block clears only after a cooldown; a fast
+            # reconnect just keeps hitting it (and can extend it). Back off long
+            # on a 429/blocked; normal exponential backoff otherwise.
+            if blocked:
+                wait = self.BLOCKED_BACKOFF_S
+                self._event("warn", "live feed blocked by Dhan (too many "
+                            f"connections / client id blocked); backing off {wait}s")
+            else:
+                wait = backoff
+                self._event("warn", f"live feed disconnected; reconnecting in {wait}s")
+            await asyncio.sleep(wait)
             backoff = min(backoff * 2, 30)
+
+    @staticmethod
+    def _is_rate_limit_block(e) -> bool:
+        """True when a connect error is Dhan's per-IP WS connection-limit block
+        (HTTP 429 'Too many requests ... client id is blocked') — which needs a
+        long cooldown, not a fast reconnect."""
+        s = repr(e).lower()
+        return "429" in s or "too many requests" in s or "client id is blocked" in s
 
     def _handle_packet(self, pkt) -> None:
         # Ticker/Quote/Full packets are dicts with security_id + LTP; status
