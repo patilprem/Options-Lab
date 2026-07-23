@@ -44,6 +44,46 @@ def test_epoch_to_ist():
     assert dc._epoch_to_ist(1780285800.0) == datetime(2026, 6, 1, 9, 20, 0)
 
 
+# --- response unwrapping / failure classification ---------------------------
+
+def test_unwrap_success_returns_data():
+    assert dc._unwrap({"status": "success", "data": {"x": 1}}) == {"x": 1}
+
+
+def test_unwrap_message_less_failure_is_empty_failure():
+    """Dhan's intermittent blip: status != success, remarks all-None. Should
+    raise the transient DhanEmptyFailure with a readable message, NOT dump the
+    raw all-None dict into the error text."""
+    import pytest
+    resp = {"status": "failure",
+            "remarks": {"error_code": None, "error_type": None, "error_message": None}}
+    with pytest.raises(dc.DhanEmptyFailure) as ei:
+        dc._unwrap(resp)
+    # the useless raw dict never reaches the message
+    assert "None" not in str(ei.value)
+    assert "error_code" not in str(ei.value)
+
+
+def test_unwrap_described_failure_extracts_message():
+    """A real failure keeps its detail and stays a plain RuntimeError (not the
+    transient DhanEmptyFailure subclass)."""
+    import pytest
+    resp = {"status": "failure",
+            "remarks": {"error_code": "DH-901", "error_type": "Invalid_Authentication",
+                        "error_message": "Invalid access token"}}
+    with pytest.raises(RuntimeError) as ei:
+        dc._unwrap(resp)
+    assert not isinstance(ei.value, dc.DhanEmptyFailure)
+    assert "Invalid access token" in str(ei.value)
+
+
+def test_unwrap_string_remarks_still_works():
+    import pytest
+    with pytest.raises(RuntimeError) as ei:
+        dc._unwrap({"status": "failure", "remarks": "DH-905"})
+    assert "DH-905" in str(ei.value)
+
+
 # --- intraday underlying candles (single-nested: data = {open,...}) ---------
 
 def test_parse_and_upsert_intraday():
