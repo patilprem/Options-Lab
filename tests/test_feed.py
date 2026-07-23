@@ -312,6 +312,78 @@ def test_rate_limit_block_backs_off_long(monkeypatch):
     assert not any("reconnecting in" in m for _, m in events), events
 
 
+def test_consecutive_blocks_escalate_backoff(monkeypatch):
+    """A running service that keeps hitting the block must ESCALATE the wait
+    (300s, 600s, 900s ...) so it eventually hands Dhan a long zero-attempt
+    window. A fixed 300s retry never lets the block clear (2026-07-23: an
+    all-day block a steady 5-min retry never broke)."""
+    import re
+    import sys
+    import types
+    from app.engines.feed import LiveFeed
+
+    class BlockedFeed:
+        def __init__(self, ctx, instruments, version):
+            pass
+
+        async def connect(self):
+            raise RuntimeError(
+                "InvalidStatus(Response(status_code=429, body=b'Too many "
+                "requests from this IP hence client id is blocked'))")
+
+        async def get_instrument_data(self):
+            await asyncio.sleep(3600)
+
+        def _is_ws_closed(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "dhanhq",
+                        types.SimpleNamespace(MarketFeed=BlockedFeed))
+
+    waits = []
+    events = []
+    lf = LiveFeed(context_factory=lambda: None,
+                  instruments=lambda: [(0, "13", 15)],
+                  sec_to_underlying=lambda: {13: "NIFTY"},
+                  on_tick=lambda *a: None,
+                  on_event=lambda lvl, msg: events.append((lvl, msg)))
+    # tiny units so the test doesn't actually sleep for minutes; escalation and
+    # cap are proportional so the STRUCTURE is what's asserted, not real seconds
+    lf.BLOCKED_BACKOFF_S = 0.02
+    lf.BLOCKED_BACKOFF_MAX_S = 0.05
+
+    async def run():
+        task = asyncio.get_running_loop().create_task(lf._driver())
+        for _ in range(400):
+            # collect the "backing off Ns" numbers as they appear
+            for _lvl, m in events:
+                mt = re.search(r"backing off ([\d.]+)s", m)
+                if mt and float(mt.group(1)) not in waits:
+                    waits.append(float(mt.group(1)))
+            if len(waits) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        lf._running = False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    lf._running = True
+    asyncio.run(run())
+
+    # first block waits BLOCKED_BACKOFF_S, each consecutive one waits longer,
+    # capped at BLOCKED_BACKOFF_MAX_S — never a flat repeat of the base wait
+    assert waits[0] == 0.02, waits
+    assert waits[1] > waits[0], waits
+    assert max(waits) <= 0.05 + 1e-9, waits
+    assert any("block #" in m for _, m in events), events
+
+
 def test_stop_disconnects_ws_for_clean_restart():
     """On shutdown the feed must DISCONNECT the Dhan WebSocket (and wait for the
     close to flush), so a restart doesn't leave a stale session that 429-blocks

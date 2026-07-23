@@ -135,7 +135,12 @@ class LiveFeed:
     # Dhan blocks the client id (HTTP 429) when too many WS connections come
     # from one IP in a short window — a reconnect storm at restart/restore trips
     # it. A 30s reconnect just keeps hitting the block, so wait out the cooldown.
+    # The block only resets after a stretch of ZERO attempts, so on CONSECUTIVE
+    # blocks the wait ESCALATES (300s, 600s, 900s ... capped) — otherwise a fixed
+    # 300s retry keeps the block perpetually warm and it never clears (observed
+    # 2026-07-23: an all-day block that a steady 5-min retry never broke).
     BLOCKED_BACKOFF_S = 300
+    BLOCKED_BACKOFF_MAX_S = 1800   # cap escalation at 30 min between attempts
     # Coalesce a burst of registration-driven refresh() calls into ONE reconnect
     # (each first-time register()/enable_chain() forces a reconnect otherwise).
     RECONNECT_DEBOUNCE_S = 3
@@ -212,6 +217,7 @@ class LiveFeed:
         from dhanhq import MarketFeed
         backoff = 1
         blocked = False
+        block_streak = 0
         while self._running:
             instruments = self._instruments()
             if not instruments:
@@ -245,6 +251,7 @@ class LiveFeed:
                 self._event("info", f"live feed connected: {', '.join(map(str, names))}")
                 backoff = 1
                 blocked = False
+                block_streak = 0            # a clean connect clears the escalation
                 while self._running and not feed._is_ws_closed():
                     # A half-open TCP socket dies SILENTLY: recv blocks
                     # forever, no error, 'connected' forever true (observed
@@ -278,12 +285,19 @@ class LiveFeed:
                 break
             # Dhan's connection-limit block clears only after a cooldown; a fast
             # reconnect just keeps hitting it (and can extend it). Back off long
-            # on a 429/blocked; normal exponential backoff otherwise.
+            # on a 429/blocked; normal exponential backoff otherwise. CONSECUTIVE
+            # blocks escalate the wait (300s, 600s, 900s ... capped) so a running
+            # service eventually hands Dhan a long enough ZERO-attempt window for
+            # the block to clear — a fixed 300s retry never does.
             if blocked:
-                wait = self.BLOCKED_BACKOFF_S
+                block_streak += 1
+                wait = min(self.BLOCKED_BACKOFF_S * block_streak,
+                           self.BLOCKED_BACKOFF_MAX_S)
                 self._event("warn", "live feed blocked by Dhan (too many "
-                            f"connections / client id blocked); backing off {wait}s")
+                            f"connections / client id blocked); backing off {wait}s"
+                            + (f" (block #{block_streak})" if block_streak > 1 else ""))
             else:
+                block_streak = 0
                 wait = backoff
                 self._event("warn", f"live feed disconnected; reconnecting in {wait}s")
             await asyncio.sleep(wait)
