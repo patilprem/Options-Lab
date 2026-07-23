@@ -312,6 +312,38 @@ def test_rate_limit_block_backs_off_long(monkeypatch):
     assert not any("reconnecting in" in m for _, m in events), events
 
 
+def test_stop_disconnects_ws_for_clean_restart():
+    """On shutdown the feed must DISCONNECT the Dhan WebSocket (and wait for the
+    close to flush), so a restart doesn't leave a stale session that 429-blocks
+    the new process. Regression for the restart feed outage."""
+    from app.engines.feed import LiveFeed
+
+    disconnected = {"n": 0}
+
+    class FakeFeed:
+        async def disconnect(self):
+            disconnected["n"] += 1
+
+    lf = LiveFeed(context_factory=lambda: None,
+                  instruments=lambda: [(0, "13", 15)],
+                  sec_to_underlying=lambda: {13: "NIFTY"},
+                  on_tick=lambda *a: None,
+                  on_event=lambda *a: None)
+
+    async def run():
+        # a live feed loop is running on THIS loop; wire it up as the feed loop
+        lf._feed = FakeFeed()
+        lf._feed_loop = asyncio.get_running_loop()
+        lf._running = True
+        # stop() calls run_coroutine_threadsafe on _feed_loop and .result()s it;
+        # run it off-thread so the loop is free to service the disconnect().
+        await asyncio.get_running_loop().run_in_executor(None, lf.stop)
+
+    asyncio.run(run())
+    assert disconnected["n"] == 1
+    assert lf._running is False
+
+
 def test_enable_chain_resubscribes_live_socket(tmp_path, monkeypatch):
     """An MCX name enabled AFTER the WS connected must force a resubscribe
     (observed 2026-07-15: canary missing until an unrelated reconnect)."""
