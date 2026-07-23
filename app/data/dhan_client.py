@@ -339,12 +339,37 @@ def get_client():
     return dhanhq(get_dhan_context())
 
 
+class DhanEmptyFailure(RuntimeError):
+    """Dhan returned status != success with NO error detail — its `remarks`
+    is absent or an all-None {error_code, error_type, error_message} dict.
+    This is a known intermittent server-side blip (2026-07-21: a rotating
+    set of stocks, ~1-in-8 requests), not a real per-symbol data problem, so
+    callers can retry/skip it instead of surfacing a useless error."""
+
+
+def _remarks_message(remarks) -> str:
+    """Human-readable text from a Dhan `remarks` field. Real failures carry a
+    string, or an {error_code, error_type, error_message} dict; the transient
+    blip carries an all-None version of that dict. Returns '' when there's
+    genuinely no detail — the caller treats that as a DhanEmptyFailure."""
+    if isinstance(remarks, dict):
+        msg = (remarks.get("error_message") or remarks.get("error_type")
+               or remarks.get("error_code"))
+        return str(msg) if msg else ""
+    return str(remarks) if remarks else ""
+
+
 def _unwrap(response: dict) -> dict:
-    """Return the `data` payload of a successful SDK response, else raise."""
+    """Return the `data` payload of a successful SDK response, else raise.
+    A message-less failure raises DhanEmptyFailure (transient); a described
+    one raises a plain RuntimeError with the extracted message."""
     if not isinstance(response, dict):
         raise RuntimeError(f"unexpected SDK response: {response!r}")
     if response.get("status") != "success":
-        raise RuntimeError(response.get("remarks") or "Dhan SDK call failed")
+        msg = _remarks_message(response.get("remarks"))
+        if not msg:
+            raise DhanEmptyFailure("Dhan returned an empty failure (no error detail)")
+        raise RuntimeError(msg)
     return response.get("data") or {}
 
 

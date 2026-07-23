@@ -128,8 +128,7 @@ def test_fetch_chain_retries_once_on_transient_failure(monkeypatch):
     def flaky_fetch(client, security_id, segment, expiry):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise RuntimeError({"error_code": None, "error_type": None,
-                                "error_message": None})
+            raise dhan_client.DhanEmptyFailure("Dhan returned an empty failure (no error detail)")
         return {"last_price": 100, "oc": {}}
 
     monkeypatch.setattr(dhan_client, "fetch_option_chain", flaky_fetch)
@@ -147,14 +146,44 @@ def test_fetch_chain_retries_once_on_transient_failure(monkeypatch):
     assert result == {"last_price": 100, "oc": {}}
 
 
-def test_fetch_chain_raises_after_exhausting_retries(monkeypatch):
+def test_fetch_chain_returns_none_on_persistent_empty_failure(monkeypatch):
+    """A message-less blip that survives the retry is transient noise, not a
+    real per-symbol problem — return None (skip the symbol this cycle) instead
+    of raising a detail-free error into the attention feed."""
+    import asyncio
+
+    from app.data import dhan_client
+
+    calls = {"n": 0}
+
+    def always_empty(client, security_id, segment, expiry):
+        calls["n"] += 1
+        raise dhan_client.DhanEmptyFailure("Dhan returned an empty failure (no error detail)")
+
+    monkeypatch.setattr(dhan_client, "fetch_option_chain", always_empty)
+    hub = MarketHub(_Store())
+    hub.CHAIN_MIN_INTERVAL = 0.0
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        return await hub._fetch_chain_ratelimited(
+            client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
+            expiry="2026-07-31", loop=loop)
+
+    result = asyncio.run(run())
+    assert calls["n"] == 2                # tried, retried, then gave up quietly
+    assert result is None
+
+
+def test_fetch_chain_raises_on_real_failure(monkeypatch):
+    """A DESCRIBED failure (auth expired, rate limited, ...) is a genuine
+    problem — it must still propagate after retries, not be swallowed."""
     import asyncio
 
     from app.data import dhan_client
 
     def always_fails(client, security_id, segment, expiry):
-        raise RuntimeError({"error_code": None, "error_type": None,
-                            "error_message": None})
+        raise RuntimeError("DH-901: Invalid access token")
 
     monkeypatch.setattr(dhan_client, "fetch_option_chain", always_fails)
     hub = MarketHub(_Store())
@@ -169,5 +198,5 @@ def test_fetch_chain_raises_after_exhausting_retries(monkeypatch):
     try:
         asyncio.run(run())
         assert False, "expected RuntimeError"
-    except RuntimeError:
-        pass
+    except RuntimeError as e:
+        assert "DH-901" in str(e)

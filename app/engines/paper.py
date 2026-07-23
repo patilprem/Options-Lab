@@ -622,6 +622,12 @@ class MarketHub:
                 self._last_chain_ts = time.monotonic()
         if retries > 0:
             return await self._fetch_chain_ratelimited(client, cfg, expiry, loop, retries - 1)
+        # Dhan's message-less blip is transient and expected; after exhausting
+        # retries, treat it as an empty chain (skip this symbol this cycle,
+        # re-poll next) rather than raising a detail-free error that would
+        # flood the attention feed. Real, described failures still propagate.
+        if isinstance(exc, dhan_client.DhanEmptyFailure):
+            return None
         raise exc
 
     def persist_chain_snapshots(self, store, underlyings=None) -> int:

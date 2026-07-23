@@ -986,6 +986,12 @@ class StockScanner:
                 if n:
                     registry.record_event("info", "scanner",
                                            f"tier-1 sweep: {n} stocks")
+            except dhan_client.DhanEmptyFailure as e:
+                # Known intermittent Dhan blip (message-less failure): the sweep
+                # just retries next cycle. Log it as plumbing ('data'/info) so it
+                # doesn't flood the Important attention feed as a real error.
+                registry.record_event("info", "data", f"tier-1 sweep skipped (transient): {e}")
+                client = None
             except Exception as e:
                 registry.record_event("warn", "scanner", f"sweep error: {e!r}")
                 client = None
