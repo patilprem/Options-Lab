@@ -62,6 +62,17 @@ class TradeConfig:
     max_positions: int = 5
     max_hold_days: int = 10          # positional, but not forever
     max_lots: int = 10
+    # -- behavioural gates (defaults preserve pre-existing behaviour exactly;
+    # they exist so the adaptation pipeline can TRIAL them — every knob here
+    # is reachable by the shadow challenger via replace(cfg, **overrides),
+    # so an insight rule mapped in adaptation.ADAPTABLE can prove its value
+    # on the virtual book before a human ever applies it) -------------------
+    reentry_cooldown_min: float = 0.0  # skip re-entering a symbol within N
+                                       # min of its own exit; 0 = off
+    entry_cutoff_min: int = 935      # no NEW entries at/after this minute of
+                                     # day (935 = 15:35 = session close = off)
+    fresh_buildup_only: int = 0      # 1 = only long/short buildup entries
+                                     # (skip covering/unwinding-fuelled)
 
 
 @dataclass
@@ -137,11 +148,27 @@ def exit_decision(pos: SPosition, premium: float, score: dict | None,
     return False, None
 
 
-def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig) -> list:
+def _minutes_of_day(ts) -> int:
+    return ts.hour * 60 + ts.minute
+
+
+def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig,
+                 now=None, last_exits: dict | None = None) -> list:
     """Symbols to open this cycle: highest-scoring setups above entry_score,
-    with a bias, not already held, up to the free-slot count."""
+    with a bias, not already held, up to the free-slot count.
+
+    The behavioural gates (entry cutoff, re-entry cooldown, fresh-buildup
+    filter) live HERE — the single choke point both the champion and the
+    shadow challenger enter through — so any TradeConfig knob is trialable
+    by the adaptation pipeline with no extra wiring. All three default to
+    off/no-op; `now` and `last_exits` ({symbol: exit datetime or ISO str})
+    are optional so pure-logic callers and old tests are unaffected."""
     slots = cfg.max_positions - len(held)
     if slots <= 0:
+        return []
+    # no NEW entries at/after the cutoff (exits/management are unaffected)
+    if now is not None and cfg.entry_cutoff_min and \
+            _minutes_of_day(now) >= cfg.entry_cutoff_min:
         return []
     out = []
     for sc in ranked_scores:
@@ -150,6 +177,23 @@ def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig) -> list:
             continue
         if (sc.get("score") or 0) < cfg.entry_score:
             continue
+        # skip covering/unwinding-fuelled setups when fresh-only is on
+        # (unknown buildup stays allowed — absence of data is not evidence)
+        if cfg.fresh_buildup_only and sc.get("buildup") in (
+                "short_covering", "long_unwinding"):
+            continue
+        # re-entry cooldown: don't re-buy a symbol within N min of its exit
+        if cfg.reentry_cooldown_min and now is not None and last_exits:
+            last = last_exits.get(sym)
+            if last is not None:
+                if isinstance(last, str):
+                    try:
+                        last = datetime.fromisoformat(last)
+                    except ValueError:
+                        last = None
+                if last is not None and (now - last).total_seconds() / 60.0 \
+                        < cfg.reentry_cooldown_min:
+                    continue
         out.append(sym)
         if len(out) >= slots:
             break
@@ -193,6 +237,9 @@ class ScannerTrader:
             max_positions=int(_f("scanner_trade_max_positions", 5)),
             max_hold_days=int(_f("scanner_trade_max_hold_days", 10)),
             max_lots=int(_f("scanner_trade_max_lots", 10)),
+            reentry_cooldown_min=_f("scanner_trade_reentry_cooldown_min", 0.0),
+            entry_cutoff_min=int(_f("scanner_trade_entry_cutoff_min", 935)),
+            fresh_buildup_only=int(_f("scanner_trade_fresh_buildup_only", 0)),
         )
 
     def _persist(self) -> None:
@@ -301,6 +348,13 @@ class ScannerTrader:
                 f"P&L ₹{round(realized)}")
             del self.book[sym]
             exited.add(sym)
+            # feed the re-entry cooldown gate (in-memory: a restart forgets
+            # these, so the worst case is one early re-entry after a restart
+            # — bounded by the cooldown length itself)
+            store = getattr(self, "_last_exit", None)
+            if store is None:
+                store = self._last_exit = {}
+            store[sym] = now
 
         # a closed trade is new evidence — reflect on the journal (at most
         # once a day) and surface any data-backed suggestion as an event
@@ -359,7 +413,8 @@ class ScannerTrader:
         # re-buy the same name on the still-elevated score (churn).
         held = set(self.book) | exited
         fees_today = 0.0
-        for sym in pick_entries(scanner.ranked_scores(), held, cfg):
+        for sym in pick_entries(scanner.ranked_scores(), held, cfg,
+                                now=now, last_exits=getattr(self, "_last_exit", None)):
             sc = scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
@@ -702,7 +757,16 @@ class ScannerTrader:
             del book[sym]
             exited.add(sym)
         held = set(book) | exited
-        for sym in pick_entries(scanner.ranked_scores(), held, chal_cfg):
+        # the challenger's OWN exit times (not the champion's) feed its
+        # cooldown gate — derived from its persisted closed-trades list so a
+        # cooldown trial survives restarts, unlike the champion's in-memory map
+        chal_last_exit: dict = {}
+        for c in closed:
+            s, ts = c.get("symbol"), c.get("ts")
+            if s and ts and ts > chal_last_exit.get(s, ""):
+                chal_last_exit[s] = ts
+        for sym in pick_entries(scanner.ranked_scores(), held, chal_cfg,
+                                now=now, last_exits=chal_last_exit):
             sc = scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
@@ -834,5 +898,8 @@ class ScannerTrader:
             "positions": positions,
             "config": {"entry_score": cfg.entry_score, "exit_score": cfg.exit_score,
                        "trail_pct": cfg.trail_pct, "hard_stop_pct": cfg.hard_stop_pct,
-                       "target_pct": cfg.target_pct, "risk_pct": cfg.risk_pct},
+                       "target_pct": cfg.target_pct, "risk_pct": cfg.risk_pct,
+                       "reentry_cooldown_min": cfg.reentry_cooldown_min,
+                       "entry_cutoff_min": cfg.entry_cutoff_min,
+                       "fresh_buildup_only": cfg.fresh_buildup_only},
         }

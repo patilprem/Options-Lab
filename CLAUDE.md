@@ -74,7 +74,14 @@ off-hours window; genuinely urgent fixes get the marker.
   (a 'worse' verdict surfaces a revert warning). Discarded/dismissed rules
   cool down 30 days. NEVER auto-applies — the ONLY settings-mutation path is
   apply_proposal(). Strategies get the same discipline via walkforward.py
-  (derive on IS, validate OOS), not a shadow book.
+  (derive on IS, validate OOS), not a shadow book. HOLISTIC coverage: every
+  journal-insight rule with a scalar-izable remedy has an ADAPTABLE mapping —
+  incl. the behavioural gates reentry_cooldown_min / entry_cutoff_min /
+  fresh_buildup_only, which live in TradeConfig (defaults = off/no-op) and are
+  enforced inside pick_entries(), the single choke point both champion and
+  shadow challenger enter through, so a challenger override trials them with
+  no extra wiring. Only `fast_hard_stops` stays human-only (its remedy — a
+  confirmation entry — is a state machine, not a scalar).
 - `app/engines/walkforward.py` `adaptive_search` + `app/engines/strategy_adapt.py`
   — the Strategy twin of the scanner adaptation loop. Persistence (an insight
   fires ≥3 distinct days) ARMS a scan; the scan builds ONE-step bounded param

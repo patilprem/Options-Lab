@@ -42,8 +42,13 @@ EMBARGO_DAYS = 21         # no new trials for this long after an apply
 RULE_COOLDOWN_DAYS = 30   # a discarded/dismissed rule waits this long
 
 # Which insight rules may adapt which param, by ONE bounded step per apply,
-# inside hard clamps. Behavioural rules (confirmation entry, cooldowns) stay
-# human-only — only scalar knobs self-tune.
+# inside hard clamps. HOLISTIC by design: every insight rule the journal
+# engine can fire maps to a knob here whenever a scalar knob can express it
+# — behavioural gates included (cooldown / entry cutoff / fresh-buildup are
+# TradeConfig fields precisely so the shadow challenger can trial them).
+# The one exception is `fast_hard_stops`: its remedy (a confirmation entry —
+# wait for a second signal before filling) is a state machine, not a scalar,
+# so it stays human-only until someone builds that knob.
 ADAPTABLE: dict[str, dict] = {
     "trail_giveback":    {"param": "trail_pct",     "step": -0.05,
                           "lo": 0.10, "hi": 0.40,
@@ -54,6 +59,26 @@ ADAPTABLE: dict[str, dict] = {
     "raise_entry_score": {"param": "entry_score",   "step": 5.0,
                           "lo": 50.0, "hi": 85.0,
                           "label": "raise the entry score"},
+    # churn: re-entries within ~30 min of an exit losing money -> one step
+    # turns the cooldown on at exactly the churn window the insight measures
+    "churn":             {"param": "reentry_cooldown_min", "step": 30.0,
+                          "lo": 0.0, "hi": 60.0,
+                          "label": "add a per-symbol re-entry cooldown"},
+    # late_entries: afternoon entries losing while mornings win -> pull the
+    # new-entry cutoff earlier one hour per step (935 = 15:35 = off)
+    "late_entries":      {"param": "entry_cutoff_min", "step": -60,
+                          "lo": 815, "hi": 935,
+                          "label": "stop opening new positions earlier"},
+    # fresh_buildup_only: covering/unwinding-fuelled entries losing while
+    # fresh-OI buildup wins -> flip the fresh-only filter (0 -> 1)
+    "fresh_buildup_only": {"param": "fresh_buildup_only", "step": 1,
+                           "lo": 0, "hi": 1,
+                           "label": "require fresh OI buildup at entry"},
+    # fee_drag: fees eating winners -> same lever as raise_entry_score
+    # (fewer, higher-conviction trades); embargo prevents stacking applies
+    "fee_drag":          {"param": "entry_score",   "step": 5.0,
+                          "lo": 50.0, "hi": 85.0,
+                          "label": "raise the entry score (cut fee churn)"},
 }
 
 

@@ -1720,6 +1720,9 @@ class TraderSettingsReq(BaseModel):
     risk_pct: float | None = None
     max_positions: int | None = None
     capital: float | None = None
+    reentry_cooldown_min: float | None = None
+    entry_cutoff_min: int | None = None
+    fresh_buildup_only: int | None = None
 
 
 @scanner_router.post("/scanner/trade-settings")
@@ -1735,6 +1738,9 @@ def set_trader(req: TraderSettingsReq):
         ("scanner_trade_risk_pct", req.risk_pct, 0.001, 0.2),
         ("scanner_trade_max_positions", req.max_positions, 1, 50),
         ("scanner_trade_capital", req.capital, 0.0, 1e9),
+        ("scanner_trade_reentry_cooldown_min", req.reentry_cooldown_min, 0.0, 120.0),
+        ("scanner_trade_entry_cutoff_min", req.entry_cutoff_min, 780, 935),
+        ("scanner_trade_fresh_buildup_only", req.fresh_buildup_only, 0, 1),
     ]:
         if val is not None:
             registry.set_setting(key, str(max(lo, min(hi, val))))
