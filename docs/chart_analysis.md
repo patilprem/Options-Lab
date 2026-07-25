@@ -340,5 +340,68 @@ small-N caveat flagged when this was built:
    itself. Not obviously fixable without a tighter initial stop specifically
    for high-volatility/fast-spike entries.
 
+---
+
+## NIFTY 50 index — 3-day technical read (2026-07-22 to 07-24)
+
+Standalone read of the index itself (5m), not a scanner-traded instrument —
+context for *why* the stock-level entries above looked the way they did,
+kept separate from the per-day trade comparisons since there's no
+scanner_journal round trip to check it against.
+
+**2026-07-22 (Wed)**: O 24,150.45 · H 24,166.30 · L 24,076.15 · C 24,094.10
+(‑98.95, ‑0.41%). Fast opening decline (first 30–45 min, ~24,150→24,000),
+then a tight chop 24,000–24,040 through midday, then a second, cleaner leg
+down into the close (24,000→23,917).
+- Good entry (short bias): the retest of the opening-drive breakdown level
+  after the first fast decline — not the first red candle itself.
+- Hard-to-hit-SL zone: the midday 24,000–24,040 chop — a tight short
+  entered right at the open would have been stopped/whipsawed here before
+  the real afternoon continuation.
+- Best exit zone: into the acceleration going into the close, the fastest,
+  cleanest part of the move.
+
+**2026-07-23 (Thu)**: O 23,904.80 · H 23,916.05 · L 23,876.20 · C 23,915.35
+(‑75.70, ‑0.32%). Chop 23,920–23,960 through the morning, a rounded top,
+then the cleanest single trending segment of the 3 days — a sustained
+breakdown from ~23,920 to a low near 23,800 through the afternoon — followed
+by a sharp V-shaped short-covering bounce in the final 30–45 minutes that
+round-tripped almost the entire afternoon decline back up to close near
+flat (23,915, barely below the morning range).
+- Good entry (short bias): the clean break of the 23,920 morning-range
+  support, the best-trending window of the whole set.
+- Hard-to-hit-SL zone: same morning chop pattern as 07-22.
+- **The critical risk this day**: holding a short into the last 30–45
+  minutes. The late reversal gave back the entire afternoon's move (~115
+  points) in a short covering rally — a short had to be closed into
+  strength (near the low), not held into the close.
+
+**2026-07-24 (Fri)**: O 23,666.35 · H 23,752.80 · L 23,646.90 · C 23,751.70
+(current as of this read; index gapped down ~249 points / ~‑1.0% overnight
+from 07-23's 23,915 close). Sharp continuation of the gap-down for the
+first 15–20 minutes to the day's low (~23,647), then a strong, sustained
+V-shaped recovery rally through midday to ~23,800–23,820, then a choppy
+23,750–23,800 consolidation into the early afternoon.
+- Good entry (long bias): the exact capitulation low right as the
+  gap-down's panic selling exhausted (~23,647–23,660) — buying the
+  low, not the initial panic candle, led into the cleanest, longest
+  trending move of the 3 days.
+- Hard-to-hit-SL zone: the early-afternoon 23,750–23,800 chop — a tight
+  stop on a long initiated during the rally gets tested repeatedly here
+  even though the broader recovery from the gap-down low stayed intact.
+
+**Why this matters for the stock-level read above**: 07-24's dominant
+entry reason across COFORGE, PERSISTENT, TATAELXSI, and CIPLA was
+`short_covering` / `moved +X%` — i.e. a broad bullish move. NIFTY's own
+gap-down-then-V-recovery this same day is very likely the macro driver:
+a broad, index-wide relief rally off a capitulation low was lifting
+individual FNO names with it, not name-specific news. Worth remembering
+when reading any single day's stock-level "buy the pullback, not the
+spike" lesson — on a day like 07-24, the whole market's "pullback" was the
+index's own gap-down low, and names chasing the LATER stage of that
+market-wide bounce (as several 07-24 entries did — TATAELXSI, PERSISTENT's
+first two entries) were effectively chasing the SAME extended move NIFTY
+itself had already made most of by midday.
+
 *(Next day's entry: repeat the same SSH → sqlite3/python3 dump → chart
 comparison, append below this line.)*
