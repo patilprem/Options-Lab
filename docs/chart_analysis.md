@@ -349,6 +349,13 @@ context for *why* the stock-level entries above looked the way they did,
 kept separate from the per-day trade comparisons since there's no
 scanner_journal round trip to check it against.
 
+Indicators visible on the charts: standard floor-trader **pivot points**
+(the thick dotted red/yellow horizontal lines — S1/S2/PP/R1/R2), a fast and
+slow **moving average pair** (orange = faster, pink/magenta = slower), a
+wide-swinging **volatility band** (blue), and what reads as a
+**Supertrend-style trailing stop** (the green stepped line — flat until it
+flips, then trails the trend).
+
 **2026-07-22 (Wed)**: O 24,150.45 · H 24,166.30 · L 24,076.15 · C 24,094.10
 (‑98.95, ‑0.41%). Fast opening decline (first 30–45 min, ~24,150→24,000),
 then a tight chop 24,000–24,040 through midday, then a second, cleaner leg
@@ -360,6 +367,17 @@ down into the close (24,000→23,917).
   the real afternoon continuation.
 - Best exit zone: into the acceleration going into the close, the fastest,
   cleanest part of the move.
+- **Near the indicators**: the opening decline sliced straight through a
+  cluster of pivot levels (24,120→24,080→24,040→24,000) with barely a
+  pause at any of them — strong momentum blowing through the pivot grid,
+  not a level-by-level fight. The midday chop was price oscillating
+  *between* the orange and pink MAs as they converged (classic
+  MA-compression = indecision), while the blue volatility band contracted
+  in step. The green trailing-stop line sat flat/elevated through the
+  whole chop and only flipped down as the final afternoon leg broke —
+  a lagging but clean trend-confirmation, not a leading signal. Close
+  landed just below the lowest pivot support (~23,920) — a genuinely
+  bearish close relative to the pivot grid, not just relative to the open.
 
 **2026-07-23 (Thu)**: O 23,904.80 · H 23,916.05 · L 23,876.20 · C 23,915.35
 (‑75.70, ‑0.32%). Chop 23,920–23,960 through the morning, a rounded top,
@@ -375,6 +393,18 @@ flat (23,915, barely below the morning range).
   minutes. The late reversal gave back the entire afternoon's move (~115
   points) in a short covering rally — a short had to be closed into
   strength (near the low), not held into the close.
+- **Near the indicators**: the morning chop was a genuine pivot range —
+  price respected both the ~23,920 support and ~23,960 resistance pivots
+  repeatedly for over two hours, real S/R here, not noise. The afternoon
+  breakdown was a clean break of the 23,920 pivot (not just an MA cross),
+  continuing to the next pivot support near 23,840 and on to the ~23,800
+  low where the reversal began. The green trailing-stop line flipped right
+  at the breakdown and stayed low through the whole decline without
+  re-flipping — it avoided whipsawing during the earlier chop by staying
+  flat, then tracked the real move once it started. The closing V-bounce
+  punched back up through the orange MA, then the pink MA, and closed
+  right back **at** the same ~23,920 pivot that had been support all
+  morning — a "reclaim" close, not just a bounce that stalled short of it.
 
 **2026-07-24 (Fri)**: O 23,666.35 · H 23,752.80 · L 23,646.90 · C 23,751.70
 (current as of this read; index gapped down ~249 points / ~‑1.0% overnight
@@ -389,6 +419,18 @@ V-shaped recovery rally through midday to ~23,800–23,820, then a choppy
 - Hard-to-hit-SL zone: the early-afternoon 23,750–23,800 chop — a tight
   stop on a long initiated during the rally gets tested repeatedly here
   even though the broader recovery from the gap-down low stayed intact.
+- **Near the indicators**: the day's low (23,646.90) landed almost exactly
+  on a pivot support line near 23,600–23,610 — the level held on its first
+  and only test, a textbook pivot-support bounce, not a random low. The
+  recovery climbed the pivot ladder in order — reclaiming the ~23,720
+  pivot, then the ~23,800 pivot, each acting as fresh resistance that got
+  tested and cleared in turn rather than one clean vertical move. The
+  green trailing-stop line flipped up right as price crossed the orange MA
+  during the recovery, then trailed cleanly below price the rest of the
+  way — it stayed valid (no whipsaw) straight through the choppy
+  23,750–23,800 consolidation, meaning that chop never actually threatened
+  the uptrend by this indicator's own read, even though it would have
+  stopped out a tight fixed-distance stop.
 
 **Why this matters for the stock-level read above**: 07-24's dominant
 entry reason across COFORGE, PERSISTENT, TATAELXSI, and CIPLA was
