@@ -85,6 +85,7 @@ async def _market_recorder():
     MCX names also need MCX security ids in dhan_client.UNDERLYINGS."""
     loop = asyncio.get_running_loop()
     delay = 15    # first pass right after boot: registers MCX names with the
+    skips = 0     # consecutive in-session cycles that persisted nothing
     while True:   # feed (canary + recorder) instead of waiting out a full tick
         await asyncio.sleep(delay)
         delay = 300
@@ -132,7 +133,31 @@ async def _market_recorder():
             # clock gate but serve a frozen chain — identical fingerprint)
             changed = hub.chain_changed(live_names)
             if not changed:
+                # A frozen chain (holiday) and a DEAD chain poller both land
+                # here, and used to look IDENTICAL in the log: nothing written
+                # at all. That silence made the 2026-07-24 index-chain gap
+                # undiagnosable after the fact — the data was simply missing
+                # with no trace of why. Distinguish the two cases now:
+                #   fingerprint None -> the poller never populated a cache for
+                #     that name (a real outage: dead client, expired token,
+                #     unresolved security id)
+                #   fingerprint unchanged -> genuinely frozen (holiday), fine
+                # Escalating thresholds keep a real holiday from spamming the
+                # log every 5 minutes while still making an outage loud.
+                if live_names:
+                    skips += 1
+                    if skips in (3, 12, 48):     # ~15 min, ~1 h, ~4 h
+                        cold = [u for u in live_names
+                                if hub._chain_fingerprint(u) is None]
+                        registry.record_event(
+                            "warn", "feed",
+                            f"recorder: nothing persisted for {skips} cycles "
+                            f"during an open session — no chain cache for "
+                            f"{cold or 'none'}; "
+                            f"{sorted(set(live_names) - set(cold)) or 'none'} "
+                            "cached but unchanged (frozen)")
                 continue                      # closed or frozen — nothing real
+            skips = 0
             n_full = hub.persist_chain_full(store, underlyings=changed)
             n_atm = hub.persist_chain_snapshots(store, underlyings=changed)
             hub.mark_chain_persisted(changed)
