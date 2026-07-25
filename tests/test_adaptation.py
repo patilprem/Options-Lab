@@ -234,3 +234,31 @@ def test_settings_only_change_via_apply(tmp_path, monkeypatch):
     trader._daily_reflection(trader._cfg(), date(2026, 7, 16))   # starts trial
     after = trader._cfg()
     assert after == before                       # trading config untouched
+
+
+def test_every_scalar_insight_rule_is_adaptable():
+    """Holistic coverage: every rule journal_insights can fire has an
+    ADAPTABLE mapping, except fast_hard_stops (its remedy — a confirmation
+    entry — is a state machine, not a scalar; documented human-only)."""
+    all_rules = {"trail_giveback", "fast_hard_stops", "raise_entry_score",
+                 "late_entries", "churn", "tighten_hard_stop",
+                 "fresh_buildup_only", "fee_drag"}
+    assert set(A.ADAPTABLE) == all_rules - {"fast_hard_stops"}
+
+
+def test_behavioural_rule_overrides_step_and_clamp():
+    from dataclasses import asdict
+    from app.engines.scanner_trader import TradeConfig
+    cfg = asdict(TradeConfig())
+    # churn: cooldown off (0) -> one step turns it on at 30 min
+    assert A.challenger_overrides(cfg, "churn") == {"reentry_cooldown_min": 30.0}
+    # late_entries: 935 (off) -> one hour earlier
+    assert A.challenger_overrides(cfg, "late_entries") == {"entry_cutoff_min": 875}
+    # fresh filter: 0 -> 1
+    assert A.challenger_overrides(cfg, "fresh_buildup_only") == {"fresh_buildup_only": 1}
+    # fee_drag shares the entry_score lever
+    assert A.challenger_overrides(cfg, "fee_drag") == {"entry_score": 70.0}
+    # clamped ends refuse a trial rather than stepping past the rail
+    assert A.challenger_overrides({"reentry_cooldown_min": 60.0}, "churn") is None
+    assert A.challenger_overrides({"fresh_buildup_only": 1}, "fresh_buildup_only") is None
+    assert A.challenger_overrides({"entry_cutoff_min": 815}, "late_entries") is None

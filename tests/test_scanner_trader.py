@@ -85,6 +85,60 @@ def test_exit_max_hold_and_hold_otherwise():
     assert hold is False
 
 
+# --- pure: behavioural gates (the holistic-adaptation knobs) ----------------
+
+def _score(sym="AAA", score=80, bias="CE", buildup="long_buildup"):
+    return {"symbol": sym, "score": score, "bias": bias, "buildup": buildup}
+
+
+def test_defaults_leave_behaviour_unchanged():
+    """All three gates default to off/no-op — pre-existing callers that pass
+    no now/last_exits must see identical picks (adaptation PROPOSES change;
+    shipping the knobs must not BE a change)."""
+    cfg = TradeConfig()
+    late = datetime(2026, 7, 27, 15, 34)   # 1 min before close
+    picks = st.pick_entries(
+        [_score(buildup="short_covering")], set(), cfg,
+        now=late, last_exits={"AAA": datetime(2026, 7, 27, 15, 33)})
+    assert picks == ["AAA"]
+
+
+def test_reentry_cooldown_blocks_then_releases():
+    cfg = TradeConfig(reentry_cooldown_min=30)
+    exit_ts = datetime(2026, 7, 27, 11, 0)
+    ranked = [_score()]
+    # 10 min after the exit: blocked
+    assert st.pick_entries(ranked, set(), cfg,
+                           now=datetime(2026, 7, 27, 11, 10),
+                           last_exits={"AAA": exit_ts}) == []
+    # 31 min after: allowed again
+    assert st.pick_entries(ranked, set(), cfg,
+                           now=datetime(2026, 7, 27, 11, 31),
+                           last_exits={"AAA": exit_ts}) == ["AAA"]
+    # ISO-string exit times (the challenger's persisted form) work too
+    assert st.pick_entries(ranked, set(), cfg,
+                           now=datetime(2026, 7, 27, 11, 10),
+                           last_exits={"AAA": exit_ts.isoformat()}) == []
+
+
+def test_entry_cutoff_blocks_new_entries_only_after_time():
+    cfg = TradeConfig(entry_cutoff_min=13 * 60 + 30)   # 13:30
+    ranked = [_score()]
+    assert st.pick_entries(ranked, set(), cfg,
+                           now=datetime(2026, 7, 27, 13, 29)) == ["AAA"]
+    assert st.pick_entries(ranked, set(), cfg,
+                           now=datetime(2026, 7, 27, 13, 30)) == []
+
+
+def test_fresh_buildup_only_skips_covering_and_unwinding():
+    cfg = TradeConfig(fresh_buildup_only=1)
+    ranked = [_score("AAA", buildup="short_covering"),
+              _score("BBB", buildup="long_unwinding"),
+              _score("CCC", buildup="short_buildup", bias="PE"),
+              _score("DDD", buildup=None)]        # unknown stays allowed
+    assert st.pick_entries(ranked, set(), cfg) == ["CCC", "DDD"]
+
+
 # --- pure: entry pick -------------------------------------------------------
 
 def test_pick_entries_respects_score_bias_and_slots():
@@ -288,6 +342,38 @@ def test_manage_marks_and_exits_without_opening_new_positions(tmp_path, monkeypa
     row = next(r for r in reg.performance_rows(st.STRATEGY_ID, "PAPER")
               if r["trade_date"] == today)
     assert row["realized"] > 0                  # the trailing exit was booked
+
+
+def test_cooldown_blocks_immediate_rebuy_after_exit(tmp_path, monkeypatch):
+    """End-to-end churn guard: with reentry_cooldown_min set, a symbol that
+    just exited is NOT re-bought on the next cycle even though its score
+    still clears entry_score (the exact INFY 07-24 failure: 9 re-entries on
+    a persistently-elevated score, net -Rs15,327)."""
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+    reg.set_setting("scanner_trade_reentry_cooldown_min", "30")
+
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+
+    hub, scanner = _FakeHub(), _FakeScanner()
+    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, scanner)
+    assert "RELIANCE" in trader.book
+    hub.set_atm("RELIANCE", "CALL", ltp=13.0)      # 35% down -> hard stop
+    trader.step(hub, scanner)
+    assert "RELIANCE" not in trader.book
+
+    # score is still 80 and a fresh cycle runs — cooldown must block the rebuy
+    hub.set_atm("RELIANCE", "CALL", ltp=13.5)
+    trader.step(hub, scanner)
+    assert "RELIANCE" not in trader.book
 
 
 def test_entry_ctx_premium_distance_needs_history(tmp_path, monkeypatch):
