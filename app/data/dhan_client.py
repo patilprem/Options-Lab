@@ -31,10 +31,15 @@ the storage boundary can be verified without network or credentials.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from app.data.sessions import in_session
+
+_log = logging.getLogger(__name__)
 
 # IST is UTC+5:30. Dhan historical APIs return epoch seconds; we convert to
 # a naive IST datetime at this boundary so the store matches everything else
@@ -494,10 +499,25 @@ def parse_expired_option_rows(underlying: str, strike_offset: int, option_type: 
 # ---------------------------------------------------------------------------
 
 def upsert_underlying_rows(store, rows: list[tuple]) -> int:
-    if rows:
+    """Insert intraday candles, DROPPING any that fall outside their
+    exchange's regular session.
+
+    Dhan's intraday historical response is trusted input everywhere else in
+    this module, but it reaches underlying_bars unvalidated, and the nightly
+    gap repair replays it every weekday. On 2026-07-27 that produced flat
+    zero-volume candles stamped after the NSE close. Filtering here means the
+    research dataset can't be poisoned by a single odd response — see
+    app/data/sessions.py. Returns the number of rows actually written."""
+    kept = [r for r in rows if in_session(r[1], r[0])]
+    dropped = len(rows) - len(kept)
+    if dropped:
+        _log.warning("dropped %d out-of-session underlying rows (e.g. %s %s)",
+                     dropped, rows[0][0],
+                     next(r[1] for r in rows if not in_session(r[1], r[0])))
+    if kept:
         store.con.executemany(
-            "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)", rows)
-    return len(rows)
+            "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)", kept)
+    return len(kept)
 
 
 def upsert_option_rows(store, rows: list[tuple]) -> int:

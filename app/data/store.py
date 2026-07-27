@@ -18,6 +18,7 @@ market so you can develop and test the whole platform before wiring Dhan.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
@@ -25,6 +26,9 @@ from datetime import datetime, date, timedelta, time
 from pathlib import Path
 
 from app.core.contract import Bar, OptionQuote, OptionType, LegSpec
+from app.data.sessions import in_session
+
+_log = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parents[2] / "marketdata.duckdb"
 
@@ -283,7 +287,15 @@ class DataStore:
 
     def upsert_live_bar(self, underlying: str, bar) -> None:
         """Persist one completed live 5-min candle so the store stays current
-        without re-backfilling (backtests can include today)."""
+        without re-backfilling (backtests can include today).
+
+        Out-of-session bars are DROPPED, not stored. The tick gate upstream
+        should already have rejected them, but this is the table's own last
+        line of defence — see app/data/sessions.py for the phantom-candle
+        incident that motivated guarding the write and not just the tick."""
+        if not in_session(bar.ts, underlying):
+            _log.warning("dropped out-of-session bar: %s %s", underlying, bar.ts)
+            return
         with self._lock:
             self.con.execute(
                 "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)",

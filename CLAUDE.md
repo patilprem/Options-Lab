@@ -149,6 +149,12 @@ off-hours window; genuinely urgent fixes get the marker.
   global gate), caches quotes, and `hub.quote` serves them to fills (fallback
   to store). `hub.persist_chain_snapshots` writes snapshots into option_bars
   (used by the MCX recorder).
+- `app/data/sessions.py` — THE canonical exchange session windows
+  (NSE 09:15–15:30, MCX 09:00–23:30). Every underlying_bars write goes
+  through `in_session()`: the live tick gate (paper._tick_ok), the live-bar
+  upsert, AND the backfill. Guarding only ticks was not enough — the nightly
+  gap repair wrote post-close phantom candles straight into the table.
+  Unknown underlyings get the stricter NSE window.
 - `app/data/store.py` — DuckDB schema (underlying_bars, option_bars with
   ATM-relative keys) + SyntheticStore fallback.
 - `app/data/dhan_client.py` — dhanhq SDK wrappers + backfill CLI.
