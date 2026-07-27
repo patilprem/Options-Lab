@@ -157,6 +157,19 @@ def resolve_index_futures(max_age_h: float = 24.0) -> dict:
     it deliberately does NOT reuse _FNO_MASTER_CACHE, which the scanner rewrites
     with FUTSTK/EQUITY rows only and would leave this returning EMPTY. Live-
     verify on the VPS: the FUTIDX trading-symbol format and the NSE-FnO int."""
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    return parse_index_futures(index_fut_master_rows(max_age_h),
+                               INDEX_FUT_NAMES, today)
+
+
+def index_fut_master_rows(max_age_h: float = 24.0) -> list:
+    """The cached FUTIDX scrip-master rows (downloading/trimming on miss).
+
+    Split out of resolve_index_futures so the retroactive volume backfill can
+    resolve the front-month contract PER HISTORICAL DATE against the same
+    rows, instead of only for today. Note the master lists currently-listed
+    contracts only — app/data/index_volume.py handles the expired-and-delisted
+    case rather than silently resolving to the wrong contract."""
     import csv
     import io
     import urllib.request
@@ -173,10 +186,8 @@ def resolve_index_futures(max_age_h: float = 24.0) -> dict:
                              if (ln.startswith("NSE,") or ln.startswith("BSE,"))
                              and "FUTIDX" in ln]
         _IDX_FUT_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
-    rows = list(csv.DictReader(io.StringIO(
+    return list(csv.DictReader(io.StringIO(
         _IDX_FUT_MASTER_CACHE.read_text(encoding="utf-8"))))
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    return parse_index_futures(rows, INDEX_FUT_NAMES, today)
 
 
 # ---------------------------------------------------------------------------
