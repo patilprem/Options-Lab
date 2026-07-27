@@ -126,6 +126,8 @@ class MarketHub:
     # Which ATM-relative expiries to poll per underlying (WEEKLY 0 = current
     # week, 1 = next). Covers the common intraday + rollover cases; one chain
     # fetch yields every strike_offset for that expiry.
+    RECORD_INTERVAL = 5       # timeframe built for recorder-only (chain-only)
+                              # names so their spot/futures history persists
     CHAIN_TARGETS = (("WEEKLY", 0), ("WEEKLY", 1))
     CHAIN_MIN_INTERVAL = 3.0  # Dhan option-chain rate limit: 1 req / 3 s
     # Requests share one global 3s gate, so every extra (underlying, expiry)
@@ -187,6 +189,15 @@ class MarketHub:
         started and `underlying` present in dhan_client.UNDERLYINGS."""
         first_time = underlying not in self._chain_only
         self._chain_only.add(underlying)
+        # Give recorder-only names a candle builder too. Only register() used
+        # to create one, and only STRATEGIES call register() — so chain-only
+        # names (the MCX recorder's CRUDEOIL/GOLD) had their futures ticks
+        # arrive and get silently dropped in _on_tick, and underlying_bars
+        # recorded nothing for them ever. Observed 2026-07-27: 152 rows (two
+        # NSE names x 75 bars) frozen while MCX traded for hours, leaving MCX
+        # spot history absent and unbacktestable.
+        self._builders.setdefault(
+            (underlying, self.RECORD_INTERVAL), CandleBuilder(self.RECORD_INTERVAL))
         # a name added AFTER the socket connected needs a resubscribe, same
         # as register() — else the WS carries the old instrument list until
         # some unrelated reconnect (observed: MCX canary missing post-boot)
@@ -248,6 +259,15 @@ class MarketHub:
                 # UI pill can say Off-hours (not Quiet) when only OTHER
                 # exchanges are open (e.g. MCX evenings on an NSE-only feed)
                 "segments": sorted(self._watch_segments())}
+
+    def _tick_intervals(self, underlying: str) -> tuple:
+        """Timeframes to build for `underlying`: whatever strategies asked for,
+        plus RECORD_INTERVAL for chain-only names so the recorder gets their
+        candles (see enable_chain for why that was missing)."""
+        ivs = set(self._wanted.get(underlying, ()))
+        if underlying in self._chain_only:
+            ivs.add(self.RECORD_INTERVAL)
+        return tuple(ivs)
 
     def _watch_segments(self) -> set[str]:
         """Exchanges whose sessions the watchdog/pill should judge — all
@@ -467,7 +487,7 @@ class MarketHub:
         _on_companion."""
         if not self._tick_ok(ts):
             return
-        for interval in tuple(self._wanted.get(underlying, ())):
+        for interval in self._tick_intervals(underlying):
             builder = self._builders.get((underlying, interval))
             if builder is None:
                 continue
@@ -483,7 +503,7 @@ class MarketHub:
         rolls the bucket carries the accumulated volume/OI out."""
         if not self._tick_ok(ts):
             return
-        for interval in tuple(self._wanted.get(underlying, ())):
+        for interval in self._tick_intervals(underlying):
             builder = self._builders.get((underlying, interval))
             if builder is not None:
                 builder.add_volume(volume, oi)
@@ -502,6 +522,14 @@ class MarketHub:
             if datetime.now(IST).weekday() >= 5:
                 continue
             for (u, interval), builder in self._builders.items():
+                # 15:31 is the NSE close. MCX trades to 23:30, so flushing an
+                # MCX builder here would persist a PARTIAL candle mid-session
+                # and then keep filling the next one — silently corrupting the
+                # very MCX history we just started recording. Let MCX builders
+                # roll naturally on their own ticks.
+                cfg = UNDERLYINGS.get(u) or {}
+                if "MCX" in str(cfg.get("segment", "")):
+                    continue
                 bar = builder.flush()
                 if bar is not None:
                     self._emit(("bar", u, interval, bar))
