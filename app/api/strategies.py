@@ -294,6 +294,51 @@ def data_coverage():
                      if store_kind == "SyntheticStore" else "")}
 
 
+@data_router.get("/data/health")
+def data_health(stale_min: int = 20):
+    """Is every live recorder ACTUALLY writing? Per-table newest row, rows
+    today, and a stale flag during market hours.
+
+    Exists because the 2026-07-23..27 outage was invisible: chain_snapshots
+    stopped for the index names for five days while /data/coverage still
+    looked healthy (it reports underlying_bars dates and a bare option_bars
+    count, so a table that stopped writing is indistinguishable from one that
+    never had data). `stale` is only meaningful while a session is open — an
+    idle table at 02:00 is correct, not broken — so it's computed against the
+    NSE/MCX session windows rather than wall-clock alone."""
+    from app.engines.paper import IST
+    from app.engines.watchdog import session_open_for
+    if not hasattr(_store, "recording_health"):
+        return {"store": type(_store).__name__, "synthetic": True,
+                "note": "synthetic store — nothing is recorded", "tables": []}
+    now = datetime.now(IST).replace(tzinfo=None)
+    nse_open = session_open_for({"NSE"}, now)
+    mcx_open = session_open_for({"MCX"}, now)
+    any_open = nse_open or mcx_open
+    tables = []
+    for row in _store.recording_health():
+        age_min = None
+        last = row.get("last_ts")
+        if last:
+            try:
+                age_min = round(
+                    (now - datetime.fromisoformat(str(last))).total_seconds() / 60.0, 1)
+            except ValueError:
+                pass
+        # stale only counts during an open session: a quiet table off-hours is
+        # correct behaviour, and flagging it would train you to ignore the flag
+        row["age_min"] = age_min
+        row["stale"] = bool(any_open and row["present"]
+                            and (age_min is None or age_min > stale_min))
+        tables.append(row)
+    return {"store": type(_store).__name__, "synthetic": False,
+            "session_open": {"NSE": nse_open, "MCX": mcx_open},
+            "stale_threshold_min": stale_min,
+            "recording_on": registry.setting("recording", "on") == "on",
+            "any_stale": any(t["stale"] for t in tables),
+            "tables": tables}
+
+
 _MATURITY_STAGES = [
     # (min learning days, stage, what it unlocks)
     (0,  "Infant",         "collecting first sessions — no conclusions yet"),

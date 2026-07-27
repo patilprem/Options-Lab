@@ -204,6 +204,52 @@ class DataStore:
                GROUP BY ts ORDER BY ts""",
             [underlying, strike, option_type, expiry_kind, expiry_offset, end])
 
+    # Every table the live recorders write, with the column holding its
+    # event time. Backs recording_health() — see there for why this exists.
+    _RECORDED_TABLES = (
+        ("underlying_bars",   "ts"),
+        ("option_bars",       "ts"),
+        ("chain_snapshots",   "ts"),
+        ("index_bias_history", "ts"),
+        ("setup_flags",       "ts"),
+        ("stock_snapshots",   "ts"),
+    )
+
+    def recording_health(self) -> list[dict]:
+        """Per-table freshness audit: newest row, rows today, distinct
+        sessions. One query per table, no scans of full history.
+
+        Exists because the 2026-07-23..27 outage was invisible: chain_snapshots
+        silently stopped for the index names for FIVE DAYS while everything
+        else looked healthy, and the only symptom was absent rows nobody was
+        counting. /data/coverage reports underlying_bars dates and a bare
+        option_bars COUNT — so a table that stops writing looks identical to
+        one that never had data. This makes 'is every recorder actually
+        writing?' a question with a direct answer.
+
+        Missing tables report present=False rather than raising, so a schema
+        that predates a table doesn't break the whole audit."""
+        out = []
+        for table, tscol in self._RECORDED_TABLES:
+            row = {"table": table, "present": True, "last_ts": None,
+                   "rows_today": 0, "sessions": 0, "error": None}
+            try:
+                r = self._q1(
+                    f"SELECT max({tscol}), count(*), "  # noqa: S608 - fixed names
+                    f"count(DISTINCT CAST({tscol} AS DATE)) FROM {table}")
+                if r:
+                    row["last_ts"] = str(r[0]) if r[0] is not None else None
+                    row["sessions"] = int(r[2] or 0)
+                t = self._q1(
+                    f"SELECT count(*) FROM {table} "      # noqa: S608
+                    f"WHERE CAST({tscol} AS DATE) = CURRENT_DATE")
+                row["rows_today"] = int((t or [0])[0] or 0)
+            except Exception as e:
+                row["present"] = False
+                row["error"] = f"{type(e).__name__}: {e}"
+            out.append(row)
+        return out
+
     def coverage(self) -> tuple[list, dict]:
         """(underlying_bars summary rows, option_bars counts) for /data/coverage."""
         rows = self._q(

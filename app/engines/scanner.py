@@ -588,6 +588,9 @@ class StockScanner:
         self.scores: dict[str, dict] = {}      # symbol -> latest setup_score()
         self._prev_chain: dict[str, dict] = {} # symbol -> last chain cache (OI shift)
         self._alerted: dict[str, str] = {}     # symbol -> day already alerted
+        # one-shot latches: a broken persist warns once per process, not never
+        self._bias_store_warned: set = set()
+        self._flag_store_warned = False
         self.index_bias: dict[str, dict] = {}  # index -> latest bias reading
         self.trader = None                     # optional ScannerTrader (positional book)
 
@@ -672,8 +675,18 @@ class StockScanner:
             self.index_bias[index] = {**bias, "ts": str(ts)}
             try:
                 self.store.upsert_index_bias(ts, index, bias)
-            except Exception:
-                pass
+            except Exception as e:
+                # Non-fatal, but NOT silent: index_bias_history is the ONLY
+                # source ctx.signal("index_bias") replays from in backtest, so
+                # a persistent failure silently erodes backtest fidelity with
+                # no symptom until a strategy sees None for a whole window.
+                if index not in self._bias_store_warned:
+                    self._bias_store_warned.add(index)
+                    from app.core import registry as _reg
+                    _reg.record_event(
+                        "warn", "scanner",
+                        f"index_bias persist FAILED for {index} ({e!r}) — "
+                        "backtest signal replay will have a hole here")
 
     def score_yesterday_bias(self, day, horizon_min: int = 30) -> None:
         """Nightly: score each index's recorded bias for `day` vs the realized
@@ -888,8 +901,17 @@ class StockScanner:
             self.store.record_setup_flag(
                 ts, sym, sc.get("bias"), sc.get("score"),
                 self.metrics.get(sym, {}).get("spot"), entry)
-        except Exception:
-            pass
+        except Exception as e:
+            # Non-fatal, but NOT silent: setup_flags backs validate()'s
+            # forward-return hit-rate, so losing it silently would make the
+            # scanner look unvalidatable rather than un-recorded.
+            if not self._flag_store_warned:
+                self._flag_store_warned = True
+                from app.core import registry as _reg
+                _reg.record_event(
+                    "warn", "scanner",
+                    f"setup-flag persist FAILED ({e!r}) — forward-return "
+                    "validation will under-count flagged setups")
 
     def validate(self, since_day, horizon_min: int = 30) -> dict:
         """Forward-return hit-rate of setups flagged since `since_day`. For each
