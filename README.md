@@ -5,6 +5,11 @@ built on DhanHQ v2 APIs. Paste an LLM-generated strategy, validate it,
 backtest it date-by-date, deploy it to a paper-trading engine, play/pause
 it, and allocate capital per strategy.
 
+**New here?** Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md) first — it says
+what we're trying to achieve, where the edge is meant to come from, what
+would count as success, and the evidence rules the system runs on. This
+README covers the mechanics.
+
 ## How "paste LLM code" works
 
 The platform does not parse arbitrary code. Instead:
@@ -42,7 +47,8 @@ With zero configuration the platform uses a synthetic market
 
 ## Dashboard
 
-`http://<server>:8000/` serves the UI (`app/static/index.html`):
+`http://<server>:8000/` serves the UI — a React + Vite SPA in
+`frontend/`, built to `app/static/` (`cd frontend && npm run build`):
 status tape (IST market clock, token countdown, engine heartbeat),
 portfolio summary (allocated / equity / growth / live count), strategy
 cards with state badges, and a detail panel with paper metrics + equity
@@ -72,15 +78,21 @@ Deploy on a small VPS (₹300–600/month) so strategies run without your
 laptop: `deploy/optionslab.service` is a systemd unit with auto-restart.
 Point the Dhan static-IP setting at the VPS IP. The paper engine acts
 only during market hours; daily P&L rows persist to SQLite so the
-dashboard shows performance history whenever you check in. Known gap:
-open paper positions are held in memory, so a mid-session restart loses
-them — persist `PaperContext` positions if that matters to you.
+dashboard shows performance history whenever you check in. Open paper
+positions are snapshotted to `registry.paper_state` on every fill/close
+and on a 60 s heartbeat, so a mid-session restart recovers them.
+
+Deploys are pull-based: pushing to `main` IS the deploy
+(`optionslab-autopull.timer` fetches every 5 min), and restarts are
+deferred during IST market hours so a redeploy never drops the live feed
+or chain recording. `[force-deploy]` in a commit message overrides.
 
 ## Wiring real DhanHQ data
 
-1. Put your client id + access token in `app/data/dhan_client.py`.
-   (SEBI rules: access tokens last 24 h — schedule a daily refresh,
-   and run from a static IP registered with Dhan.)
+1. Set `DHAN_CLIENT_ID` / `DHAN_ACCESS_TOKEN` in the environment, or let
+   `app/core/token_manager.py` manage the token (see below). SEBI rules:
+   access tokens last 24 h, and you must run from a static IP registered
+   with Dhan.
 2. Backfill history into DuckDB:
    `python -m app.data.dhan_client backfill NIFTY 2024-01-01 2025-06-30`
    - underlying candles: 90-day chunks (Dhan intraday historical, 5 yrs)
@@ -88,10 +100,11 @@ them — persist `PaperContext` positions if that matters to you.
      minute-level, ATM-relative strikes, 30 days/call, up to 5 yrs,
      NSE & BSE (MCX expired data: verify with Dhan; for commodities,
      start recording live chain snapshots now to build your own history).
-3. Replace `MarketHub.run_synthetic` with a driver that consumes the
-   dhanhq `MarketFeed` WebSocket (ticks → candle builder) and a chain
-   poller (Option Chain API, max 1 unique request per 3 s) for greeks/IV
-   and bid/ask.
+3. Live data is wired: `app/engines/feed.py` drives the dhanhq
+   `MarketFeed` WebSocket (ticks → candle builder) and `MarketHub` runs
+   the chain poller (Option Chain API, max 1 unique request per 3 s) for
+   greeks/IV and bid/ask. `OPTIONSLAB_SYNTHETIC=1` (or absent creds)
+   falls back to the synthetic replay.
 
 ## Play / pause semantics (deliberate design choice)
 
@@ -104,10 +117,11 @@ them — persist `PaperContext` positions if that matters to you.
 ## Capital allocation
 
 `allocated_capital` is virtual money per strategy instance. Both engines
-reject entries whose estimated margin exceeds available capital.
-`app/engines/fills.py:estimate_margin` is a rough SPAN stand-in — in
-paper/live mode swap in Dhan's multi-leg margin calculator API (hedge
-benefit included) and calibrate the backtest approximation from it.
+reject entries whose estimated margin exceeds available capital. Paper
+and live use `app/engines/margin.py:real_margin`, which sums Dhan's
+per-leg `margin_calculator` across the structure; backtests use the
+cheaper `fills.py:estimate_margin` scaled by a per-underlying calibration
+factor (setting `margin_factor:<underlying>`).
 
 ## Costs model
 
@@ -116,16 +130,28 @@ per order and fills at bid/ask live or close±synthetic-spread in
 backtests (spread widens with distance from ATM). Verify rates against a
 real Dhan contract note before trusting absolute P&L.
 
-## What's intentionally NOT here yet
+## What's NOT here yet
 
-- Real Dhan WS binary parsing (use the official `dhanhq` pip package's
-  MarketFeed)
-- Walk-forward / Monte Carlo wrappers around `run_backtest` (both are
-  thin loops over it — next step)
-- Live order routing (add an ExecutionContext later; keep the kill-switch
-  wired to Dhan's killswitch + P&L-based exit APIs)
-- A frontend — the REST API is UI-ready (list, play/pause buttons,
-  allocate dialog, equity charts from `daily` arrays)
+Built since this README was first written: real Dhan WS feed,
+walk-forward + Monte Carlo, the React frontend (`frontend/` → built into
+`app/static/`), risk panel, real margin, the scanner auto-trader, the
+insight + adaptation engines, and gated live order routing with Dhan's
+kill switch.
+
+Still outstanding — and all of these gate real capital:
+
+- **Broker position reconciliation** — the app's positions are not yet
+  checked against Dhan's.
+- **Fill reconciliation** via the OrderUpdate WebSocket — fills are
+  assumed, not confirmed.
+- **Real FNO SPAN margin verification** during market hours (equity
+  margin is live-verified) + `scripts/calibrate_margin`.
+- **MCX chain recording** — needs MCX security ids in
+  `dhan_client.UNDERLYINGS`.
+
+Live execution is built and dry-run verified; no real order has been
+sent. See `docs/OVERVIEW.md` §7 for the five gates that must all be open
+before one can be.
 
 ## Layout
 
@@ -135,12 +161,24 @@ app/
   core/loader.py      AST validation + restricted load + smoke test
   core/registry.py    lifecycle state machine, allocation, SQLite
   engines/fills.py    fills, Indian option charges, margin estimate
+  engines/margin.py   real per-leg margin via Dhan, with fallback
   engines/backtest.py event-driven backtester, date-by-date P&L
-  engines/paper.py    live paper engine, MarketHub, play/pause
+  engines/walkforward.py  K-fold walk-forward + adaptive_search
+  engines/paper.py    live paper engine, MarketHub, chain poller
+  engines/feed.py     dhanhq MarketFeed driver + tick→candle builder
+  engines/chain.py    option-chain normalizer (ATM-relative quotes)
+  engines/indicators.py   the indicator toolbox strategies use
+  engines/risk.py     portfolio + per-strategy risk caps
+  engines/live.py     gated live execution (default: dry run)
+  engines/scanner_trader.py   the F&O scanner auto-trader
+  engines/*_insights.py, adaptation.py, strategy_adapt.py
+                      trade-log analytics → gated param proposals
   data/store.py       DuckDB store + synthetic fallback
   data/dhan_client.py Dhan downloaders + backfill CLI
   api/strategies.py   REST endpoints
   main.py             FastAPI app
+frontend/             React + Vite SPA, builds into app/static/
+docs/OVERVIEW.md      what we're trying to achieve, and the rules
 prompts/strategy_prompt.md  give this to your LLM
 examples/short_straddle_920.py  known-good pasteable strategy
 ```
