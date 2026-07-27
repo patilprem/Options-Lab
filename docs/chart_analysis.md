@@ -14,6 +14,21 @@ note — SSH to the VPS, dump `scanner_journal` rows for the day (see chat
 history for the exact `sqlite3`/python3 one-liners), pull the day's option
 charts from the broker app, then do the write-up below.
 
+**2026-07-27 — the 07-23..26 entry-distance data is NOT USABLE.** It carried a
+systematic selection bias: a symbol was only sampled once held or at the
+instant of entry, so a FIRST entry always had one sample (VWAP == the entry
+price, recorded as a real-looking `0.00`) and only RE-entries carried history.
+In the 07-24 rows that split perfectly — every `0.00` was a first entry, every
+populated row a re-entry, and ~70% of the populated rows were INFY churn (the
+day's worst losses). Bucketing that would have "proven" that entries below
+VWAP lose money, when it was really measuring churn. Fixed 2026-07-27:
+`_sample_candidates()` samples EVERY ranked candidate each cycle (cache-only,
+no extra API calls), `opt_prem_samples` records the window size so thin rows
+are filterable, thin windows now report `null` instead of `0.00`, and the
+ambiguous `opt_dist_to_lower_bb_pct` was replaced by `opt_pct_b` (position
+within the band, 0=lower/1=upper — comparable across names and volatility,
+which distance-to-lower-band was not). Analysis starts from 2026-07-28 data.
+
 **2026-07-23+:** `entry_ctx` now also logs `opt_dist_to_vwap_pct` and
 `opt_dist_to_lower_bb_pct` — the option premium's own distance from its
 session VWAP / lower Bollinger band at entry, computed from an in-memory
