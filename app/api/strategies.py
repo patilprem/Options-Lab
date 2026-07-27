@@ -314,7 +314,7 @@ def data_health(stale_min: int = 20):
     now = datetime.now(IST).replace(tzinfo=None)
     nse_open = session_open_for({"NSE"}, now)
     mcx_open = session_open_for({"MCX"}, now)
-    any_open = nse_open or mcx_open
+    open_segs = {s for s, ok in (("NSE", nse_open), ("MCX", mcx_open)) if ok}
     tables = []
     for row in _store.recording_health():
         age_min = None
@@ -325,10 +325,15 @@ def data_health(stale_min: int = 20):
                     (now - datetime.fromisoformat(str(last))).total_seconds() / 60.0, 1)
             except ValueError:
                 pass
-        # stale only counts during an open session: a quiet table off-hours is
-        # correct behaviour, and flagging it would train you to ignore the flag
         row["age_min"] = age_min
-        row["stale"] = bool(any_open and row["present"]
+        # Only flag a table whose OWN feeding session is open, and only if it
+        # writes periodically. Judging every table against "any session open"
+        # flagged the NSE-only ones for the whole 8-hour MCX evening, and
+        # event-driven setup_flags for any quiet stretch — noise that teaches
+        # you to ignore the flag, which is worse than having no flag at all.
+        feeding_open = bool(open_segs & set(row.get("segments") or ()))
+        row["stale"] = bool(feeding_open and row.get("periodic")
+                            and row["present"]
                             and (age_min is None or age_min > stale_min))
         tables.append(row)
     return {"store": type(_store).__name__, "synthetic": False,

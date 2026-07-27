@@ -204,15 +204,26 @@ class DataStore:
                GROUP BY ts ORDER BY ts""",
             [underlying, strike, option_type, expiry_kind, expiry_offset, end])
 
-    # Every table the live recorders write, with the column holding its
-    # event time. Backs recording_health() — see there for why this exists.
+    # Every table the live recorders write: (table, ts column, feeding
+    # segments, periodic?). Backs recording_health() — see there for why.
+    #
+    # `segments` matters because staleness is only meaningful while a session
+    # that FEEDS that table is open. index_bias_history and stock_snapshots
+    # come from the NSE stock sweep and correctly stop at the 15:35 NSE close
+    # — judging them against "any session open" flagged them for the whole
+    # 8-hour MCX evening every single night, which trains you to ignore the
+    # flag (observed the first evening this endpoint existed).
+    #
+    # `periodic=False` marks EVENT-driven tables: setup_flags only writes when
+    # a setup clears the alert threshold, so a quiet stretch is normal and
+    # "age" says nothing about health. Those are reported, never flagged.
     _RECORDED_TABLES = (
-        ("underlying_bars",   "ts"),
-        ("option_bars",       "ts"),
-        ("chain_snapshots",   "ts"),
-        ("index_bias_history", "ts"),
-        ("setup_flags",       "ts"),
-        ("stock_snapshots",   "ts"),
+        ("underlying_bars",    "ts", ("NSE", "MCX"), True),
+        ("option_bars",        "ts", ("NSE", "MCX"), True),
+        ("chain_snapshots",    "ts", ("NSE", "MCX"), True),
+        ("index_bias_history", "ts", ("NSE",),       True),
+        ("stock_snapshots",    "ts", ("NSE",),       True),
+        ("setup_flags",        "ts", ("NSE",),       False),
     )
 
     def recording_health(self) -> list[dict]:
@@ -230,9 +241,10 @@ class DataStore:
         Missing tables report present=False rather than raising, so a schema
         that predates a table doesn't break the whole audit."""
         out = []
-        for table, tscol in self._RECORDED_TABLES:
+        for table, tscol, segments, periodic in self._RECORDED_TABLES:
             row = {"table": table, "present": True, "last_ts": None,
-                   "rows_today": 0, "sessions": 0, "error": None}
+                   "rows_today": 0, "sessions": 0, "error": None,
+                   "segments": list(segments), "periodic": periodic}
             try:
                 r = self._q1(
                     f"SELECT max({tscol}), count(*), "  # noqa: S608 - fixed names
