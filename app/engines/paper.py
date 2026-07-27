@@ -43,6 +43,10 @@ from app.engines.feed import CandleBuilder, LiveFeed
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# One-shot latch so a broken durable-journal write warns once per strategy per
+# process instead of on every close (or, as before, never).
+_JOURNAL_WARNED: set = set()
+
 # MarketFeed subscription constants (avoid importing the SDK at module load).
 _FEED_IDX = 0      # MarketFeed.IDX  — index spot segment
 _FEED_NSE_FNO = 2  # MarketFeed.NSE_FNO — NSE index/stock futures (companion vol)
@@ -1064,8 +1068,19 @@ class PaperContext(Context):
             registry.record_strategy_journal(
                 self.rec.id, "exit", build_round_trip(p),
                 ts=self.now.isoformat())
-        except Exception:
-            pass
+        except Exception as e:
+            # Non-fatal (a close must never be disrupted) but NOT silent: this
+            # journal is what strategy_insights and the adaptation pipeline
+            # learn from, so a persistent failure would quietly starve them.
+            # Silent data-loss paths are exactly what hid the 07-23..27 chain
+            # outage for days. Warn once per process per strategy.
+            if self.rec.id not in _JOURNAL_WARNED:
+                _JOURNAL_WARNED.add(self.rec.id)
+                registry.record_event(
+                    "warn", "engine",
+                    f"strategy journal write FAILED ({e!r}) — insights and "
+                    "adaptation will under-count closed trades until fixed",
+                    self.rec.id)
 
     def _maybe_reflect(self, day) -> None:
         """At most once a day, after a close: if the journal now supports a
