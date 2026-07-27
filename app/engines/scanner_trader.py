@@ -70,7 +70,8 @@ class TradeConfig:
     reentry_cooldown_min: float = 0.0  # skip re-entering a symbol within N
                                        # min of its own exit; 0 = off
     entry_cutoff_min: int = 935      # no NEW entries at/after this minute of
-                                     # day (935 = 15:35 = session close = off)
+                                     # day; >= _NO_ENTRY_CUTOFF_MIN (935) means
+                                     # NO cutoff at all, which is the default
     fresh_buildup_only: int = 0      # 1 = only long/short buildup entries
                                      # (skip covering/unwinding-fuelled)
 
@@ -152,6 +153,14 @@ def _minutes_of_day(ts) -> int:
     return ts.hour * 60 + ts.minute
 
 
+# entry_cutoff_min at/above this is treated as NO cutoff. 935 = 15:35 = the
+# NSE close, the default. It must be a true no-op rather than "block after
+# 15:35": MCX runs to 23:30, so a live 935 cutoff would silently kill ~8h of
+# MCX entries. (Caught by tests run at 16:01 IST — the original test used
+# 15:34 and passed by one minute, hiding it.)
+_NO_ENTRY_CUTOFF_MIN = 935
+
+
 def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig,
                  now=None, last_exits: dict | None = None) -> list:
     """Symbols to open this cycle: highest-scoring setups above entry_score,
@@ -167,7 +176,7 @@ def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig,
     if slots <= 0:
         return []
     # no NEW entries at/after the cutoff (exits/management are unaffected)
-    if now is not None and cfg.entry_cutoff_min and \
+    if now is not None and cfg.entry_cutoff_min < _NO_ENTRY_CUTOFF_MIN and \
             _minutes_of_day(now) >= cfg.entry_cutoff_min:
         return []
     out = []

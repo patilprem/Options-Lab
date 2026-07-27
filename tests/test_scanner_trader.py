@@ -94,13 +94,19 @@ def _score(sym="AAA", score=80, bias="CE", buildup="long_buildup"):
 def test_defaults_leave_behaviour_unchanged():
     """All three gates default to off/no-op — pre-existing callers that pass
     no now/last_exits must see identical picks (adaptation PROPOSES change;
-    shipping the knobs must not BE a change)."""
+    shipping the knobs must not BE a change).
+
+    Deliberately probes times BEYOND the 935 default, incl. MCX hours: the
+    first version of this test used 15:34 and passed by one minute, hiding a
+    real bug where the default cutoff blocked every entry after 15:35 — which
+    would have silently killed ~8h of MCX trading (MCX runs to 23:30)."""
     cfg = TradeConfig()
-    late = datetime(2026, 7, 27, 15, 34)   # 1 min before close
-    picks = st.pick_entries(
-        [_score(buildup="short_covering")], set(), cfg,
-        now=late, last_exits={"AAA": datetime(2026, 7, 27, 15, 33)})
-    assert picks == ["AAA"]
+    for hh, mm in ((15, 34), (15, 36), (18, 0), (23, 20)):
+        picks = st.pick_entries(
+            [_score(buildup="short_covering")], set(), cfg,
+            now=datetime(2026, 7, 27, hh, mm),
+            last_exits={"AAA": datetime(2026, 7, 27, 9, 30)})
+        assert picks == ["AAA"], f"default gates blocked an entry at {hh}:{mm:02d}"
 
 
 def test_reentry_cooldown_blocks_then_releases():

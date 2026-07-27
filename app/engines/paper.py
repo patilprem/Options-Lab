@@ -146,6 +146,11 @@ class MarketHub:
         self._chain_spot: dict[str, float] = {}   # underlying -> last chain spot
         self._chain_persisted_fp: dict[str, tuple] = {}  # dedup for the recorder
         self._expiries_cache: dict[str, tuple[date, list]] = {}
+        # An EMPTY expiry_list must never be cached for the day (see
+        # _get_expiries): these track when the last empty came back so we
+        # retry it soon instead of either poisoning the day or hammering.
+        self._expiries_fail: dict[str, float] = {}
+        self._expiry_warned: set = set()
         self._chain_only: set[str] = set()   # polled for snapshots, no strategy (MCX recorder)
         self._chain_gate = asyncio.Lock()
         self._last_chain_ts = 0.0
@@ -567,8 +572,17 @@ class MarketHub:
         """Refresh one underlying's chain cache for `targets` expiries through
         the shared 3s gate. Single-sourced so both the deployed poll loop and
         the Tier-2 scanner use the exact same fetch/normalize/cache path (and
-        the same global rate limit). Raises on hard failure; the caller owns
-        client rebuild and warn-throttling."""
+        the same global rate limit).
+
+        Raises on a DESCRIBED failure; the caller owns client rebuild and
+        warn-throttling. But note it can also return having refreshed NOTHING,
+        silently, via any of: an empty expiry list, resolve_expiry finding no
+        match, Dhan's message-less blip (_fetch_chain_ratelimited returns None
+        by design — see PR #17), or a chain that normalizes to no quotes. A
+        caller that needs to know whether the cache actually moved must check
+        the cache/fingerprint itself (MarketHub._chain_fingerprint) rather than
+        assume 'no exception' means 'fresh data' — assuming that is what let
+        the 07-23..27 index-chain outage run for days without a log line."""
         expiries = await self._get_expiries(client, u, cfg, loop)
         for kind, off in targets:
             exp = chainmod.resolve_expiry(expiries, kind, off)
@@ -586,18 +600,53 @@ class MarketHub:
                 if sp:
                     self._chain_spot[u] = sp
 
+    EXPIRY_RETRY_S = 60.0     # after an EMPTY expiry_list, wait this long
+                              # before refetching (the poll loop runs ~1/s)
+
     async def _get_expiries(self, client, underlying, cfg, loop) -> list:
+        """Cached expiry list for one underlying, refreshed once a day.
+
+        NEVER caches an EMPTY result for the day. Doing so silently froze the
+        index chain poller for entire sessions (observed 2026-07-23..27:
+        chain_snapshots empty for NIFTY/BANKNIFTY/CRUDEOIL/GOLD while stock
+        chains recorded fine). The mechanism: the cache is keyed by date, so
+        at 00:00 IST it invalidates and the poll loop immediately refetches —
+        during dead hours, when Dhan serves no expiries. That `[]` was then
+        cached for the WHOLE trading day, making every subsequent poll a no-op
+        (`for kind, off in targets` over an empty list) with nothing logged
+        anywhere. Stock names escaped it because the scanner only fetches
+        their expiries during market hours, when the API answers.
+
+        An empty result now backs off for EXPIRY_RETRY_S and retries, so a
+        dead-hours or blip response costs one minute instead of a session."""
         today = datetime.now(IST).date()
         cached = self._expiries_cache.get(underlying)
         if cached and cached[0] == today:
             return cached[1]
+        # don't re-hit the API on every ~1s poll pass while it returns nothing
+        last_fail = self._expiries_fail.get(underlying)
+        if last_fail is not None and \
+                (time.monotonic() - last_fail) < self.EXPIRY_RETRY_S:
+            return []
         resp = await loop.run_in_executor(
             None, lambda: client.expiry_list(under_security_id=cfg["security_id"],
                                              under_exchange_segment=cfg["segment"]))
         data = resp.get("data") if isinstance(resp, dict) else None
         expiries = data.get("data") if isinstance(data, dict) else data
         expiries = expiries or []
-        self._expiries_cache[underlying] = (today, expiries)
+        if expiries:
+            self._expiries_cache[underlying] = (today, expiries)
+            self._expiries_fail.pop(underlying, None)
+            self._expiry_warned.discard(underlying)
+        else:
+            self._expiries_fail[underlying] = time.monotonic()
+            if underlying not in self._expiry_warned:
+                self._expiry_warned.add(underlying)
+                registry.record_event(
+                    "warn", "feed",
+                    f"expiry list empty for {underlying} — chain polling is a "
+                    f"no-op until it answers; retrying every "
+                    f"{int(self.EXPIRY_RETRY_S)}s (NOT cached for the day)")
         return expiries
 
     async def _fetch_chain_ratelimited(self, client, cfg, expiry, loop, retries=1):
