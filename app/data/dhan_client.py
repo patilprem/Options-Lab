@@ -31,10 +31,15 @@ the storage boundary can be verified without network or credentials.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from app.data.sessions import in_session
+
+_log = logging.getLogger(__name__)
 
 # IST is UTC+5:30. Dhan historical APIs return epoch seconds; we convert to
 # a naive IST datetime at this boundary so the store matches everything else
@@ -152,6 +157,19 @@ def resolve_index_futures(max_age_h: float = 24.0) -> dict:
     it deliberately does NOT reuse _FNO_MASTER_CACHE, which the scanner rewrites
     with FUTSTK/EQUITY rows only and would leave this returning EMPTY. Live-
     verify on the VPS: the FUTIDX trading-symbol format and the NSE-FnO int."""
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    return parse_index_futures(index_fut_master_rows(max_age_h),
+                               INDEX_FUT_NAMES, today)
+
+
+def index_fut_master_rows(max_age_h: float = 24.0) -> list:
+    """The cached FUTIDX scrip-master rows (downloading/trimming on miss).
+
+    Split out of resolve_index_futures so the retroactive volume backfill can
+    resolve the front-month contract PER HISTORICAL DATE against the same
+    rows, instead of only for today. Note the master lists currently-listed
+    contracts only — app/data/index_volume.py handles the expired-and-delisted
+    case rather than silently resolving to the wrong contract."""
     import csv
     import io
     import urllib.request
@@ -168,10 +186,8 @@ def resolve_index_futures(max_age_h: float = 24.0) -> dict:
                              if (ln.startswith("NSE,") or ln.startswith("BSE,"))
                              and "FUTIDX" in ln]
         _IDX_FUT_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
-    rows = list(csv.DictReader(io.StringIO(
+    return list(csv.DictReader(io.StringIO(
         _IDX_FUT_MASTER_CACHE.read_text(encoding="utf-8"))))
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    return parse_index_futures(rows, INDEX_FUT_NAMES, today)
 
 
 # ---------------------------------------------------------------------------
@@ -494,10 +510,25 @@ def parse_expired_option_rows(underlying: str, strike_offset: int, option_type: 
 # ---------------------------------------------------------------------------
 
 def upsert_underlying_rows(store, rows: list[tuple]) -> int:
-    if rows:
+    """Insert intraday candles, DROPPING any that fall outside their
+    exchange's regular session.
+
+    Dhan's intraday historical response is trusted input everywhere else in
+    this module, but it reaches underlying_bars unvalidated, and the nightly
+    gap repair replays it every weekday. On 2026-07-27 that produced flat
+    zero-volume candles stamped after the NSE close. Filtering here means the
+    research dataset can't be poisoned by a single odd response — see
+    app/data/sessions.py. Returns the number of rows actually written."""
+    kept = [r for r in rows if in_session(r[1], r[0])]
+    dropped = len(rows) - len(kept)
+    if dropped:
+        _log.warning("dropped %d out-of-session underlying rows (e.g. %s %s)",
+                     dropped, rows[0][0],
+                     next(r[1] for r in rows if not in_session(r[1], r[0])))
+    if kept:
         store.con.executemany(
-            "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)", rows)
-    return len(rows)
+            "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)", kept)
+    return len(kept)
 
 
 def upsert_option_rows(store, rows: list[tuple]) -> int:

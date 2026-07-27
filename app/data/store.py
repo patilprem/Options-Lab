@@ -18,6 +18,7 @@ market so you can develop and test the whole platform before wiring Dhan.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
@@ -25,6 +26,9 @@ from datetime import datetime, date, timedelta, time
 from pathlib import Path
 
 from app.core.contract import Bar, OptionQuote, OptionType, LegSpec
+from app.data.sessions import in_session
+
+_log = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parents[2] / "marketdata.duckdb"
 
@@ -283,12 +287,41 @@ class DataStore:
 
     def upsert_live_bar(self, underlying: str, bar) -> None:
         """Persist one completed live 5-min candle so the store stays current
-        without re-backfilling (backtests can include today)."""
+        without re-backfilling (backtests can include today).
+
+        Out-of-session bars are DROPPED, not stored. The tick gate upstream
+        should already have rejected them, but this is the table's own last
+        line of defence — see app/data/sessions.py for the phantom-candle
+        incident that motivated guarding the write and not just the tick."""
+        if not in_session(bar.ts, underlying):
+            _log.warning("dropped out-of-session bar: %s %s", underlying, bar.ts)
+            return
         with self._lock:
             self.con.execute(
                 "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)",
                 [underlying, bar.ts, bar.open, bar.high, bar.low, bar.close,
                  getattr(bar, "volume", 0) or 0, getattr(bar, "oi", 0) or 0])
+
+    def update_bar_volume(self, rows: list, only_if_zero: bool = True) -> int:
+        """Fill volume/OI into EXISTING underlying_bars. Never inserts, never
+        touches price — see app/data/index_volume.py for why.
+
+        `only_if_zero` (default) restricts the write to bars whose volume is
+        still 0, so a retroactive backfill can never overwrite volume the live
+        futures companion already recorded. Returns rows actually changed.
+        """
+        if not rows:
+            return 0
+        guard = " AND (volume IS NULL OR volume = 0)" if only_if_zero else ""
+        n = 0
+        with self._lock:
+            for underlying, ts, volume, oi in rows:
+                cur = self.con.execute(
+                    f"""UPDATE underlying_bars SET volume = ?, oi = ?
+                        WHERE underlying = ? AND ts = ?{guard}""",
+                    [volume, oi, underlying, ts])
+                n += cur.fetchall()[0][0] if cur.description else 0
+        return n
 
     def day_footprint(self, underlying: str, day: str) -> dict:
         """One session's chain-footprint aggregates for post-market analysis:

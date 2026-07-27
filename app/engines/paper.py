@@ -34,6 +34,7 @@ from app.core import registry
 from app.core.contract import (Action, Bar, Context, ExpiryKind, LegSpec,
                                OptionQuote, OptionType, Position, Strategy)
 from app.data.dhan_client import UNDERLYINGS
+from app.data.sessions import in_session
 from app.engines import chain as chainmod
 from app.engines import fills as F
 from app.engines import margin as M
@@ -465,12 +466,6 @@ class MarketHub:
         for q in self.subscribers:
             q.put_nowait(msg)
 
-    # Regular-session tick windows per exchange. MCX runs far later than NSE,
-    # and applying NSE's window to it silently discarded ~8h of MCX ticks
-    # every evening (see _tick_ok).
-    _TICK_WINDOW = {"MCX": (dtime(9, 0), dtime(23, 30)),
-                    "NSE": (dtime(9, 15), dtime(15, 30))}
-
     def _tick_ok(self, ts: datetime, underlying: str = "") -> bool:
         """Shared tick gate: regular-session, plausibly-timed ticks only. Dhan's
         feed also delivers pre-open auction prints (09:00-09:08) and stale
@@ -478,19 +473,12 @@ class MarketHub:
         future-stamped bars (which tripped the 15:25 EOD branch mid-day), and
         weekend bars. All junk dies here, at the single choke point.
 
-        The window is PER EXCHANGE. It used to be hardcoded to NSE's
-        09:15-15:30 for every underlying, so every MCX tick after 15:30 (and
-        before 09:15) was thrown away — MCX trades to 23:30, so that silently
-        discarded most of its session. Combined with MCX having no candle
-        builder at all, underlying_bars held no MCX history whatsoever
-        (observed 2026-07-27: frozen at 152 rows — two NSE names — while MCX
-        traded for hours). Unknown underlyings keep the stricter NSE window."""
-        if ts.weekday() >= 5:
-            return False
-        cfg = UNDERLYINGS.get(underlying) or {}
-        seg = "MCX" if "MCX" in str(cfg.get("segment", "")) else "NSE"
-        lo, hi = self._TICK_WINDOW[seg]
-        if not (lo <= ts.time() <= hi):
+        The window is PER EXCHANGE and lives in app/data/sessions.py, shared
+        with the two underlying_bars WRITE paths — this gate only guards
+        ticks, and post-close phantom candles reached the table through the
+        backfill instead (see that module's incident note). Unknown
+        underlyings keep the stricter NSE window."""
+        if not in_session(ts, underlying):
             return False
         if self.TICK_FRESHNESS_S:          # None in tests/replays (fixed clocks)
             now = datetime.now(IST).replace(tzinfo=None)
