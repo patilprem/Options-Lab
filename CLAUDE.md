@@ -217,6 +217,19 @@ off-hours window; genuinely urgent fixes get the marker.
   Expiry weekdays have changed historically.
 - STT/charges rates in fills.py are approximations — verify vs contract
   notes before trusting absolute P&L.
+- INDEX VOLUME (verified 2026-07-27, don't re-derive): `underlying_bars.volume`
+  for NIFTY/BANKNIFTY is POPULATED from 2025-11 onward and ZERO before it.
+  An index has no volume of its own, so Dhan's intraday historical substitutes
+  the front-month future's — the SAME series the live companion records
+  (day totals 261–382M, avg ~4M per 5-min bar, both writers agree). So the
+  nightly gap repair overwriting live companion bars is benign, NOT a mix of
+  two definitions. The companion still matters: it's the only volume available
+  DURING the session, before any repair runs.
+  Pre-2025-11 (~325 NIFTY sessions back to 2024-07) has no volume and cannot
+  get any — `scripts/backfill_index_volume` correctly REFUSES those dates
+  because their front-month contracts have left the scrip master, and a
+  resolved-but-wrong contract would write plausible-looking thin volume.
+  Price/OHLC for those sessions is fine; only volume is absent.
 
 ## Data / price-action strategy surface (post-M8)
 Strategies now reach a richer, backtestable data surface (all through Context):
