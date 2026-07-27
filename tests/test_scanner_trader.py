@@ -382,19 +382,42 @@ def test_cooldown_blocks_immediate_rebuy_after_exit(tmp_path, monkeypatch):
     assert "RELIANCE" not in trader.book
 
 
-def test_entry_ctx_premium_distance_needs_history(tmp_path, monkeypatch):
-    """opt_dist_to_vwap_pct / opt_dist_to_lower_bb_pct in entry_ctx read the
-    OPTION's OWN recent premium prints. We only ever buy premium (CE or PE),
-    so 'cheap relative to its own session' is the same test either way — no
-    separate upper-band case for PE. Fields are None until there's enough
-    history for that (symbol, side); populated once there is."""
-    import dataclasses
-    from app.core.contract import Bar
+def test_entry_ctx_thin_window_reports_null_not_zero(tmp_path, monkeypatch):
+    """A thin premium window must read as NO DATA, not as a real measurement.
 
+    The original behaviour recorded 0.00 on a first-ever entry (VWAP of one
+    sample == that price), which is indistinguishable from "entered exactly at
+    VWAP". In the 07-24 data every 0.00 row was a symbol's first entry and
+    every populated row was a re-entry, so the rows carrying data were ~70%
+    INFY churn — bucketing them would have produced a confident wrong answer.
+    Now: None until there's enough history, plus n_samples so it's filterable."""
     reg = _iso_registry(tmp_path, monkeypatch)
     reg.set_setting("scanner_trade", "on")
-    reg.set_setting("scanner_trade_entry_score", "65")
     reg.set_setting("scanner_trade_risk_pct", "0.02")
+
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+
+    hub, scanner = _FakeHub(), _FakeScanner()
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+
+    trader.step(hub, scanner)
+    ctx = trader.book["RELIANCE"].entry_ctx
+    assert ctx["opt_prem_samples"] == 1
+    assert ctx["opt_dist_to_vwap_pct"] is None      # was 0.0 — the bug
+    assert ctx["opt_pct_b"] is None                 # needs >= 5 samples
+
+
+def test_candidates_are_sampled_even_when_not_traded(tmp_path, monkeypatch):
+    """The bias fix: a ranked candidate accumulates history whether or not we
+    trade it, so its FIRST entry already has a real VWAP to compare against."""
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_entry_score", "95")   # nothing qualifies
 
     trader = st.ScannerTrader.__new__(st.ScannerTrader)
     trader.store = None
@@ -405,27 +428,22 @@ def test_entry_ctx_premium_distance_needs_history(tmp_path, monkeypatch):
     hub, scanner = _FakeHub(), _FakeScanner()
     scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
 
-    # first-ever cycle for this (symbol, side): history is just this quote,
-    # so VWAP trivially equals it (0% away) and Bollinger needs >=5 samples
-    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    for ltp in (20.0, 21.0, 22.0, 23.0, 24.0, 25.0):
+        hub.set_atm("RELIANCE", "CALL", ltp=ltp)
+        trader.step(hub, scanner)
+
+    assert trader.book == {}                          # never entered
+    assert len(trader._prem_hist[("RELIANCE", "CALL")]) == 6   # but sampled
+
+    # now let it qualify: the very first entry has a real window behind it
+    reg.set_setting("scanner_trade_entry_score", "65")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+    hub.set_atm("RELIANCE", "CALL", ltp=21.0)
     trader.step(hub, scanner)
     ctx = trader.book["RELIANCE"].entry_ctx
-    assert ctx["opt_dist_to_vwap_pct"] == 0.0
-    assert ctx["opt_dist_to_lower_bb_pct"] is None
-
-    # seed a session window with a clear average around ~23-24, then price a
-    # fresh entry well below it — a real pullback, not a chase
-    trader._prem_hist[("RELIANCE", "CALL")] = [
-        Bar(ts=datetime(2026, 7, 22, 10, m), open=p, high=p, low=p, close=p)
-        for m, p in enumerate((24.0, 23.0, 25.0, 22.0, 26.0, 21.0))
-    ]
-    q = hub._chain_cache["RELIANCE"][("MONTHLY", 0, 0, "CALL")]
-    q = dataclasses.replace(q, ltp=18.0)              # today's cheapest print
-    cfg = trader._cfg()
-    ctx2 = trader._entry_context(
-        scanner, "RELIANCE", scanner.scores["RELIANCE"], q, cfg)
-    assert ctx2["opt_dist_to_vwap_pct"] < 0           # below its own VWAP
-    assert ctx2["opt_dist_to_lower_bb_pct"] is not None
+    assert ctx["opt_prem_samples"] >= 5
+    assert ctx["opt_dist_to_vwap_pct"] is not None    # real, not 0.0
+    assert 0.0 <= ctx["opt_pct_b"] <= 1.0             # %B is normalised
 
 
 def test_analyze_over_real_journal_rows(tmp_path, monkeypatch):

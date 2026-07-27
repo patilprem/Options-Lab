@@ -291,6 +291,27 @@ class ScannerTrader:
         u = scanner._universe.get(symbol) or {}
         return int(u.get("lot_size") or 0)
 
+    def _sample_candidates(self, hub, scanner, now) -> int:
+        """Record the ATM premium of every scored candidate (any symbol the
+        scanner ranked with a bias) into its rolling window, whether or not we
+        trade it. Purely observational — feeds entry_ctx's VWAP/%B so those
+        reflect the option's own recent path instead of only existing for
+        symbols we already held. Cache-only, no API calls; never raises."""
+        n = 0
+        try:
+            for sc in scanner.ranked_scores():
+                sym, bias = sc.get("symbol"), sc.get("bias")
+                if not sym or not bias:
+                    continue
+                side = self._side_for(bias)
+                q = self._atm_quote(hub, sym, side)
+                if q is not None and q.ltp:
+                    self._sample_premium(sym, side, now, q.ltp)
+                    n += 1
+        except Exception:
+            pass          # observation must never disturb trading
+        return n
+
     def _sample_premium(self, sym: str, side: str, ts, ltp) -> None:
         """Append this cycle's option LTP to the (symbol, side)'s in-session
         rolling window, feeding VWAP/Bollinger for entry_ctx. Cleared across a
@@ -420,6 +441,15 @@ class ScannerTrader:
         # open new positions from the freshest ranked setups. Names exited
         # THIS cycle are held out so a trailing-stop exit can't immediately
         # re-buy the same name on the still-elevated score (churn).
+        # Sample EVERY candidate's premium, not just the ones we enter. This is
+        # what removes the selection bias in entry_ctx's VWAP/%B: previously a
+        # symbol was only sampled once held or at the instant of entry, so a
+        # first entry always had 1 sample (VWAP == price) and only RE-entries
+        # carried real history — making the populated rows a proxy for churn
+        # rather than a measure of entry quality. Reads the chain cache Tier-2
+        # already populated, so it costs no extra API calls.
+        self._sample_candidates(hub, scanner, now)
+
         held = set(self.book) | exited
         fees_today = 0.0
         for sym in pick_entries(scanner.ranked_scores(), held, cfg,
@@ -429,7 +459,9 @@ class ScannerTrader:
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
                 continue
-            self._sample_premium(sym, side, now, q.ltp or q.ask)
+            # (no _sample_premium here — _sample_candidates() above already
+            # sampled every ranked candidate this cycle; sampling again would
+            # double-count this timestamp and skew the window toward entries)
             lot_size = self._lot_size(scanner, sym)
             probe = F.fill_live(q, Action.BUY, lot_size or 1, self._fee, self._slip)
             lots = size_lots(cfg, probe.price, lot_size)
@@ -478,17 +510,32 @@ class ScannerTrader:
         # How "cheap" is this premium relative to its OWN session so far —
         # we only ever buy premium (CE or PE), so a good entry is one near
         # the option's own VWAP / lower Bollinger band, same test both ways.
+        # Sample count is recorded so thin windows are FILTERABLE rather than
+        # silently misleading. Previously a first-ever entry had exactly one
+        # sample, so VWAP == the entry price and the field read 0.00 — which
+        # looks like "entered exactly at VWAP" but means "no history". In the
+        # 07-24 data every populated row was a RE-entry and every 0.00 row was
+        # a first entry, so the populated rows were ~70% INFY churn (the day's
+        # worst losses): bucketing that would have "proven" a spurious result.
         hist = (getattr(self, "_prem_hist", None) or {}).get(
             (sym, self._side_for(sc.get("bias"))), [])
-        vwap_val = IND.vwap(hist) if hist else None
-        bb = IND.bollinger(hist, n=min(20, len(hist))) if len(hist) >= 5 else None
+        n_samples = len(hist)
         opt_ltp = q.ltp
+        # need >= 2 samples for VWAP to mean anything other than "the price"
+        vwap_val = IND.vwap(hist) if n_samples >= 2 else None
         opt_dist_to_vwap_pct = (
             round((opt_ltp - vwap_val) / vwap_val * 100, 2)
             if vwap_val and opt_ltp else None)
-        opt_dist_to_lower_bb_pct = (
-            round((opt_ltp - bb["lower"]) / bb["lower"] * 100, 2)
-            if bb and bb["lower"] and opt_ltp else None)
+        # %B (position WITHIN the band, 0 = at lower, 1 = at upper) rather
+        # than distance-to-lower-band: the old metric conflated position with
+        # band WIDTH, so the same number meant different things on a quiet vs
+        # volatile name and wasn't comparable across symbols.
+        bb = IND.bollinger(hist, n=min(20, n_samples)) if n_samples >= 5 else None
+        opt_pct_b = None
+        if bb and opt_ltp is not None:
+            span = (bb["upper"] or 0) - (bb["lower"] or 0)
+            if span > 0:
+                opt_pct_b = round((opt_ltp - bb["lower"]) / span, 3)
         return {
             "score": sc.get("score"), "reasons": sc.get("reasons") or [],
             "buildup": sc.get("buildup") or t1.get("buildup"),
@@ -504,7 +551,8 @@ class ScannerTrader:
             "opt_iv": getattr(q, "iv", None), "opt_oi": q.oi,
             "opt_spread_pct": spread_pct,
             "opt_dist_to_vwap_pct": opt_dist_to_vwap_pct,
-            "opt_dist_to_lower_bb_pct": opt_dist_to_lower_bb_pct,
+            "opt_pct_b": opt_pct_b,
+            "opt_prem_samples": n_samples,
             "expiry": str(q.expiry) if getattr(q, "expiry", None) else None,
             "config": {"entry_score": cfg.entry_score,
                        "exit_score": cfg.exit_score,
