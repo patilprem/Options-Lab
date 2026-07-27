@@ -465,13 +465,32 @@ class MarketHub:
         for q in self.subscribers:
             q.put_nowait(msg)
 
-    def _tick_ok(self, ts: datetime) -> bool:
+    # Regular-session tick windows per exchange. MCX runs far later than NSE,
+    # and applying NSE's window to it silently discarded ~8h of MCX ticks
+    # every evening (see _tick_ok).
+    _TICK_WINDOW = {"MCX": (dtime(9, 0), dtime(23, 30)),
+                    "NSE": (dtime(9, 15), dtime(15, 30))}
+
+    def _tick_ok(self, ts: datetime, underlying: str = "") -> bool:
         """Shared tick gate: regular-session, plausibly-timed ticks only. Dhan's
         feed also delivers pre-open auction prints (09:00-09:08) and stale
         snapshot ticks on (re)subscribe — observed producing a 09:00 bar,
         future-stamped bars (which tripped the 15:25 EOD branch mid-day), and
-        weekend bars. All junk dies here, at the single choke point."""
-        if ts.weekday() >= 5 or not (dtime(9, 15) <= ts.time() <= dtime(15, 30)):
+        weekend bars. All junk dies here, at the single choke point.
+
+        The window is PER EXCHANGE. It used to be hardcoded to NSE's
+        09:15-15:30 for every underlying, so every MCX tick after 15:30 (and
+        before 09:15) was thrown away — MCX trades to 23:30, so that silently
+        discarded most of its session. Combined with MCX having no candle
+        builder at all, underlying_bars held no MCX history whatsoever
+        (observed 2026-07-27: frozen at 152 rows — two NSE names — while MCX
+        traded for hours). Unknown underlyings keep the stricter NSE window."""
+        if ts.weekday() >= 5:
+            return False
+        cfg = UNDERLYINGS.get(underlying) or {}
+        seg = "MCX" if "MCX" in str(cfg.get("segment", "")) else "NSE"
+        lo, hi = self._TICK_WINDOW[seg]
+        if not (lo <= ts.time() <= hi):
             return False
         if self.TICK_FRESHNESS_S:          # None in tests/replays (fixed clocks)
             now = datetime.now(IST).replace(tzinfo=None)
@@ -485,7 +504,7 @@ class MarketHub:
         emits completed bars per registered timeframe. `volume`/`oi` are 0 for
         volumeless index spot (Ticker) — the companion future supplies them via
         _on_companion."""
-        if not self._tick_ok(ts):
+        if not self._tick_ok(ts, underlying):
             return
         for interval in self._tick_intervals(underlying):
             builder = self._builders.get((underlying, interval))
@@ -501,7 +520,7 @@ class MarketHub:
         underlying, without touching price (index spot already sets it). Same
         tick gate as price ticks. No bar is emitted here — the price tick that
         rolls the bucket carries the accumulated volume/OI out."""
-        if not self._tick_ok(ts):
+        if not self._tick_ok(ts, underlying):
             return
         for interval in self._tick_intervals(underlying):
             builder = self._builders.get((underlying, interval))

@@ -22,7 +22,7 @@ from app.engines.paper import IST, MarketHub
 
 def _hub():
     hub = MarketHub(SyntheticStore())
-    hub._tick_ok = lambda ts: True     # bypass the session/freshness gate
+    hub._tick_ok = lambda ts, u="": True   # bypass the session/freshness gate
     return hub
 
 
@@ -92,3 +92,62 @@ def test_eod_flush_skips_mcx_builders():
         if b.flush() is not None:
             flushed.append(u)
     assert "CRUDEOIL" not in flushed
+
+
+# --- the tick gate itself ---------------------------------------------------
+# The builder fix above was necessary but NOT sufficient: _tick_ok hardcoded
+# NSE's 09:15-15:30 window for EVERY underlying, so MCX ticks outside it were
+# discarded before reaching any builder. MCX trades 09:00-23:30, so most of
+# its session was thrown away. underlying_bars stayed frozen at 152 rows even
+# after builders existed -- two independent layers had to be fixed.
+
+from datetime import time as dtime           # noqa: E402
+
+
+def _mcx_is_resolved() -> bool:
+    from app.data.dhan_client import UNDERLYINGS
+    return "MCX" in str((UNDERLYINGS.get("CRUDEOIL") or {}).get("segment", ""))
+
+
+def _at(hh, mm):
+    """A weekday timestamp at hh:mm, fresh relative to the freshness check."""
+    base = datetime.now(IST).replace(tzinfo=None)
+    while base.weekday() >= 5:
+        base -= timedelta(days=1)
+    return base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def test_nse_window_still_rejects_out_of_session_ticks():
+    hub = MarketHub(SyntheticStore())
+    hub.TICK_FRESHNESS_S = None              # isolate the window check
+    assert hub._tick_ok(_at(10, 0), "NIFTY") is True
+    assert hub._tick_ok(_at(9, 5), "NIFTY") is False      # pre-open auction
+    assert hub._tick_ok(_at(16, 0), "NIFTY") is False     # after NSE close
+
+
+def test_mcx_evening_ticks_are_accepted():
+    """The regression: MCX ticks after the NSE close must survive the gate."""
+    if not _mcx_is_resolved():
+        return                                # MCX ids unresolved in this env
+    hub = MarketHub(SyntheticStore())
+    hub.TICK_FRESHNESS_S = None
+    assert hub._tick_ok(_at(9, 5), "CRUDEOIL") is True    # MCX opens 09:00
+    assert hub._tick_ok(_at(16, 0), "CRUDEOIL") is True   # was rejected
+    assert hub._tick_ok(_at(22, 30), "CRUDEOIL") is True  # was rejected
+    assert hub._tick_ok(_at(23, 45), "CRUDEOIL") is False  # past MCX close
+
+
+def test_unknown_underlying_keeps_the_stricter_nse_window():
+    hub = MarketHub(SyntheticStore())
+    hub.TICK_FRESHNESS_S = None
+    assert hub._tick_ok(_at(16, 0), "WHATEVER") is False
+
+
+def test_weekend_ticks_always_rejected():
+    hub = MarketHub(SyntheticStore())
+    hub.TICK_FRESHNESS_S = None
+    sat = _at(11, 0)
+    while sat.weekday() != 5:
+        sat += timedelta(days=1)
+    assert hub._tick_ok(sat, "CRUDEOIL") is False
+    assert hub._tick_ok(sat, "NIFTY") is False
