@@ -72,6 +72,21 @@ class PBKConfluence(Strategy):
 
         # ---- manage open position (uses last completed-bar state) ---------
         if ctx.positions:
+            if self._entry_spot is None:
+                # Recovered across a restart. M4 restores POSITIONS from
+                # paper_state, but this object is rebuilt fresh from the
+                # pasted source, so every self._* attribute is back at its
+                # initial value while ctx.positions is non-empty. Re-derive
+                # from the position itself (entries are ATM, so the strike is
+                # the entry spot to within one strike interval) instead of
+                # subtracting None. Crashed live 2026-07-28 after a mid-session
+                # redeploy: TypeError float - NoneType, strategy auto-paused.
+                _p = ctx.positions[0]
+                self._entry_spot = _p.strike
+                self._side = ("up" if str(_p.leg.option_type).upper().endswith("CALL")
+                              else "down")
+                ctx.log(f"resumed after restart: entry_spot~{self._entry_spot} "
+                        f"side={self._side}")
             move = ctx.spot - self._entry_spot
             fav = move if self._side == "up" else -move
             if fav >= self.params["target_pts"]:
