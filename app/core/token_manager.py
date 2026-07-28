@@ -60,8 +60,19 @@ router = APIRouter(tags=["token"])
 # storage
 # ---------------------------------------------------------------------------
 
+def _conn() -> sqlite3.Connection:
+    """Same DB file as app.core.registry, same WAL + busy_timeout — see the
+    comment on registry._conn(). Both modules open raw connections against
+    optionslab.db independently; a mismatch here would silently reintroduce
+    the lock contention that fix addresses for this module's calls."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=8000")
+    return conn
+
+
 def _init():
-    with sqlite3.connect(DB_PATH) as c:
+    with _conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS dhan_token (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             access_token TEXT, generated_at TEXT, expires_at TEXT)""")
@@ -70,7 +81,7 @@ def _init():
 def _save(token: str) -> None:
     _init()
     now = datetime.now(IST)
-    with sqlite3.connect(DB_PATH) as c:
+    with _conn() as c:
         c.execute("INSERT OR REPLACE INTO dhan_token VALUES (1, ?, ?, ?)",
                   (token, now.isoformat(),
                    (now + timedelta(hours=TOKEN_LIFETIME_H)).isoformat()))
@@ -78,7 +89,7 @@ def _save(token: str) -> None:
 
 def _load() -> dict | None:
     _init()
-    with sqlite3.connect(DB_PATH) as c:
+    with _conn() as c:
         row = c.execute("SELECT access_token, generated_at, expires_at "
                         "FROM dhan_token WHERE id=1").fetchone()
     if not row or not row[0]:

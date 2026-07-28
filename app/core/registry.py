@@ -69,6 +69,22 @@ class StrategyRecord:
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    # WAL lets readers (dashboard polls, /token/status, diag.py) proceed
+    # while a writer's transaction is open — the default rollback-journal
+    # mode blocks EVERY reader for the duration of any writer's transaction.
+    # optionslab.db never had this set. It went unnoticed until 2026-07-28,
+    # when the day's fixes added roughly a dozen new record_event() call
+    # sites (the recording watchdog, four loop guards, crash-loop
+    # containment, entry-skip logging) — more writers meant more chances for
+    # a reader to stall behind one, and /token/status, /data/health and
+    # /scanner all timed out mid-session while background recording kept
+    # running fine. busy_timeout gives a bounded wait instead of an
+    # immediate "database is locked" on the rare remaining contention
+    # (WAL still serializes writer-vs-writer). Idempotent: safe to run on
+    # every connect; WAL is a persistent property of the file after the
+    # first call.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=8000")
     conn.row_factory = sqlite3.Row
     return conn
 
