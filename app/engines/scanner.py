@@ -906,16 +906,29 @@ class StockScanner:
         return marked
 
     def ranked_scores(self) -> list[dict]:
-        """All current setup scores, highest first — backs GET /scanner. Falls
-        back to a Tier-1-only score for names not yet deep-dived."""
+        """All current setup scores, highest first. This is THE trading
+        surface — ScannerTrader.pick_entries gates entries on it — as well as
+        the GET /scanner table.
+
+        Recomputed FRESH from current Tier-1 metrics on EVERY call, folding in
+        Tier-2 chain data only for names deep-dived in the CURRENT shortlist.
+        It used to merge self.scores — computed once per Tier-2 cycle, so up
+        to ~7 minutes stale — with fresh Tier-1-only scores for everything
+        else. Mixed freshness meant fast movers rose to the top scored
+        fresh-but-chainless while the deep-dived names sat below them on stale
+        numbers (observed 2026-07-28 ~12:30: the entire top-8 was
+        deep_dived=False even though Tier-2 was running every cycle). Uniform
+        freshness restores the alignment invariant: what ranks highest is what
+        the shortlist deep-dives, so qualifying names have chains.
+
+        Stale Tier-2 data for names that dropped OFF the shortlist is
+        deliberately NOT used — its chain bonus (up to +15, or the liquidity
+        cap) describes a market several cycles gone."""
+        current = {d["symbol"] for d in self.shortlist}
         out = []
-        seen = set()
-        for sym, sc in self.scores.items():
-            out.append(sc)
-            seen.add(sym)
         for sym, m in self.metrics.items():
-            if sym not in seen:
-                out.append(setup_score(m, None))
+            out.append(setup_score(m, self.tier2.get(sym)
+                                   if sym in current else None))
         out.sort(key=lambda s: s.get("score") or 0, reverse=True)
         return out
 

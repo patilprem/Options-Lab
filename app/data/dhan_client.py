@@ -91,7 +91,12 @@ def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
             .decode("utf-8", "replace")
         lines = raw.splitlines()
         keep = [lines[0]] + [ln for ln in lines[1:] if ln.startswith("MCX,")]
-        _MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+        # Never cache a header-only result (see _FNO_MASTER_CACHE note): a bad
+        # download must not blank MCX contract resolution for 24h — with the
+        # July contract rolling 2026-07-30 this is exactly the week it would
+        # sting.
+        if len(keep) > 1:
+            _MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
 
     rows = list(csv.DictReader(io.StringIO(
         _MASTER_CACHE.read_text(encoding="utf-8"))))
@@ -185,7 +190,10 @@ def index_fut_master_rows(max_age_h: float = 24.0) -> list:
         keep = [lines[0]] + [ln for ln in lines[1:]
                              if (ln.startswith("NSE,") or ln.startswith("BSE,"))
                              and "FUTIDX" in ln]
-        _IDX_FUT_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+        # Never cache a header-only result (see _FNO_MASTER_CACHE note): a bad
+        # download must not blank index-futures resolution for 24h.
+        if len(keep) > 1:
+            _IDX_FUT_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
     return list(csv.DictReader(io.StringIO(
         _IDX_FUT_MASTER_CACHE.read_text(encoding="utf-8"))))
 
@@ -299,7 +307,13 @@ def resolve_fno_universe(max_age_h: float = 24.0, store=None, today=None) -> dic
         keep = [lines[0]] + [
             ln for ln in lines[1:]
             if ln.startswith("NSE,") and ("FUTSTK" in ln or "EQUITY" in ln)]
-        _FNO_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
+        # Never cache a header-only result: an empty/garbage download (CDN
+        # error page, truncated body) would otherwise poison resolution for
+        # 24h — the same never-cache-empty rule the expiry cache learned the
+        # hard way (2026-07-23..27 outage). Keep the old cache and retry next
+        # call instead.
+        if len(keep) > 1:
+            _FNO_MASTER_CACHE.write_text("\n".join(keep), encoding="utf-8")
 
     rows = list(csv.DictReader(io.StringIO(
         _FNO_MASTER_CACHE.read_text(encoding="utf-8"))))

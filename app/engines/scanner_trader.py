@@ -455,9 +455,16 @@ class ScannerTrader:
 
         held = set(self.book) | exited
         fees_today = 0.0
-        for sym in pick_entries(scanner.ranked_scores(), held, cfg,
+        # One fresh snapshot for BOTH gating and booking: pick_entries decides
+        # on this list, so bias/entry_score must come from the same dicts —
+        # scanner.scores is the per-Tier-2-cycle copy (up to ~7 min stale) and
+        # for a fresh qualifier not in the last shortlist it's absent entirely,
+        # which used to null the bias and silently kill the entry.
+        ranked = scanner.ranked_scores()
+        by_sym = {r.get("symbol"): r for r in ranked}
+        for sym in pick_entries(ranked, held, cfg,
                                 now=now, last_exits=getattr(self, "_last_exit", None)):
-            sc = scanner.scores.get(sym) or {}
+            sc = by_sym.get(sym) or scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
@@ -840,9 +847,11 @@ class ScannerTrader:
             s, ts = c.get("symbol"), c.get("ts")
             if s and ts and ts > chal_last_exit.get(s, ""):
                 chal_last_exit[s] = ts
-        for sym in pick_entries(scanner.ranked_scores(), held, chal_cfg,
+        chal_ranked = scanner.ranked_scores()
+        chal_by_sym = {r.get("symbol"): r for r in chal_ranked}
+        for sym in pick_entries(chal_ranked, held, chal_cfg,
                                 now=now, last_exits=chal_last_exit):
-            sc = scanner.scores.get(sym) or {}
+            sc = chal_by_sym.get(sym) or scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
