@@ -282,12 +282,20 @@ class MarketHub:
         return segs
 
     async def _watchdog_loop(self) -> None:
-        """Once a minute: if the feed is down/silent during market hours,
-        push an ntfy alert (same channel as token refresh). See watchdog.py."""
+        """Once a minute: if the feed is down/silent during market hours, OR a
+        recorder has stopped writing, push an ntfy alert (same channel as token
+        refresh). See watchdog.py / recording_watchdog.py.
+
+        Two watchdogs because they catch different failures. The 2026-07-23..27
+        chain outage never touched the feed — ticks flowed, the pill stayed
+        green, and chain_snapshots recorded nothing for five days. Watching the
+        socket cannot see that; watching whether ROWS LAND can."""
         from app.engines.watchdog import (FeedWatchdog, feed_broken,
                                           session_open_for)
+        from app.engines.recording_watchdog import RecordingWatchdog
         HEAL_COOLDOWN_S = 180        # at most one self-heal attempt / 3 min
         wd = FeedWatchdog()
+        rec_wd = RecordingWatchdog()
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(60)
@@ -311,6 +319,20 @@ class MarketHub:
                             "warn", "feed", f"watchdog: feed broken — self-heal {res}")
                 else:
                     self._last_heal = None      # healthy again → reset cooldown
+
+                # Recorders: are rows actually landing? Independent of the
+                # feed's health — see this method's docstring.
+                if hasattr(self.store, "recording_health"):
+                    health = await loop.run_in_executor(
+                        None, self.store.recording_health)
+                    rkind = await loop.run_in_executor(
+                        None, rec_wd.step, health, now)
+                    if rkind:
+                        registry.record_event(
+                            "info" if rkind == "recovered" else "warn",
+                            "data", f"recording watchdog: {rkind}"
+                            + ("" if rkind == "recovered"
+                               else f" ({', '.join(rec_wd.stale)})"))
             except Exception as e:
                 registry.record_event("warn", "feed", f"watchdog error: {e!r}")
 
@@ -564,48 +586,88 @@ class MarketHub:
         """Poll each deployed underlying's option chain (rate-limited to
         1 req / 3 s globally) and refresh the ATM-relative quote cache used by
         fills. One fetch per (underlying, expiry) covers all strike offsets."""
-        from app.data import dhan_client
         loop = asyncio.get_running_loop()
         client = None
         warned: set[str] = set()
         cycle = 0
         while True:
-            for u in self._chain_order():
-                cfg = UNDERLYINGS.get(u)
-                if not cfg:
-                    continue
-                targets = self.CHAIN_TARGETS
-                if u in self._wanted and cycle % self.SECONDARY_EVERY != 0:
-                    targets = tuple(t for t in targets if t[1] == 0)
-                # Per-underlying isolation: a failing chain (e.g. MCX) must
-                # never break the others' polling. On ANY failure the client is
-                # dropped and rebuilt for the next name — Dhan's error payloads
-                # don't reliably say "token", and after the 24h token rotated a
-                # keyword-gated rebuild kept a dead client all session, freezing
-                # the quote cache at Friday's prices (2026-07-13).
-                try:
-                    if client is None:
-                        client = await loop.run_in_executor(None, dhan_client.get_client)
-                    await self._poll_one_chain(u, cfg, client, loop, targets)
-                    warned.discard(u)
-                except Exception as e:
-                    if u not in warned:
-                        warned.add(u)
-                        registry.record_event("warn", "feed",
-                                              f"chain poll error [{u}]: {e!r}")
-                    client = None          # rebuild for the next name/cycle
-                    await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
+            # TOP-LEVEL GUARD. The per-underlying try inside _poll_cycle only
+            # covers ONE name's fetch; _chain_order() is evaluated outside it,
+            # in the for statement, so anything raising there killed this task
+            # outright — silently, with no restart and no event. The quote
+            # cache then froze at its last values while everything else looked
+            # healthy: feed connected, underlying_bars writing, dashboard green
+            # (observed 2026-07-28 — all four names stopped within 15s of each
+            # other at 09:30, the minute the Tier-2 scanner first calls
+            # enable_chain() and mutates the _chain_only set this iterates).
+            # A failing poller must degrade to a logged, retried cycle. It must
+            # never degrade to a dead task, because a dead task is invisible.
+            try:
+                client = await self._poll_cycle(client, loop, cycle, warned)
+            except Exception as e:
+                registry.record_event("error", "feed",
+                                      f"chain poll cycle failed: {e!r}")
+                client = None
+                await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
             await asyncio.sleep(1.0)
             cycle += 1
+
+    async def _poll_cycle(self, client, loop, cycle: int, warned: set):
+        """One pass over every polled underlying. Split out of the loop so the
+        caller can guard the WHOLE pass — including _chain_order(), which reads
+        sets the scanner mutates concurrently. Returns the client to reuse
+        (None when it needs rebuilding)."""
+        from app.data import dhan_client
+        for u in self._chain_order():
+            cfg = UNDERLYINGS.get(u)
+            if not cfg:
+                continue
+            targets = self.CHAIN_TARGETS
+            if u in self._wanted and cycle % self.SECONDARY_EVERY != 0:
+                targets = tuple(t for t in targets if t[1] == 0)
+            # Per-underlying isolation: a failing chain (e.g. MCX) must
+            # never break the others' polling. On ANY failure the client is
+            # dropped and rebuilt for the next name — Dhan's error payloads
+            # don't reliably say "token", and after the 24h token rotated a
+            # keyword-gated rebuild kept a dead client all session, freezing
+            # the quote cache at Friday's prices (2026-07-13).
+            try:
+                if client is None:
+                    client = await loop.run_in_executor(None, dhan_client.get_client)
+                await self._poll_one_chain(u, cfg, client, loop, targets)
+                warned.discard(u)
+            except Exception as e:
+                if u not in warned:
+                    warned.add(u)
+                    registry.record_event("warn", "feed",
+                                          f"chain poll error [{u}]: {e!r}")
+                client = None          # rebuild for the next name/cycle
+                await asyncio.sleep(self.CHAIN_MIN_INTERVAL)
+        return client
 
     def _chain_order(self) -> list:
         """Underlyings to poll each cycle, DEPLOYED FIRST. Paper fills depend
         on fresh chains for `_wanted`; the Tier-2 scanner (F3) dumps stock
         names into `_chain_only`, so deployed strategies must never queue
-        behind the shortlist. Deployed names lead; chain-only names follow."""
-        order = list(self._wanted)
-        order += [u for u in self._chain_only if u not in self._wanted]
-        return order
+        behind the shortlist. Deployed names lead; chain-only names follow.
+
+        Both sets are mutated from OUTSIDE this coroutine — register() and
+        enable_chain() are called by strategies and by the Tier-2 scanner —
+        so iterating them directly can raise "Set changed size during
+        iteration" mid-pass. tuple() takes an atomic snapshot; the retry
+        covers the copy itself racing, and an empty pass is survivable (the
+        next cycle is one second away) where a raised exception was not."""
+        for _ in range(3):
+            try:
+                wanted = tuple(self._wanted)
+                chain_only = tuple(self._chain_only)
+                break
+            except RuntimeError:            # mutated while copying
+                continue
+        else:
+            return []
+        seen = set(wanted)
+        return list(wanted) + [u for u in chain_only if u not in seen]
 
     async def _poll_one_chain(self, u, cfg, client, loop, targets) -> None:
         """Refresh one underlying's chain cache for `targets` expiries through
