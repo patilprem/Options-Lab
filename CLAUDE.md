@@ -110,6 +110,12 @@ off-hours window; genuinely urgent fixes get the marker.
   run_backtest), evaluates the winner OOS, chains an aggregate OOS equity
   curve. Caps runs (max_runs), progress via callback. Pure — API builds the
   strategy factory. Frontend Walk-Forward tab (components/WalkForward.jsx).
+- `app/engines/watchdog.py` + `recording_watchdog.py` — two ntfy watchdogs on
+  the once-a-minute hub loop. FeedWatchdog watches the SOCKET (down/silent);
+  RecordingWatchdog watches whether ROWS LAND (`store.recording_health()`),
+  because the 07-23..27 outage never touched the socket. Segment-aware and
+  event-table-aware so idle-but-correct tables never cry wolf; one push on
+  state change, re-push every 15 min, one all-clear.
 - `app/engines/risk.py` — M7 risk panel: pure `evaluate()` (portfolio max daily
   loss + per-strategy caps from settings), `exposure()` by underlying/expiry,
   `snapshot()` (margin utilization, day P&L vs max-loss). PaperRunner.enforce_risk
@@ -217,6 +223,23 @@ off-hours window; genuinely urgent fixes get the marker.
   Expiry weekdays have changed historically.
 - STT/charges rates in fills.py are approximations — verify vs contract
   notes before trusting absolute P&L.
+- EVENTS TIMESTAMPS use a SPACE separator (`registry.record_event` stores
+  `isoformat(sep=" ")`). A SQL filter built as `ts >= date('now')||'T09:15'`
+  compares `' '` (0x20) against `'T'` (0x54) and silently excludes EVERY row —
+  an entire day of ad-hoc diagnostics returned empty because of this
+  (2026-07-28). Filter with `ts LIKE 'YYYY-MM-DD %'` (as `events_for` does) or
+  use `scripts/diag.py`, which has the correct forms baked in.
+- LONG-RUNNING LOOPS must have their ENTIRE body inside a try
+  (tests/test_loop_resilience.py enforces this structurally). The chain poller
+  died silently on an unguarded statement (2026-07-28) and five sibling tasks
+  had the same hole. Also: any iteration over `_wanted`/`_chain_only`/
+  `_builders` must snapshot first — the scanner mutates them concurrently.
+- ONE RANKING, ONE GATE: `StockScanner.ranked_scores()` is THE trading
+  surface. The Tier-2 shortlist (rank_for_deep_dive), the entry gate
+  (pick_entries) and ranked_scores all use setup_score, recomputed fresh per
+  call (tests/test_shortlist_alignment.py enforces alignment). Two formulas
+  drifted apart once (2026-07-28: every qualifying name lacked chain data,
+  trader silently skipped them all) — don't reintroduce a second scale.
 - INDEX VOLUME (verified 2026-07-27, don't re-derive): `underlying_bars.volume`
   for NIFTY/BANKNIFTY is POPULATED from 2025-11 onward and ZERO before it.
   An index has no volume of its own, so Dhan's intraday historical substitutes
@@ -254,8 +277,12 @@ execution + kill switch built & gated, verified in DRY-RUN (no real orders).
 Before real capital, ON THE VPS during market hours: (a) live tick→candle flow,
 (b) chain poller under load, (c) real FNO margin + `scripts/calibrate_margin`,
 (d) M8 real-order path incl. OrderUpdate fill reconciliation (not yet built) +
-kill_switch action strings. Also pending: MCX chain recording needs MCX security
-ids in dhan_client.UNDERLYINGS. Flip live on only via /live/settings ON the VPS.
+kill_switch action strings. (MCX chain recording is LIVE since 2026-07-27 —
+the dynamic resolver populates CRUDEOIL/GOLD ids; verified 100k+ rows/day.)
+Flip live on only via /live/settings ON the VPS. (a) and (b) verified
+2026-07-27/28. For any "is it healthy?" question run `scripts/diag.py` on the
+VPS — one command: sha, service, token, per-table + per-underlying freshness,
+scanner cadence/scores, warn/error tail, RED-flag verdict.
 - Index-futures VOLUME companion (engines/feed.py + paper.py, gated behind the
   `index_futures_volume` setting, default OFF). VERIFIED against the installed
   dhanhq SDK: feed-mode/segment ints (Ticker15/Full21/IDX0/NSE_FNO2/BSE_FNO8),

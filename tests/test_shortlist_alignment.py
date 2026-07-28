@@ -98,3 +98,57 @@ def test_deep_dive_can_only_raise_a_score():
     with_chain = setup_score(m, {"liquidity": {"ok": True, "checked": True},
                                  "iv_skew": None, "oi_shift": []})["score"]
     assert with_chain > t1_only
+
+
+# --- ranked_scores freshness (the trading surface) ---------------------------
+
+def _scanner_with(metrics, shortlist_syms=(), tier2=None, stale_scores=None):
+    from app.engines.scanner import StockScanner
+    s = StockScanner.__new__(StockScanner)
+    s.metrics = metrics
+    s.shortlist = [{"symbol": x} for x in shortlist_syms]
+    s.tier2 = tier2 or {}
+    s.scores = stale_scores or {}
+    return s
+
+
+def test_ranked_scores_recomputes_fresh_not_from_stale_cache():
+    """The 2026-07-28 ~12:30 shape: a shortlisted name whose Tier-1 metrics
+    have IMPROVED since the last Tier-2 pass must rank on its current metrics,
+    not on the stale per-cycle score. Mixed freshness put every fresh mover
+    above every deep-dived name."""
+    m = _m("HOT", 3.0, surge=3.0)                     # current: strong
+    s = _scanner_with({"HOT": m}, shortlist_syms=["HOT"],
+                      stale_scores={"HOT": {"symbol": "HOT", "score": 5.0,
+                                            "bias": "CE"}})
+    out = s.ranked_scores()
+    assert out[0]["symbol"] == "HOT"
+    assert out[0]["score"] > 50, "still serving the stale 5.0 score"
+
+
+def test_ranked_scores_folds_t2_only_for_current_shortlist():
+    """Chain bonus applies to names deep-dived THIS cycle; a name that dropped
+    off the shortlist must not keep a bonus describing a market cycles gone."""
+    t2 = {"liquidity": {"ok": True, "checked": True}, "iv_skew": None,
+          "oi_shift": []}
+    metrics = {"IN": _m("IN", 1.0), "OUT": _m("OUT", 1.0)}
+    s = _scanner_with(metrics, shortlist_syms=["IN"],
+                      tier2={"IN": t2, "OUT": t2})
+    by = {r["symbol"]: r for r in s.ranked_scores()}
+    assert by["IN"]["deep_dived"] is True
+    assert by["OUT"]["deep_dived"] is False
+    assert by["IN"]["score"] > by["OUT"]["score"]
+
+
+def test_ranked_scores_and_shortlist_agree_on_the_top():
+    """End-to-end alignment: with uniform freshness, the top of ranked_scores
+    IS the shortlist (same formula, same inputs), so qualifying names have
+    chains by construction."""
+    metrics = {f"S{i}": _m(f"S{i}", 0.4 + i * 0.2, surge=1.0 + i * 0.1)
+               for i in range(20)}
+    from app.engines.scanner import rank_for_deep_dive
+    shortlist = [d["symbol"] for d in rank_for_deep_dive(metrics, top_n=5)]
+    s = _scanner_with(metrics, shortlist_syms=shortlist)
+    top5 = [r["symbol"] for r in s.ranked_scores()
+            if r.get("bias")][:5]
+    assert set(top5) == set(shortlist)
