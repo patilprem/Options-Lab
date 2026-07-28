@@ -543,27 +543,47 @@ class MarketHub:
         Weekdays only — an EOD on a closed day would stamp a phantom zero
         P&L row for a session that never happened."""
         while True:
-            now = datetime.now(IST)
-            target = now.replace(hour=15, minute=31, second=0, microsecond=0)
-            if now >= target:
-                target += timedelta(days=1)
-            await asyncio.sleep((target - now).total_seconds())
-            if datetime.now(IST).weekday() >= 5:
-                continue
-            for (u, interval), builder in self._builders.items():
-                # 15:31 is the NSE close. MCX trades to 23:30, so flushing an
-                # MCX builder here would persist a PARTIAL candle mid-session
-                # and then keep filling the next one — silently corrupting the
-                # very MCX history we just started recording. Let MCX builders
-                # roll naturally on their own ticks.
-                cfg = UNDERLYINGS.get(u) or {}
-                if "MCX" in str(cfg.get("segment", "")):
+            # Guarded whole-body: an exception here used to kill the task, and
+            # a dead EOD clock means no 15:31 flush, no square-off and no
+            # persisted day — discovered only when the P&L looks wrong. The
+            # concrete risk is the _builders iteration below: register() and
+            # enable_chain() mutate that dict from other coroutines, so
+            # Tier-2 adding a name at 15:31 raised "dictionary changed size
+            # during iteration" and took EOD with it. Snapshot + guard, same
+            # fix as _chain_order().
+            try:
+                now = datetime.now(IST)
+                target = now.replace(hour=15, minute=31, second=0, microsecond=0)
+                if now >= target:
+                    target += timedelta(days=1)
+                await asyncio.sleep((target - now).total_seconds())
+                if datetime.now(IST).weekday() >= 5:
                     continue
-                bar = builder.flush()
-                if bar is not None:
-                    self._emit(("bar", u, interval, bar))
-            for u in list(self._wanted):
-                self._emit(("eod", u, None, None))
+                await self._eod_flush()
+            except Exception as e:
+                registry.record_event("error", "engine", f"EOD clock error: {e!r}")
+                await asyncio.sleep(60)
+
+    async def _eod_flush(self) -> None:
+        """Flush non-MCX partial candles and emit EOD. Split out so _eod_clock
+        can guard the whole pass."""
+        # list() snapshots the dict: register()/enable_chain() mutate it from
+        # other coroutines, and iterating it live raised "dictionary changed
+        # size during iteration" — which used to kill the EOD clock outright.
+        for (u, interval), builder in list(self._builders.items()):
+            # 15:31 is the NSE close. MCX trades to 23:30, so flushing an
+            # MCX builder here would persist a PARTIAL candle mid-session
+            # and then keep filling the next one — silently corrupting the
+            # very MCX history we just started recording. Let MCX builders
+            # roll naturally on their own ticks.
+            cfg = UNDERLYINGS.get(u) or {}
+            if "MCX" in str(cfg.get("segment", "")):
+                continue
+            bar = builder.flush()
+            if bar is not None:
+                self._emit(("bar", u, interval, bar))
+        for u in list(self._wanted):
+            self._emit(("eod", u, None, None))
 
     async def _run_synthetic(self) -> None:
         """Dev driver: replay today's synthetic bars (per registered timeframe),
@@ -1400,55 +1420,96 @@ class PaperRunner:
         MarketHub.CHAIN_MIN_INTERVAL), it just removes any extra lag between
         a fresh quote landing in _chain_cache and it reaching day_pnl/API."""
         while True:
-            await asyncio.sleep(self.MTM_REFRESH_SEC)
-            now = datetime.now(IST).replace(tzinfo=None)
-            for ctx in list(self.contexts.values()):
-                try:
-                    ctx.refresh_mtm(now)
-                except Exception as e:
-                    registry.record_event("warn", "engine", f"mtm refresh failed: {e!r}")
+            # Outer guard: the per-context try below cannot catch a failure in
+            # the clock read or the contexts snapshot, and this task dying
+            # silently freezes displayed P&L (and the stop/target checks that
+            # ride on it) while everything else looks healthy.
+            try:
+                await asyncio.sleep(self.MTM_REFRESH_SEC)
+                now = datetime.now(IST).replace(tzinfo=None)
+                for ctx in list(self.contexts.values()):
+                    try:
+                        ctx.refresh_mtm(now)
+                    except Exception as e:
+                        registry.record_event("warn", "engine",
+                                              f"mtm refresh failed: {e!r}")
+            except Exception as e:
+                registry.record_event("error", "engine", f"mtm loop error: {e!r}")
+                await asyncio.sleep(5)
 
     async def _heartbeat(self) -> None:
         """Persist every live context on an interval so an ungraceful crash
         (between fills) still leaves a recent recoverable snapshot."""
         while True:
-            await asyncio.sleep(self.HEARTBEAT_SEC)
-            for ctx in list(self.contexts.values()):
-                try:
-                    ctx.persist_state()
-                except Exception as e:
-                    registry.record_event("warn", "engine", f"heartbeat persist failed: {e!r}")
+            # Outer guard: if this task dies, M4 recovery quietly degrades —
+            # an ungraceful restart then loses open positions, and nothing
+            # says so until you notice they're gone.
+            try:
+                await asyncio.sleep(self.HEARTBEAT_SEC)
+                for ctx in list(self.contexts.values()):
+                    try:
+                        ctx.persist_state()
+                    except Exception as e:
+                        registry.record_event("warn", "engine",
+                                              f"heartbeat persist failed: {e!r}")
+            except Exception as e:
+                registry.record_event("error", "engine", f"heartbeat loop error: {e!r}")
+                await asyncio.sleep(5)
 
     async def _loop(self, sid: str, strategy: Strategy, ctx: PaperContext) -> None:
         q = self.hub.subscribe()
-        strategy.on_start(ctx)
+        self._guard_strategy(sid, ctx, "on_start", strategy.on_start, ctx)
         while True:
-            kind, underlying, interval, bar = await q.get()
-            if underlying != ctx.underlying:
-                continue
-            if interval is not None and interval != ctx.interval:
-                continue  # a bar for a different timeframe on this underlying
-            if kind == "eod" or (bar and bar.ts.time() >= dtime(15, 25)):
-                if bar:
-                    ctx.push_bar(bar)
-                # square off expiring positions
-                for p in list(ctx.positions):
-                    if p.expiry <= ctx.now.date():
-                        ctx._close(p, reason='expiry')
-                strategy.on_day_end(ctx)
-                ctx.persist_day()
-                if kind == "eod":
-                    continue
-            ctx.push_bar(bar)
+            # Invariant #6 says a crashing strategy auto-pauses and never kills
+            # the process. on_bar was guarded — but on_start/on_day_end are
+            # strategy code too, and push_bar/persist_day/enforce_risk are
+            # engine code, all of them unguarded. Any one raising killed this
+            # task: the strategy simply stopped trading, still displayed as
+            # RUNNING, with no event. Same silent-task-death as the chain
+            # poller (2026-07-28). Strategy hooks auto-pause; engine failures
+            # log and continue so one bad bar can't end the session.
             try:
-                strategy.on_bar(ctx, bar)
+                kind, underlying, interval, bar = await q.get()
+                if underlying != ctx.underlying:
+                    continue
+                if interval is not None and interval != ctx.interval:
+                    continue  # a bar for a different timeframe on this underlying
+                if kind == "eod" or (bar and bar.ts.time() >= dtime(15, 25)):
+                    if bar:
+                        ctx.push_bar(bar)
+                    # square off expiring positions
+                    for p in list(ctx.positions):
+                        if p.expiry <= ctx.now.date():
+                            ctx._close(p, reason='expiry')
+                    self._guard_strategy(sid, ctx, "on_day_end",
+                                         strategy.on_day_end, ctx)
+                    ctx.persist_day()
+                    if kind == "eod":
+                        continue
+                ctx.push_bar(bar)
+                self._guard_strategy(sid, ctx, "on_bar", strategy.on_bar, ctx, bar)
+                self.enforce_risk()  # M7: risk guardrails every bar
             except Exception as e:
-                ctx.log(f"STRATEGY ERROR (auto-paused): {e!r}")
                 registry.record_event("error", "engine",
-                                      f"Strategy crashed and was auto-paused: {e!r}", sid)
+                                      f"strategy loop error (engine side): {e!r}", sid)
+                await asyncio.sleep(1)
+
+    def _guard_strategy(self, sid: str, ctx, hook: str, fn, *args) -> None:
+        """Run one strategy hook under invariant #6: a crash auto-pauses the
+        strategy, it never propagates. Shared by on_start/on_bar/on_day_end so
+        a hook can't be added later without the guard."""
+        try:
+            fn(*args)
+        except Exception as e:
+            ctx.log(f"STRATEGY ERROR in {hook} (auto-paused): {e!r}")
+            registry.record_event(
+                "error", "engine",
+                f"Strategy crashed in {hook} and was auto-paused: {e!r}", sid)
+            try:
                 ctx.set_paused(True)
                 registry.transition(sid, registry.State.DEPLOYED_PAUSED)
-            self.enforce_risk()  # M7: risk guardrails every bar
+            except Exception:
+                pass                      # already paused / bad state
 
     def _auto_pause(self, sid: str, level: str, reason: str) -> bool:
         """Pause one strategy for a risk breach (idempotent). Returns True if it
