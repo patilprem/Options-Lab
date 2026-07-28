@@ -20,7 +20,17 @@ Output ONLY Python code, no explanations, no markdown fences.
    the `indicators` toolbox (below) — do NOT hand-roll EMA/ATR/Supertrend/
    VWAP/pivots; the built-ins are tested and stateless (recomputed from the
    history window each call, so a restart can't desync them).
-8. If your logic needs indicator lookback (EMA/RSI/ATR/etc.), set
+8. YOUR INSTANCE STATE DOES NOT SURVIVE A RESTART — OPEN POSITIONS DO.
+   On a mid-session restart the engine restores positions from `paper_state`,
+   but your strategy object is rebuilt fresh from source, so every `self.*`
+   attribute is back at its initial value. That means `ctx.positions` can be
+   NON-EMPTY while `self._entry_spot` / `self._side` / your bar counters are
+   still `None`/zero. Never assume a remembered value is set just because a
+   position exists: re-derive it from the position (`p.strike`, `p.entry_price`,
+   `p.leg.option_type`, `p.entry_ts`) or guard with `is None`. This crashed a
+   live strategy on 2026-07-28 — `ctx.spot - self._entry_spot` raised
+   `TypeError: float - NoneType` and auto-paused it after a redeploy.
+9. If your logic needs indicator lookback (EMA/RSI/ATR/etc.), set
    `"warmup_bars": N` in `meta().params` — the engine preloads N bars of
    history BEFORE the start of a backtest and on a mid-session paper restart,
    so `ctx.history(n)` is deep enough from your first `on_bar` instead of
