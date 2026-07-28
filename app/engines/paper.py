@@ -282,12 +282,20 @@ class MarketHub:
         return segs
 
     async def _watchdog_loop(self) -> None:
-        """Once a minute: if the feed is down/silent during market hours,
-        push an ntfy alert (same channel as token refresh). See watchdog.py."""
+        """Once a minute: if the feed is down/silent during market hours, OR a
+        recorder has stopped writing, push an ntfy alert (same channel as token
+        refresh). See watchdog.py / recording_watchdog.py.
+
+        Two watchdogs because they catch different failures. The 2026-07-23..27
+        chain outage never touched the feed — ticks flowed, the pill stayed
+        green, and chain_snapshots recorded nothing for five days. Watching the
+        socket cannot see that; watching whether ROWS LAND can."""
         from app.engines.watchdog import (FeedWatchdog, feed_broken,
                                           session_open_for)
+        from app.engines.recording_watchdog import RecordingWatchdog
         HEAL_COOLDOWN_S = 180        # at most one self-heal attempt / 3 min
         wd = FeedWatchdog()
+        rec_wd = RecordingWatchdog()
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(60)
@@ -311,6 +319,20 @@ class MarketHub:
                             "warn", "feed", f"watchdog: feed broken — self-heal {res}")
                 else:
                     self._last_heal = None      # healthy again → reset cooldown
+
+                # Recorders: are rows actually landing? Independent of the
+                # feed's health — see this method's docstring.
+                if hasattr(self.store, "recording_health"):
+                    health = await loop.run_in_executor(
+                        None, self.store.recording_health)
+                    rkind = await loop.run_in_executor(
+                        None, rec_wd.step, health, now)
+                    if rkind:
+                        registry.record_event(
+                            "info" if rkind == "recovered" else "warn",
+                            "data", f"recording watchdog: {rkind}"
+                            + ("" if rkind == "recovered"
+                               else f" ({', '.join(rec_wd.stale)})"))
             except Exception as e:
                 registry.record_event("warn", "feed", f"watchdog error: {e!r}")
 
