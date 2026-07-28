@@ -106,3 +106,109 @@ def test_guard_helper_exists_and_pauses():
     body = ast.dump(fn)
     assert "set_paused" in body, "_guard_strategy must pause the strategy"
     assert "DEPLOYED_PAUSED" in body, "_guard_strategy must transition state"
+
+
+# --- crash-loop containment -------------------------------------------------
+
+class _FakeCtx:
+    def __init__(self):
+        self.logs = []
+        self.paused = False
+
+    def log(self, m):
+        self.logs.append(m)
+
+    def set_paused(self, v):
+        self.paused = v
+
+
+def _runner(monkeypatch):
+    from app.engines.paper import PaperRunner
+    r = PaperRunner.__new__(PaperRunner)
+    events = []
+    monkeypatch.setattr("app.core.registry.record_event",
+                        lambda *a, **k: events.append(a))
+    monkeypatch.setattr("app.core.registry.transition", lambda *a, **k: None)
+    return r, events
+
+
+def test_repeated_crashes_disable_the_hook(monkeypatch):
+    """Pause keeps delivering on_bar so exits stay managed — so a strategy
+    crashing inside its own manage block re-crashes every bar forever. Three
+    strikes and we stop calling it."""
+    r, events = _runner(monkeypatch)
+    ctx = _FakeCtx()
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise ValueError("float - None")
+
+    for _ in range(10):
+        r._guard_strategy("sid1", ctx, "on_bar", boom)
+    assert len(calls) == r.MAX_HOOK_CRASHES, "hook kept being called after giving up"
+    assert ctx.paused is True
+    assert any("DISABLED" in str(a) for a in events)
+
+
+def test_a_success_resets_the_crash_counter(monkeypatch):
+    """A transient failure must not burn down the budget permanently."""
+    r, _ = _runner(monkeypatch)
+    ctx = _FakeCtx()
+    state = {"fail": True}
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if state["fail"]:
+            raise ValueError("transient")
+
+    r._guard_strategy("sid2", ctx, "on_bar", flaky)
+    r._guard_strategy("sid2", ctx, "on_bar", flaky)
+    state["fail"] = False
+    r._guard_strategy("sid2", ctx, "on_bar", flaky)   # recovers, resets
+    state["fail"] = True
+    for _ in range(5):
+        r._guard_strategy("sid2", ctx, "on_bar", flaky)
+    # 2 fails + 1 success + 3 more fails before giving up again
+    assert len(calls) == 6
+
+
+def test_hooks_are_tracked_independently(monkeypatch):
+    """on_bar giving up must not silence on_day_end."""
+    r, _ = _runner(monkeypatch)
+    ctx = _FakeCtx()
+    bar_calls, day_calls = [], []
+
+    def bad_bar():
+        bar_calls.append(1)
+        raise ValueError("x")
+
+    def good_day():
+        day_calls.append(1)
+
+    for _ in range(6):
+        r._guard_strategy("sid3", ctx, "on_bar", bad_bar)
+        r._guard_strategy("sid3", ctx, "on_day_end", good_day)
+    assert len(bar_calls) == r.MAX_HOOK_CRASHES
+    assert len(day_calls) == 6
+
+
+def test_strategies_are_tracked_independently(monkeypatch):
+    """One broken strategy must not disable another's hook."""
+    r, _ = _runner(monkeypatch)
+    ctx = _FakeCtx()
+    a, b = [], []
+
+    def bad_a():
+        a.append(1)
+        raise ValueError("x")
+
+    def good_b():
+        b.append(1)
+
+    for _ in range(6):
+        r._guard_strategy("A", ctx, "on_bar", bad_a)
+        r._guard_strategy("B", ctx, "on_bar", good_b)
+    assert len(a) == r.MAX_HOOK_CRASHES
+    assert len(b) == 6

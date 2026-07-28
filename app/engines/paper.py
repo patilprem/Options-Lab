@@ -1494,17 +1494,48 @@ class PaperRunner:
                                       f"strategy loop error (engine side): {e!r}", sid)
                 await asyncio.sleep(1)
 
+    # Consecutive crashes in the same hook before we stop calling it. Pausing
+    # alone is NOT enough: pause deliberately keeps delivering on_bar so exits
+    # stay managed, so a strategy crashing inside its own manage block
+    # (`if ctx.positions:`) re-crashes on EVERY bar, forever, spamming the log
+    # while its position goes unmanaged. Observed 2026-07-28: PBK Confluence
+    # crashed identically at 12:05 and 12:25 and would have all session. Three
+    # strikes is enough to prove it isn't transient.
+    MAX_HOOK_CRASHES = 3
+
     def _guard_strategy(self, sid: str, ctx, hook: str, fn, *args) -> None:
         """Run one strategy hook under invariant #6: a crash auto-pauses the
         strategy, it never propagates. Shared by on_start/on_bar/on_day_end so
-        a hook can't be added later without the guard."""
+        a hook can't be added later without the guard.
+
+        After MAX_HOOK_CRASHES consecutive failures the hook is DISABLED for
+        this instance — the engine's declared stop_loss/target still protect
+        any open position (invariant #4), but we stop pretending the strategy
+        can manage it. A success resets the counter."""
+        crashes = getattr(self, "_hook_crashes", None)
+        if crashes is None:
+            crashes = self._hook_crashes = {}
+        key = (sid, hook)
+        if crashes.get(key, 0) >= self.MAX_HOOK_CRASHES:
+            return                        # already given up on this hook
         try:
             fn(*args)
+            crashes.pop(key, None)        # recovered
         except Exception as e:
-            ctx.log(f"STRATEGY ERROR in {hook} (auto-paused): {e!r}")
+            n = crashes[key] = crashes.get(key, 0) + 1
+            ctx.log(f"STRATEGY ERROR in {hook} (auto-paused, {n}/"
+                    f"{self.MAX_HOOK_CRASHES}): {e!r}")
             registry.record_event(
                 "error", "engine",
-                f"Strategy crashed in {hook} and was auto-paused: {e!r}", sid)
+                f"Strategy crashed in {hook} and was auto-paused "
+                f"({n}/{self.MAX_HOOK_CRASHES}): {e!r}", sid)
+            if n >= self.MAX_HOOK_CRASHES:
+                registry.record_event(
+                    "error", "engine",
+                    f"{hook} DISABLED after {n} consecutive crashes — the "
+                    f"engine's declared stop/target still guard any open "
+                    f"position, but this strategy is no longer managing it. "
+                    f"Fix the code and redeploy.", sid)
             try:
                 ctx.set_paused(True)
                 registry.transition(sid, registry.State.DEPLOYED_PAUSED)
