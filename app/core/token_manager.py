@@ -153,17 +153,31 @@ async def daily_refresh_loop():
     until market close, generate a login link and push it to your phone."""
     import asyncio
     while True:
-        now = datetime.now(IST)
-        target = now.replace(hour=8, minute=30, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        st = token_status()
-        if st["state"] != "ok":
-            try:
+        # The WHOLE body is guarded, not just notify_phone. token_status() and
+        # the clock arithmetic sat outside the try, so one exception there
+        # killed this task outright — and a dead refresh loop is invisible
+        # until the NEXT morning, when the token quietly expires and every
+        # Dhan call fails for the whole session. Same silent-task-death that
+        # took out the chain poller on 2026-07-28; here the blast radius is a
+        # full trading day.
+        try:
+            now = datetime.now(IST)
+            target = now.replace(hour=8, minute=30, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+            st = token_status()
+            if st["state"] != "ok":
                 notify_phone(build_login_url())
-            except Exception as e:
-                print(f"[token] daily refresh failed: {e}")
+        except Exception as e:
+            print(f"[token] daily refresh failed: {e}")
+            try:
+                from app.core import registry
+                registry.record_event("error", "token",
+                                      f"daily refresh loop error: {e!r}")
+            except Exception:
+                pass
+            await asyncio.sleep(60)      # don't hot-spin if it keeps failing
 
 
 # ---------------------------------------------------------------------------
