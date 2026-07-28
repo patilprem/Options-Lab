@@ -180,7 +180,14 @@ def main() -> int:
             "SELECT max(ts) FROM events WHERE ts LIKE ? "
             "AND message LIKE '%tier-2%'", (day + "%",)).fetchone()[0]
         if t2:
-            age = (now - datetime.fromisoformat(t2)).total_seconds() / 60.0
+            # events.ts is stored from a tz-AWARE datetime (registry.record_event
+            # uses datetime.now(IST).isoformat(...)), so it carries a +05:30
+            # offset; `now` here is naive. Strip it before subtracting or this
+            # crashes with "can't subtract offset-naive and offset-aware
+            # datetimes" — which it did, 2026-07-28, wiping the rest of this
+            # section's output along with everything after it in the function.
+            t2_dt = datetime.fromisoformat(t2).replace(tzinfo=None)
+            age = (now - t2_dt).total_seconds() / 60.0
             print(f"  last tier-2 event: {t2[11:19]} ({age:.0f}m ago)")
             if nse_open(now) and age > 15:
                 flag(f"tier-2 silent for {age:.0f}m during NSE session")
