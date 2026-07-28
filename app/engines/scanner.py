@@ -205,6 +205,45 @@ def compute_metrics(snap: dict, day_open_oi, day_open_price, vol_baseline) -> di
 # Tier-2 ranking + chain analytics (pure)
 # ---------------------------------------------------------------------------
 
+def rank_for_deep_dive(metrics: dict, top_n: int = SHORTLIST_SIZE) -> list[dict]:
+    """Pick the Tier-2 deep-dive shortlist using THE SAME formula the trader
+    gates entries on (setup_score), so the names that get chain data are the
+    names that could actually be traded.
+
+    They used to disagree. rank_shortlist() below ranks on its own
+    move x buildup x surge product, while ScannerTrader.pick_entries gates on
+    setup_score >= entry_score — two different scales, nothing keeping them
+    aligned. Observed 2026-07-28: the three names clearing the entry bar
+    (TORNTPHARM 70.6, CONCOR 70.4, TECHM 67.4) were ALL absent from the
+    shortlist, so none had a chain; the trader picked them, found no quote,
+    and skipped all three in silence. It had traded 11 times the day before
+    purely because the two sets happened to overlap.
+
+    Ranked on the TIER-1-ONLY score (t2=None), which is what we necessarily
+    have before deciding who to deep-dive. Note a deep-dive can ADD up to 15
+    points (chain quality + skew + OI shift), so names sitting below
+    entry_score here can still clear it afterwards — which is why this takes
+    the top N rather than filtering at the threshold.
+
+    Names with no bias are dropped: an unbiased setup can never be entered, so
+    spending one of 15 rate-limited chain fetches on it is pure waste.
+    """
+    scored = []
+    for sym, m in metrics.items():
+        sc = setup_score(m, None)
+        if not sc.get("bias"):
+            continue
+        scored.append((sc.get("score") or 0.0, sym, m, sc))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [
+        {"symbol": sym, "score": sc_val, "buildup": sc.get("buildup"),
+         "bias": sc.get("bias"),
+         "price_change_pct": m.get("price_change_pct"),
+         "volume_surge": m.get("volume_surge"),
+         "range_pos": m.get("range_pos")}
+        for sc_val, sym, m, sc in scored[:top_n]]
+
+
 def rank_shortlist(metrics: dict, top_n: int = SHORTLIST_SIZE,
                    min_abs_move: float = 0.3) -> list[dict]:
     """Rank Tier-1 metrics into the Tier-2 shortlist. Score rewards a bigger
@@ -734,7 +773,10 @@ class StockScanner:
         names were analysed."""
         from app.core import registry
         from app.data import dhan_client
-        self.shortlist = rank_shortlist(self.metrics)
+        # Ranked by setup_score — the SAME formula pick_entries gates on — so
+        # the 15 names that get a chain are the 15 that could be traded. See
+        # rank_for_deep_dive for the 2026-07-28 divergence this fixes.
+        self.shortlist = rank_for_deep_dive(self.metrics)
         # Poll shortlisted names AND any open-position names (their chains must
         # stay live for MTM/exit even after they drop off the shortlist).
         held = self.trader.held_symbols() if self.trader else []

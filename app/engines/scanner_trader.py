@@ -223,6 +223,9 @@ class ScannerTrader:
                                      # session's own premium samples (in-memory
                                      # only, for entry_ctx's VWAP/BB distance —
                                      # not used by any trading decision)
+        self._noquote: dict[str, str] = {}   # symbol -> day already warned
+                                     # about (qualified but unpriceable), so
+                                     # the every-cycle entry loop logs once
         self._restore()
 
     # -- config / persistence ------------------------------------------------
@@ -458,6 +461,21 @@ class ScannerTrader:
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
+                # A qualifying setup we CANNOT price. This used to `continue`
+                # in silence, which is how 2026-07-28 looked identical to "no
+                # setup qualified": three names cleared entry_score, none had
+                # been deep-dived, all three were dropped without a trace.
+                # Once per symbol per day — this loop runs every cycle and the
+                # log must not flood. (The shadow challenger's copy of this
+                # branch stays silent: same cause, twice the noise.)
+                day = now.date().isoformat()
+                if self._noquote.get(sym) != day:
+                    self._noquote[sym] = day
+                    registry.record_event(
+                        "warn", "scanner",
+                        f"entry skipped [{sym}]: qualified (score="
+                        f"{sc.get('score')}) but no chain quote — not "
+                        f"deep-dived this cycle")
                 continue
             # (no _sample_premium here — _sample_candidates() above already
             # sampled every ranked candidate this cycle; sampling again would
