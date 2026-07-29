@@ -158,6 +158,9 @@ class MarketHub:
         # retry it soon instead of either poisoning the day or hammering.
         self._expiries_fail: dict[str, float] = {}
         self._expiry_warned: set = set()
+        self._noop_warned: dict[tuple, float] = {}  # (underlying, reason) ->
+                                     # monotonic time of last _poll_one_chain
+                                     # silent-no-op log (throttle)
         self._chain_only: set[str] = set()   # polled for snapshots, no strategy (MCX recorder)
         self._chain_gate = asyncio.Lock()
         self._last_chain_ts = 0.0
@@ -696,21 +699,29 @@ class MarketHub:
         the same global rate limit).
 
         Raises on a DESCRIBED failure; the caller owns client rebuild and
-        warn-throttling. But note it can also return having refreshed NOTHING,
-        silently, via any of: an empty expiry list, resolve_expiry finding no
-        match, Dhan's message-less blip (_fetch_chain_ratelimited returns None
-        by design — see PR #17), or a chain that normalizes to no quotes. A
-        caller that needs to know whether the cache actually moved must check
-        the cache/fingerprint itself (MarketHub._chain_fingerprint) rather than
-        assume 'no exception' means 'fresh data' — assuming that is what let
-        the 07-23..27 index-chain outage run for days without a log line."""
+        warn-throttling. It can ALSO return having refreshed NOTHING via three
+        no-exception paths: resolve_expiry finding no match, Dhan's
+        message-less blip (_fetch_chain_ratelimited returns None by design —
+        see PR #17), or a chain that normalizes to no quotes. Each is now
+        logged (throttled to once per underlying+reason per _NOOP_WARN_S) —
+        this used to be silent, and it cost a live 15+ minute freeze of
+        NIFTY/BANKNIFTY/CRUDEOIL/GOLD (2026-07-29 09:32-09:47+) with no
+        exception anywhere to explain it: the poll loop was alive, every
+        cycle completed, and the cache simply never moved. A caller that
+        needs to know whether the cache actually moved must still check the
+        fingerprint itself (MarketHub._chain_fingerprint) — this logging is
+        for a human diagnosing 'why', not a machine deciding 'did it work'."""
         expiries = await self._get_expiries(client, u, cfg, loop)
         for kind, off in targets:
             exp = chainmod.resolve_expiry(expiries, kind, off)
             if not exp:
+                self._noop_warn(u, f"resolve_expiry[{kind}+{off}]",
+                                f"no match in expiries={expiries!r}")
                 continue
             data = await self._fetch_chain_ratelimited(client, cfg, exp, loop)
             if not data:
+                self._noop_warn(u, f"fetch[{kind}+{off}]",
+                                f"empty/message-less response for expiry={exp}")
                 continue
             ts = datetime.now(IST).replace(tzinfo=None)
             quotes = chainmod.normalize_chain(
@@ -720,6 +731,24 @@ class MarketHub:
                 sp = chainmod.chain_spot(data)
                 if sp:
                     self._chain_spot[u] = sp
+            else:
+                self._noop_warn(u, f"normalize[{kind}+{off}]",
+                                f"chain fetched but normalized to 0 quotes "
+                                f"(expiry={exp})")
+
+    _NOOP_WARN_S = 300.0      # throttle: at most one log line per
+                              # (underlying, reason) per 5 minutes — these
+                              # branches can legitimately fire every ~1s poll
+
+    def _noop_warn(self, u: str, reason: str, detail: str) -> None:
+        key = (u, reason)
+        last = self._noop_warned.get(key)
+        now = time.monotonic()
+        if last is not None and (now - last) < self._NOOP_WARN_S:
+            return
+        self._noop_warned[key] = now
+        registry.record_event("warn", "feed",
+                              f"chain poll no-op [{u}] {reason}: {detail}")
 
     EXPIRY_RETRY_S = 60.0     # after an EMPTY expiry_list, wait this long
                               # before refetching (the poll loop runs ~1/s)
