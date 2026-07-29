@@ -710,14 +710,45 @@ class MarketHub:
         cycle completed, and the cache simply never moved. A caller that
         needs to know whether the cache actually moved must still check the
         fingerprint itself (MarketHub._chain_fingerprint) — this logging is
-        for a human diagnosing 'why', not a machine deciding 'did it work'."""
+        for a human diagnosing 'why', not a machine deciding 'did it work'.
+
+        A WEEKLY secondary target (offset>0) that resolves implausibly far
+        from the nearest one is SKIPPED without a fetch, not requested and
+        left to fail. CHAIN_TARGETS' ("WEEKLY", 1) assumes every configured
+        underlying has a genuine weekly expiry cycle; NSE discontinued
+        BANKNIFTY's, so its expiry list only advances monthly and offset 1
+        lands ~2 months out (observed 2026-07-29: resolved to a date 2 months
+        away, and the wasted fetch for it came back message-less). Rather
+        than hardcode a list of which underlyings still have real weeklies —
+        stale the moment an exchange changes a rule again — this checks the
+        DATA: if resolve_expiry's offset>0 result is farther from offset 0
+        than a real weekly gap can be, that itself proves there is no weekly
+        entry there, so the request (and its 3s rate-gate slot) is skipped
+        entirely rather than spent on a call we're already confident fails."""
+        WEEKLY_GAP_MAX_DAYS = 15   # a missed week (holiday) still fits; a
+                                   # monthly-only underlying's "next" entry
+                                   # never does
         expiries = await self._get_expiries(client, u, cfg, loop)
+        nearest_weekly: Optional[date] = None
         for kind, off in targets:
             exp = chainmod.resolve_expiry(expiries, kind, off)
             if not exp:
                 self._noop_warn(u, f"resolve_expiry[{kind}+{off}]",
                                 f"no match in expiries={expiries!r}")
                 continue
+            exp_date = date.fromisoformat(exp)
+            if kind == "WEEKLY":
+                if off == 0:
+                    nearest_weekly = exp_date
+                elif nearest_weekly is not None and \
+                        (exp_date - nearest_weekly).days > WEEKLY_GAP_MAX_DAYS:
+                    self._noop_warn(
+                        u, f"no-weekly-cycle[{kind}+{off}]",
+                        f"offset {off} resolved to {exp} — "
+                        f"{(exp_date - nearest_weekly).days}d past the "
+                        f"nearest weekly ({nearest_weekly}); this underlying "
+                        f"likely has no weekly cycle here, skipping the fetch")
+                    continue
             data = await self._fetch_chain_ratelimited(client, cfg, exp, loop)
             if not data:
                 self._noop_warn(u, f"fetch[{kind}+{off}]",
