@@ -145,3 +145,112 @@ def test_different_underlyings_throttle_independently(monkeypatch):
     for u in ("NIFTY", "BANKNIFTY", "CRUDEOIL", "GOLD"):
         _call(hub, underlying=u)
     assert len(events) == 4, "each underlying should log once independently"
+
+
+# --- WEEKLY secondary target sanity check (2026-07-29 BANKNIFTY finding) ---
+
+def _resolver(near, far):
+    """resolve_expiry mock: offset 0 -> near, offset>0 -> far."""
+    def fn(expiries, kind, off):
+        return near if off == 0 else far
+    return fn
+
+
+def test_implausible_weekly_gap_is_skipped_without_fetching(monkeypatch):
+    """THE finding. BANKNIFTY's offset-1 resolved 2 months past offset-0 —
+    no real weekly entry exists there, so the fetch (and its rate-gate slot)
+    must not be spent on a call we're already confident fails."""
+    hub = _hub()
+    events = _patch_common(monkeypatch, hub)
+    monkeypatch.setattr("app.engines.chain.resolve_expiry",
+                        _resolver("2026-08-05", "2026-09-29"))
+    fetch_calls = []
+
+    async def fake_fetch(*a, **k):
+        fetch_calls.append(1)
+        return {"data": {}}
+
+    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)))
+    assert fetch_calls == [1], "offset 0 must still be fetched normally"
+    msgs = [a[2] for a in events]
+    assert any("no-weekly-cycle" in m for m in msgs), msgs
+    assert not any("fetch[" in m for m in msgs), (
+        "must skip before attempting the fetch, not log a fetch failure")
+
+
+def test_a_genuine_weekly_gap_still_fetches_normally(monkeypatch):
+    """A real 7-day-out next weekly must NOT be caught by the guard."""
+    hub = _hub()
+    events = _patch_common(monkeypatch, hub)
+    monkeypatch.setattr("app.engines.chain.resolve_expiry",
+                        _resolver("2026-08-05", "2026-08-12"))
+    fetch_calls = []
+
+    async def fake_fetch(*a, **k):
+        fetch_calls.append(1)
+        return None   # message-less blip; irrelevant to this test
+
+    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)))
+    assert fetch_calls == [1, 1], "both offsets should be fetched"
+    msgs = [a[2] for a in events]
+    assert not any("no-weekly-cycle" in m for m in msgs), msgs
+
+
+def test_a_skipped_holiday_week_within_threshold_still_fetches(monkeypatch):
+    """A missed week (exchange holiday shifting the cycle) is still a real
+    weekly market, just ~14 days out instead of 7 — must not be misread as
+    'no weekly cycle exists here'."""
+    hub = _hub()
+    events = _patch_common(monkeypatch, hub)
+    monkeypatch.setattr("app.engines.chain.resolve_expiry",
+                        _resolver("2026-08-05", "2026-08-19"))  # 14 days
+    fetch_calls = []
+
+    async def fake_fetch(*a, **k):
+        fetch_calls.append(1)
+        return None
+
+    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)))
+    assert fetch_calls == [1, 1]
+    assert not any("no-weekly-cycle" in a[2] for a in events)
+
+
+def test_monthly_targets_are_never_gap_checked(monkeypatch):
+    """MONTHLY offsets are naturally ~30 days apart — the WEEKLY-only guard
+    must not misfire on them."""
+    hub = _hub()
+    events = _patch_common(monkeypatch, hub)
+    monkeypatch.setattr("app.engines.chain.resolve_expiry",
+                        _resolver("2026-08-05", "2026-09-30"))
+    fetch_calls = []
+
+    async def fake_fetch(*a, **k):
+        fetch_calls.append(1)
+        return None
+
+    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _call(hub, targets=(("MONTHLY", 0), ("MONTHLY", 1)))
+    assert fetch_calls == [1, 1]
+    assert not any("no-weekly-cycle" in a[2] for a in events)
+
+
+def test_offset_zero_out_of_order_does_not_crash(monkeypatch):
+    """If targets ever listed offset>0 before offset 0, nearest_weekly is
+    still None when it's evaluated — must fail open (attempt the fetch)
+    rather than raise or wrongly skip."""
+    hub = _hub()
+    _patch_common(monkeypatch, hub)
+    monkeypatch.setattr("app.engines.chain.resolve_expiry",
+                        _resolver("2026-08-05", "2026-09-29"))
+    fetch_calls = []
+
+    async def fake_fetch(*a, **k):
+        fetch_calls.append(1)
+        return None
+
+    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _call(hub, targets=(("WEEKLY", 1), ("WEEKLY", 0)))
+    assert fetch_calls == [1, 1], "out-of-order targets must still attempt both"
