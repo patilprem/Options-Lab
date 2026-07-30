@@ -749,7 +749,7 @@ class MarketHub:
                         f"nearest weekly ({nearest_weekly}); this underlying "
                         f"likely has no weekly cycle here, skipping the fetch")
                     continue
-            data = await self._fetch_chain_ratelimited(client, cfg, exp, loop)
+            data = await self._fetch_chain_ratelimited(u, client, cfg, exp, loop)
             if not data:
                 self._noop_warn(u, f"fetch[{kind}+{off}]",
                                 f"empty/message-less response for expiry={exp}")
@@ -830,7 +830,7 @@ class MarketHub:
                     f"{int(self.EXPIRY_RETRY_S)}s (NOT cached for the day)")
         return expiries
 
-    async def _fetch_chain_ratelimited(self, client, cfg, expiry, loop, retries=1):
+    async def _fetch_chain_ratelimited(self, u, client, cfg, expiry, loop, retries=1):
         """Fetch one chain through the shared 3s gate. Dhan intermittently
         returns a bare, message-less failure (2026-07-21: a rotating set of
         stocks, not the same names twice, ~1-in-8 requests) that looks like a
@@ -851,12 +851,25 @@ class MarketHub:
             finally:
                 self._last_chain_ts = time.monotonic()
         if retries > 0:
-            return await self._fetch_chain_ratelimited(client, cfg, expiry, loop, retries - 1)
+            return await self._fetch_chain_ratelimited(u, client, cfg, expiry, loop, retries - 1)
         # Dhan's message-less blip is transient and expected; after exhausting
         # retries, treat it as an empty chain (skip this symbol this cycle,
         # re-poll next) rather than raising a detail-free error that would
         # flood the attention feed. Real, described failures still propagate.
         if isinstance(exc, dhan_client.DhanEmptyFailure):
+            # Diagnostic-only, throttled: a rare blip needs no log, but a
+            # SUSTAINED one is invisible without this. Discovered 2026-07-30:
+            # NIFTY/BANKNIFTY/CRUDEOIL/GOLD failed this exact swallowed path
+            # 100% of attempts for 30+ minutes while STOCK chains succeeded
+            # through the identical call, and the raw Dhan response was
+            # already gone by the time anyone noticed — _remarks_message had
+            # discarded it the moment its couple of friendly fields came up
+            # empty. Log the RAW response (exc.response) so the next
+            # occurrence is diagnosable instead of just "message-less" again.
+            self._noop_warn(
+                u, f"empty-failure-detail[{cfg.get('segment')}]",
+                f"expiry={expiry} sid={cfg.get('security_id')} "
+                f"raw_response={exc.response!r}")
             return None
         raise exc
 
