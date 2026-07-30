@@ -21,6 +21,7 @@ Capital allocation:
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import sqlite3
@@ -340,10 +341,56 @@ def performance_rows(strategy_id: str, mode: str = "PAPER") -> list[dict]:
 
 def record_event(level: str, kind: str, message: str,
                  strategy_id: str | None = None) -> None:
+    """Log one event. Synchronous call signature everywhere — this is
+    deliberately NOT `async def`, so every one of its many callers (across
+    paper.py, scanner.py, main.py...) stays unchanged whether they're sync
+    or async code.
+
+    From ASYNC callers (the vast majority — this fires from inside
+    background asyncio loops), the actual write is dispatched to a worker
+    thread instead of running inline on the event loop. registry.record_event
+    was NEVER wrapped in run_in_executor anywhere, and it is a genuinely
+    blocking SQLite write — under WAL, writer-vs-writer contention is still
+    fully serialized, and busy_timeout=8000 means a colliding write can
+    legitimately block for up to 8 SECONDS. On the event-loop thread, that
+    doesn't just delay this one log line — it freezes the entire
+    single-worker process (uvicorn --workers 1), including handing off new
+    HTTP requests to FastAPI's OWN separate thread pool, since that handoff
+    itself has to go through the blocked loop. Confirmed live 2026-07-30:
+    /scanner and /portfolio/today hung for the full 15s client timeout with
+    ZERO bytes back, then 5/5 immediate retries succeeded in ~9ms each —
+    intermittent, self-clearing, exactly the shape of an occasional writer
+    collision rather than a stuck lock (scanner.py has no locks at all) or
+    thread-pool exhaustion (FastAPI's sync-handler pool, via anyio, is
+    separate from asyncio's default executor these other calls use).
+
+    Fire-and-forget: the returned executor future is intentionally not
+    awaited or stored — callers never awaited this function and adding
+    `await` at every call site would be a much larger, riskier change than
+    the problem calls for. The underlying work is submitted to the
+    executor's queue immediately by run_in_executor regardless, so it runs
+    to completion even though nothing here references the future — the one
+    accepted cost is that a write failure in the background is no longer
+    visible to the caller (previously a rare failure could propagate to an
+    enclosing try/except; now it's silent). For SYNC callers (FastAPI
+    request handlers already running in their own worker thread, scripts,
+    most tests) there is no event loop to protect, so the write still
+    happens immediately and synchronously, exactly as before."""
     ts = datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(sep=" ", timespec="seconds")
-    with _conn() as c:
-        c.execute("INSERT INTO events (ts, strategy_id, level, kind, message) VALUES (?,?,?,?,?)",
-                  (ts, strategy_id, level, kind, message))
+
+    def _write():
+        with _conn() as c:
+            c.execute("INSERT INTO events (ts, strategy_id, level, kind, message) VALUES (?,?,?,?,?)",
+                      (ts, strategy_id, level, kind, message))
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        _write()
+    else:
+        loop.run_in_executor(None, _write)
 
 
 def events_for(day: str) -> list[dict]:
