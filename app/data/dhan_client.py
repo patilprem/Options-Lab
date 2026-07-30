@@ -374,7 +374,21 @@ class DhanEmptyFailure(RuntimeError):
     is absent or an all-None {error_code, error_type, error_message} dict.
     This is a known intermittent server-side blip (2026-07-21: a rotating
     set of stocks, ~1-in-8 requests), not a real per-symbol data problem, so
-    callers can retry/skip it instead of surfacing a useless error."""
+    callers can retry/skip it instead of surfacing a useless error.
+
+    Carries the RAW response dict (`.response`) so a caller that needs to
+    diagnose a SUSTAINED failure (not the rare blip) can log what Dhan
+    actually sent, rather than just "message-less" — we discovered on
+    2026-07-30 that NIFTY/BANKNIFTY/CRUDEOIL/GOLD's chain fetch failed via
+    this exact swallowed path continuously for 30+ minutes (100% of
+    attempts) while STOCK chains succeeded through the identical code path,
+    and had no way to see WHAT Dhan actually returned beyond 'no remarks' —
+    `_remarks_message` only tries a couple of friendly fields and discards
+    everything else in `response` the moment they're all empty."""
+
+    def __init__(self, msg: str, response: dict | None = None):
+        super().__init__(msg)
+        self.response = response
 
 
 def _remarks_message(remarks) -> str:
@@ -398,7 +412,8 @@ def _unwrap(response: dict) -> dict:
     if response.get("status") != "success":
         msg = _remarks_message(response.get("remarks"))
         if not msg:
-            raise DhanEmptyFailure("Dhan returned an empty failure (no error detail)")
+            raise DhanEmptyFailure(
+                "Dhan returned an empty failure (no error detail)", response)
         raise RuntimeError(msg)
     return response.get("data") or {}
 

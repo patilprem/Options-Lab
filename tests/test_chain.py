@@ -138,7 +138,7 @@ def test_fetch_chain_retries_once_on_transient_failure(monkeypatch):
     async def run():
         loop = asyncio.get_running_loop()
         return await hub._fetch_chain_ratelimited(
-            client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
+            "SOMESTOCK", client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
             expiry="2026-07-31", loop=loop)
 
     result = asyncio.run(run())
@@ -167,7 +167,7 @@ def test_fetch_chain_returns_none_on_persistent_empty_failure(monkeypatch):
     async def run():
         loop = asyncio.get_running_loop()
         return await hub._fetch_chain_ratelimited(
-            client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
+            "SOMESTOCK", client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
             expiry="2026-07-31", loop=loop)
 
     result = asyncio.run(run())
@@ -192,7 +192,7 @@ def test_fetch_chain_raises_on_real_failure(monkeypatch):
     async def run():
         loop = asyncio.get_running_loop()
         return await hub._fetch_chain_ratelimited(
-            client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
+            "SOMESTOCK", client=None, cfg={"security_id": 1, "segment": "NSE_EQ"},
             expiry="2026-07-31", loop=loop)
 
     try:
@@ -200,3 +200,65 @@ def test_fetch_chain_raises_on_real_failure(monkeypatch):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "DH-901" in str(e)
+
+
+def test_empty_failure_logs_the_raw_response_once_diagnosable(monkeypatch):
+    """2026-07-30: NIFTY/BANKNIFTY/CRUDEOIL/GOLD failed this exact swallowed
+    path 100% of attempts for 30+ minutes while stocks succeeded through the
+    identical call, and the raw Dhan response was already discarded by the
+    time anyone could look. The RAW response dict must now reach the log."""
+    import asyncio
+    from app.core import registry
+    from app.data import dhan_client
+
+    def always_empty(client, security_id, segment, expiry):
+        raise dhan_client.DhanEmptyFailure(
+            "Dhan returned an empty failure (no error detail)",
+            response={"status": "failure", "remarks": {}, "weird_field": 42})
+
+    monkeypatch.setattr(dhan_client, "fetch_option_chain", always_empty)
+    events = []
+    monkeypatch.setattr(registry, "record_event",
+                        lambda *a, **k: events.append(a))
+    hub = MarketHub(_Store())
+    hub.CHAIN_MIN_INTERVAL = 0.0
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        return await hub._fetch_chain_ratelimited(
+            "BANKNIFTY", client=None, cfg={"security_id": 25, "segment": "IDX_I"},
+            expiry="2026-08-25", loop=loop)
+
+    result = asyncio.run(run())
+    assert result is None
+    msgs = [a[2] for a in events]
+    assert any("empty-failure-detail" in m and "weird_field" in m for m in msgs), msgs
+
+
+def test_empty_failure_with_no_response_does_not_crash_the_logger(monkeypatch):
+    """A DhanEmptyFailure raised without a response (e.g. from a test double,
+    or an older code path) must still log cleanly rather than raise on
+    `exc.response` being None."""
+    import asyncio
+    from app.core import registry
+    from app.data import dhan_client
+
+    def always_empty(client, security_id, segment, expiry):
+        raise dhan_client.DhanEmptyFailure("no detail")
+
+    monkeypatch.setattr(dhan_client, "fetch_option_chain", always_empty)
+    events = []
+    monkeypatch.setattr(registry, "record_event",
+                        lambda *a, **k: events.append(a))
+    hub = MarketHub(_Store())
+    hub.CHAIN_MIN_INTERVAL = 0.0
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        return await hub._fetch_chain_ratelimited(
+            "GOLD", client=None, cfg={"security_id": 5, "segment": "MCX_COMM"},
+            expiry="2026-07-29", loop=loop)
+
+    result = asyncio.run(run())
+    assert result is None
+    assert any("empty-failure-detail" in a[2] for a in events)
