@@ -687,18 +687,38 @@ class StockScanner:
         snaps = parse_stock_quote_rows(self._universe, merged, ts)
         if not snaps:
             return 0
-        self.store.upsert_stock_snapshots(snaps)
         day = ts.date()
         ref_tod = ts.hour * 3600 + ts.minute * 60 + ts.second
+        # EVERY store call in this sweep runs in a worker thread, batched.
+        # This used to be an inline per-symbol loop on the event loop: 452
+        # queries, each a full scan of stock_snapshots, ~30s of frozen process
+        # every 5 minutes (py-spy dump, 2026-07-31 — main thread deep in
+        # store.stock_volume_baseline, all ten workers idle). Nothing else on
+        # the loop could run during it: not the chain poller, whose 3s rate
+        # gate slots were simply lost, not the WS tick bridge, not the
+        # dashboard (/token/status went from 2.5ms to >25s). ~10% of every
+        # session spent unable to record. Keep this OFF the loop.
+        opens, baselines = await loop.run_in_executor(
+            None, self._persist_and_load_baselines, snaps, day, ref_tod)
         for snap in snaps:
             sym = snap["symbol"]
-            day_open_oi, day_open_price = self.store.stock_day_open_oi(sym, day)
-            baseline = self.store.stock_volume_baseline(sym, ref_tod, day)
+            day_open_oi, day_open_price = opens.get(sym, (None, None))
             self.metrics[sym] = compute_metrics(
-                snap, day_open_oi, day_open_price, baseline)
+                snap, day_open_oi, day_open_price, baselines.get(sym))
         self._last_sweep_ts = ts
-        self._record_index_bias(ts)
+        await loop.run_in_executor(None, self._record_index_bias, ts)
         return len(snaps)
+
+    def _persist_and_load_baselines(self, snaps, day, ref_tod: int) -> tuple:
+        """Persist this sweep's snapshots, then read both per-symbol baselines
+        in bulk. Sync by design — run via run_in_executor.
+
+        Order matters and is why these three statements share one hop: the
+        upsert must land BEFORE stock_day_open_oi_bulk reads, because on the
+        first sweep of a day that write IS the day-open row it reads back."""
+        self.store.upsert_stock_snapshots(snaps)
+        return (self.store.stock_day_open_oi_bulk(day),
+                self.store.stock_volume_baseline_bulk(ref_tod, day))
 
     def _record_index_bias(self, ts) -> None:
         """Aggregate the fresh Tier-1 metrics into NIFTY/BANKNIFTY bias and
@@ -823,7 +843,9 @@ class StockScanner:
         to_persist = set(symbols) & set(held)
         if to_persist and hasattr(self.store, "upsert_chain_rows"):
             try:
-                hub.persist_chain_full(self.store, underlyings=to_persist)
+                # DuckDB write — off the loop (see sweep_once's note)
+                await loop.run_in_executor(
+                    None, hub.persist_chain_full, self.store, to_persist)
             except Exception as e:
                 registry.record_event("warn", "scanner", f"tier2 persist: {e!r}")
         # score every shortlisted name (Tier-1 read + Tier-2 chain) and alert
@@ -838,6 +860,7 @@ class StockScanner:
             flag_at = 55.0
         today = datetime.now(IST).date().isoformat()
         ts_now = datetime.now(IST).replace(tzinfo=None)
+        to_flag = []
         for d in self.shortlist:
             sym = d["symbol"]
             sc = setup_score(self.metrics.get(sym, {"symbol": sym}),
@@ -846,10 +869,15 @@ class StockScanner:
             # record every above-flag setup with its entry premium so its
             # forward return can be measured later (validation, not trading).
             if sc["score"] >= flag_at and sc.get("bias"):
-                self._record_flag(hub, sym, sc, ts_now)
+                to_flag.append((sym, sc))
             if sc["score"] >= threshold and self._alerted.get(sym) != today:
                 self._alerted[sym] = today
                 alert_setup(sym, sc)
+        if to_flag:
+            # one hop off the loop for the whole batch — each of these is a
+            # DuckDB write, and there can be one per shortlisted name
+            await loop.run_in_executor(None, self._record_flags, hub,
+                                       to_flag, ts_now)
         # positional paper trader acts on the fresh scores + live chains
         if self.trader:
             try:
@@ -942,6 +970,12 @@ class StockScanner:
             "tier2": self.tier2.get(symbol),
             "universe": self._universe.get(symbol),
         }
+
+    def _record_flags(self, hub, items, ts) -> None:
+        """Persist a batch of flagged setups. Sync — run via run_in_executor
+        so the writes never sit on the event loop."""
+        for sym, sc in items:
+            self._record_flag(hub, sym, sc, ts)
 
     def _record_flag(self, hub, sym: str, sc: dict, ts) -> None:
         """Persist a flagged setup + the bias-side ATM premium at flag time."""
