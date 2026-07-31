@@ -158,8 +158,13 @@ async def _market_recorder():
                             "cached but unchanged (frozen)")
                 continue                      # closed or frozen — nothing real
             skips = 0
-            n_full = hub.persist_chain_full(store, underlyings=changed)
-            n_atm = hub.persist_chain_snapshots(store, underlyings=changed)
+            # Both are DuckDB writes into multi-million-row tables; keep them
+            # off the event loop or a slow checkpoint stalls the chain poller
+            # and the dashboard along with them (see scanner.sweep_once).
+            n_full = await loop.run_in_executor(
+                None, hub.persist_chain_full, store, changed)
+            n_atm = await loop.run_in_executor(
+                None, hub.persist_chain_snapshots, store, changed)
             hub.mark_chain_persisted(changed)
             if n_full or n_atm:
                 registry.record_event("info", "feed",
@@ -174,13 +179,18 @@ async def _spot_bar_recorder():
     store = hub.store
     if not hasattr(store, "con"):
         return
+    loop = asyncio.get_running_loop()
     q = hub.subscribe()
     while True:
         msg = await q.get()
         try:
             kind, underlying, interval, bar = msg
             if kind == "bar" and interval == 5 and bar is not None:
-                store.upsert_live_bar(underlying, bar)
+                # one row, but it takes the same store lock every other
+                # writer does — off the loop so a busy store can't stall
+                # tick processing behind it
+                await loop.run_in_executor(
+                    None, store.upsert_live_bar, underlying, bar)
         except Exception as e:
             registry.record_event("warn", "feed", f"spot recorder error: {e!r}")
 

@@ -519,6 +519,60 @@ class DataStore:
             [ref_tod_seconds, symbol, str(before_day), days])
         return row[0] if row and row[0] is not None else None
 
+    # -- batched twins of the two methods above -------------------------------
+    #
+    # Both single-symbol versions are correct, and stay for ad-hoc/one-symbol
+    # callers. But the Tier-1 sweep needs BOTH facts for EVERY symbol in the
+    # universe, and called them in a per-symbol loop: 226 x 2 = 452 queries a
+    # sweep. stock_snapshots is written in timestamp order, so a `WHERE
+    # symbol=?` filter has no ordering to prune with and each call scans the
+    # whole table (~645k rows as of 2026-07-31) — ~146M rows read per sweep.
+    # That took ~30s, ON THE EVENT LOOP, every 5 minutes; py-spy caught it
+    # mid-stall with every worker thread idle. Grouping by symbol instead
+    # turns the whole thing into two scans.
+
+    def stock_day_open_oi_bulk(self, day) -> dict:
+        """{symbol: (first_oi, first_fut_ltp)} for `day` — one grouped pass.
+
+        Symbols with no rows for `day` are ABSENT rather than mapped to
+        (None, None); callers use .get(sym, (None, None)) to keep the
+        single-symbol contract."""
+        rows = self._q(
+            """SELECT symbol, first(oi ORDER BY ts), first(fut_ltp ORDER BY ts)
+               FROM stock_snapshots
+               WHERE CAST(ts AS DATE)=CAST(? AS DATE)
+               GROUP BY symbol""",
+            [str(day)])
+        return {r[0]: (r[1], r[2]) for r in rows}
+
+    def stock_volume_baseline_bulk(self, ref_tod_seconds: int, before_day,
+                                   days: int = 10) -> dict:
+        """{symbol: avg_volume} — batched stock_volume_baseline.
+
+        Same two steps as the single-symbol query with `symbol` added to both
+        PARTITION BYs: within each (symbol, day) keep the row nearest
+        `ref_tod_seconds`, then average the most recent `days` of those per
+        symbol. Symbols with no prior history (or only NULL volumes) are
+        absent, so .get(sym) yields None exactly as the per-symbol call did."""
+        rows = self._q(
+            """WITH per_day AS (
+                   SELECT symbol, CAST(ts AS DATE) AS d, volume,
+                          row_number() OVER (
+                              PARTITION BY symbol, CAST(ts AS DATE)
+                              ORDER BY abs(hour(ts)*3600 + minute(ts)*60
+                                           + second(ts) - ?)) AS rn
+                   FROM stock_snapshots
+                   WHERE CAST(ts AS DATE) < CAST(? AS DATE)),
+               recent AS (
+                   SELECT symbol, volume,
+                          row_number() OVER (
+                              PARTITION BY symbol ORDER BY d DESC) AS dr
+                   FROM per_day WHERE rn=1)
+               SELECT symbol, avg(volume) FROM recent
+               WHERE dr <= ? GROUP BY symbol""",
+            [ref_tod_seconds, str(before_day), days])
+        return {r[0]: r[1] for r in rows if r[1] is not None}
+
     def latest_stock_snapshots(self, day=None) -> list[dict]:
         """Most recent snapshot per symbol for `day` (default: latest day with
         data). Feeds the scanner ranker."""
