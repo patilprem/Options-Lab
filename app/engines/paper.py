@@ -295,6 +295,7 @@ class MarketHub:
         socket cannot see that; watching whether ROWS LAND can."""
         from app.engines.watchdog import (FeedWatchdog, feed_broken,
                                           session_open_for)
+        from app.engines import recording_watchdog as rec_wd_mod
         from app.engines.recording_watchdog import RecordingWatchdog
         HEAL_COOLDOWN_S = 180        # at most one self-heal attempt / 3 min
         wd = FeedWatchdog()
@@ -328,8 +329,16 @@ class MarketHub:
                 if hasattr(self.store, "recording_health"):
                     health = await loop.run_in_executor(
                         None, self.store.recording_health)
+                    # Per-underlying too: a table-level check cannot see the
+                    # core index/commodity names going dark while the scanner
+                    # keeps chain_snapshots warm with stock deep-dives.
+                    names = await loop.run_in_executor(
+                        None, rec_wd_mod.recorded_underlyings)
+                    urows = await loop.run_in_executor(
+                        None, self.store.recording_underlying_health, names)
+                    segs = {u: rec_wd_mod.segment_for(u) for u in names}
                     rkind = await loop.run_in_executor(
-                        None, rec_wd.step, health, now)
+                        None, rec_wd.step, health, now, urows, segs)
                     if rkind:
                         registry.record_event(
                             "info" if rkind == "recovered" else "warn",
