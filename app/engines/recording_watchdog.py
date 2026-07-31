@@ -56,6 +56,64 @@ def _age_s(last_ts: Optional[str], now: datetime) -> Optional[float]:
         return None
 
 
+def recorded_underlyings() -> list:
+    """The names the live recorder is responsible for, from settings.
+
+    NOT pure — reads registry settings. Lives here (rather than in main.py,
+    which is where it started) so the recorder and the watchdog that judges it
+    can never disagree about what was supposed to be recording."""
+    from app.core import registry
+    rec = [u.strip() for u in registry.setting(
+        "record_underlyings", "NIFTY,BANKNIFTY").split(",") if u.strip()]
+    mcx = [u.strip() for u in registry.setting(
+        "mcx_underlyings", "CRUDEOIL,GOLD").split(",") if u.strip()]
+    return sorted(set(rec) | set(mcx))
+
+
+def segment_for(underlying: str) -> str:
+    """Which exchange session governs `underlying` — the same MCX_DYNAMIC test
+    the recorder's own session gate uses, so a commodity is never judged
+    against NSE hours (it records until 23:30, five hours past the NSE close)."""
+    try:
+        from app.data.dhan_client import MCX_DYNAMIC
+    except Exception:
+        return "NSE"
+    return "MCX" if underlying in MCX_DYNAMIC else "NSE"
+
+
+def stale_underlyings(rows: list, now: datetime, segments: dict,
+                      fresh_tables: set,
+                      stale_after_s: float = STALE_AFTER_S,
+                      grace_min: int = GRACE_MIN) -> list:
+    """'table[UNDERLYING]' labels for names that should be recording but aren't.
+
+    Pure. `rows` is store.recording_underlying_health() output, `segments` maps
+    underlying -> "NSE"/"MCX", and `fresh_tables` is the set of tables that
+    PASSED the table-level check.
+
+    Only tables in `fresh_tables` are examined, and that is the whole point: if
+    a table is already stale table-wide, stale_tables() has said so and naming
+    every underlying inside it as well would just make the push longer without
+    adding information. What this catches is the opposite and previously
+    invisible case — the table looks alive because SOMETHING is writing to it,
+    while the specific names we care about are dead (2026-07-31: chain_snapshots
+    fresh from stock deep-dives, all four core underlyings frozen 90 minutes).
+
+    A name that has NEVER been written (last_ts=None) is stale as soon as its
+    session is open past the grace period."""
+    out = []
+    for row in rows:
+        table, u = row.get("table"), row.get("underlying")
+        if not u or table not in fresh_tables or not row.get("present", True):
+            continue
+        if not session_open_for((segments.get(u) or "NSE",), now, grace_min):
+            continue
+        age = _age_s(row.get("last_ts"), now)
+        if age is None or age > stale_after_s:
+            out.append(f"{table}[{u}]")
+    return sorted(out)
+
+
 def stale_tables(health: list, now: datetime,
                  stale_after_s: float = STALE_AFTER_S,
                  grace_min: int = GRACE_MIN) -> list:
@@ -89,10 +147,26 @@ class RecordingWatchdog:
         self.stale: tuple = ()                  # last reported stale set
         self._last_alert: Optional[datetime] = None
 
-    def step(self, health: list, now: datetime) -> Optional[str]:
+    def step(self, health: list, now: datetime,
+             underlying_rows: Optional[list] = None,
+             segments: Optional[dict] = None) -> Optional[str]:
         """Evaluate one sample. Returns the push kind sent ('stale' |
-        'recovered') or None for silence."""
-        cur = tuple(stale_tables(health, now, self.stale_after_s))
+        'recovered') or None for silence.
+
+        `underlying_rows` (store.recording_underlying_health()) is optional so
+        a caller with only table-level health — or a test — behaves exactly as
+        before. When supplied, per-underlying staleness is checked for the
+        tables that passed the table-level test, which is where a stalled core
+        underlying hides behind a table another writer is keeping warm."""
+        tables = stale_tables(health, now, self.stale_after_s)
+        cur = list(tables)
+        if underlying_rows:
+            stale_set = set(tables)
+            fresh = {r.get("table") for r in health
+                     if r.get("table") not in stale_set}
+            cur += stale_underlyings(underlying_rows, now, segments or {},
+                                     fresh, self.stale_after_s)
+        cur = tuple(cur)
 
         if not cur:
             if self.stale:

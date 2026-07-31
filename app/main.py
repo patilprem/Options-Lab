@@ -65,12 +65,13 @@ def _session_open(name: str, now=None) -> bool:
 
 def _record_list() -> list[str]:
     """Underlyings the live recorder captures (settings-driven). Merges the
-    edge-research list with the legacy MCX list."""
-    rec = [u.strip() for u in registry.setting(
-        "record_underlyings", "NIFTY,BANKNIFTY").split(",") if u.strip()]
-    mcx = [u.strip() for u in registry.setting(
-        "mcx_underlyings", "CRUDEOIL,GOLD").split(",") if u.strip()]
-    return sorted(set(rec) | set(mcx))
+    edge-research list with the legacy MCX list.
+
+    Defined in recording_watchdog so the recorder and the watchdog that judges
+    it read the SAME list — a watchdog checking a different set of names than
+    the recorder writes is worse than no watchdog."""
+    from app.engines.recording_watchdog import recorded_underlyings
+    return recorded_underlyings()
 
 
 async def _market_recorder():

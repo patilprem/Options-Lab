@@ -266,6 +266,59 @@ class DataStore:
             out.append(row)
         return out
 
+    # Tables whose freshness is only meaningful PER UNDERLYING.
+    #
+    # chain_snapshots is why this exists. It has TWO writers — the core
+    # index/commodity recorder and the scanner's Tier-2 stock deep-dive — so
+    # the table-level check in recording_health() above reads "fresh" whenever
+    # any stock is being deep-dived, no matter how long the core names have
+    # been dead. On 2026-07-31 NIFTY/BANKNIFTY/CRUDEOIL/GOLD stopped recording
+    # for 90 minutes and chain_snapshots never once looked stale: INFY and TCS
+    # were held positions and kept writing. The only reason an alert fired at
+    # all is that option_bars happens to have a single writer.
+    #
+    # Table-level freshness cannot see that, and no threshold tuning fixes it —
+    # the aggregate is simply the wrong granularity. This is the right one.
+    _UNDERLYING_TABLES = ("chain_snapshots", "option_bars", "underlying_bars")
+
+    def recording_underlying_health(self, underlyings, tables=None) -> list[dict]:
+        """Per-(table, underlying) freshness for the names the live recorder is
+        responsible for.
+
+        One grouped query per table filtered to `underlyings` — never a loop of
+        one query per name (see stock_day_open_oi_bulk for what that costs).
+        All three tables lead their PRIMARY KEY with `underlying`, so the IN
+        filter prunes rather than scans.
+
+        A requested name with NO rows at all is still reported, with
+        last_ts=None — 'never written' is the loudest case there is and must
+        not vanish just because the GROUP BY returned nothing for it."""
+        names = sorted({u for u in (underlyings or []) if u})
+        if not names:
+            return []
+        holes = ",".join("?" * len(names))
+        out = []
+        for table in (tables or self._UNDERLYING_TABLES):
+            try:
+                rows = self._q(
+                    f"SELECT underlying, max(ts), "                # noqa: S608
+                    f"count(*) FILTER (WHERE CAST(ts AS DATE)=CURRENT_DATE) "
+                    f"FROM {table} WHERE underlying IN ({holes}) "
+                    f"GROUP BY underlying", names)
+            except Exception as e:
+                out.append({"table": table, "underlying": None, "present": False,
+                            "last_ts": None, "rows_today": 0,
+                            "error": f"{type(e).__name__}: {e}"})
+                continue
+            found = {r[0]: r for r in rows}
+            for u in names:
+                r = found.get(u)
+                out.append({
+                    "table": table, "underlying": u, "present": True,
+                    "last_ts": str(r[1]) if r and r[1] is not None else None,
+                    "rows_today": int(r[2] or 0) if r else 0, "error": None})
+        return out
+
     def coverage(self) -> tuple[list, dict]:
         """(underlying_bars summary rows, option_bars counts) for /data/coverage."""
         rows = self._q(
