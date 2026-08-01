@@ -507,6 +507,61 @@ def all_trades(from_date: str = "", to_date: str = "",
     return sorted(out, key=lambda t: t.get("ts", ""), reverse=True)
 
 
+def merge_round_trips(rows: list[dict]) -> list[dict]:
+    """Pair each entry leg with its exit leg into ONE trade record, so the
+    History drill-down shows a round trip instead of two separate fill rows.
+    `rows` is all_trades()'s output shape. Grouped by (strategy_id, contract,
+    tag), FIFO by time — mirrors scripts/backfill_trade_pnl.py's pairing.
+    A still-open position (no exit yet) comes back with the exit_* fields
+    None instead of being dropped; an exit whose entry isn't in `rows` (e.g.
+    the entry predates the fetch window) comes back with the entry_* fields
+    None rather than being silently discarded."""
+    from collections import defaultdict, deque
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for r in rows:
+        groups[(r.get("strategy_id"), r.get("contract", ""), r.get("tag", ""))].append(r)
+    trips = []
+    for items in groups.values():
+        items = sorted(items, key=lambda r: r.get("ts", ""))
+        pending: deque = deque()
+        for r in items:
+            if r.get("reason") == "entry":
+                pending.append(r)
+            else:
+                trips.append(_build_round_trip(pending.popleft() if pending else None, r))
+        trips.extend(_build_round_trip(entry, None) for entry in pending)
+    return sorted(trips, key=lambda t: t.get("exit_ts") or t.get("entry_ts") or "",
+                 reverse=True)
+
+
+def _build_round_trip(entry: Optional[dict], exit_: Optional[dict]) -> dict:
+    base = entry or exit_
+    qty = (exit_ or entry).get("qty")
+    entry_price = entry.get("price") if entry else None
+    exit_price = exit_.get("price") if exit_ else None
+    entry_fees = entry.get("fees", 0.0) if entry else 0.0
+    exit_fees = exit_.get("fees", 0.0) if exit_ else 0.0
+    net_pnl = gross_pnl = None
+    if exit_ is not None:
+        if "net_pnl" in exit_:
+            net_pnl, gross_pnl = exit_["net_pnl"], exit_.get("gross_pnl")
+        elif entry is not None and entry_price is not None and exit_price is not None:
+            signed = qty if entry.get("side") == "BUY" else -qty
+            gross_pnl = round((exit_price - entry_price) * signed, 2)
+            net_pnl = round(gross_pnl - (entry_fees + exit_fees), 2)
+    return {
+        "strategy": base.get("strategy"), "strategy_id": base.get("strategy_id"),
+        "mode": base.get("mode"), "contract": base.get("contract"),
+        "tag": base.get("tag"), "side": (entry or {}).get("side"), "qty": qty,
+        "entry_ts": entry.get("ts") if entry else None,
+        "exit_ts": exit_.get("ts") if exit_ else None,
+        "entry_price": entry_price, "exit_price": exit_price,
+        "fees": round(entry_fees + exit_fees, 2),
+        "net_pnl": net_pnl, "gross_pnl": gross_pnl,
+        "reason": exit_.get("reason") if exit_ else "open",
+    }
+
+
 def daily_pnl_summary(from_date: str = "", to_date: str = "",
                       strategy_id: str = "", mode: str = "") -> dict:
     """Booked (realized) P&L + fees per calendar day, summed across every

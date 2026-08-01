@@ -130,3 +130,134 @@ def test_trades_daily_endpoint_sorted_newest_first(db):
 
     dates = [d["date"] for d in data["days"]]
     assert dates == sorted(dates, reverse=True)
+
+
+def test_merge_round_trips_pairs_entry_and_exit_into_one_row(db):
+    """The History drill-down's whole point: an entry leg + its exit leg
+    become ONE trade record, not two."""
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 09:20:00", "contract": "NIFTY 25000 CE",
+        "side": "BUY", "qty": 75, "price": 100.0, "fees": 20.0,
+        "reason": "entry", "tag": "t1",
+    })
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 10:20:00", "contract": "NIFTY 25000 CE",
+        "side": "SELL", "qty": 75, "price": 120.0, "fees": 22.0,
+        "reason": "target", "tag": "t1",
+    })
+
+    trips = db.merge_round_trips(db.all_trades())
+
+    assert len(trips) == 1
+    t = trips[0]
+    assert t["entry_ts"] == "2026-07-22 09:20:00"
+    assert t["exit_ts"] == "2026-07-22 10:20:00"
+    assert t["entry_price"] == 100.0 and t["exit_price"] == 120.0
+    assert t["fees"] == pytest.approx(42.0)
+    assert t["gross_pnl"] == pytest.approx(1500.0)
+    assert t["net_pnl"] == pytest.approx(1458.0)
+    assert t["reason"] == "target"
+
+
+def test_merge_round_trips_uses_prestamped_pnl_when_present(db):
+    """A trade booked after the net_pnl/gross_pnl fix carries its own
+    stamped values on the exit leg — merge must trust those, not recompute."""
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 09:20:00", "contract": "NIFTY 25000 PE",
+        "side": "SELL", "qty": 30, "price": 200.0, "fees": 15.0,
+        "reason": "entry", "tag": "t2",
+    })
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 10:20:00", "contract": "NIFTY 25000 PE",
+        "side": "BUY", "qty": 30, "price": 150.0, "fees": 12.0,
+        "reason": "hard_stop", "tag": "t2", "net_pnl": 1473.0, "gross_pnl": 1500.0,
+    })
+
+    trips = db.merge_round_trips(db.all_trades())
+
+    assert trips[0]["net_pnl"] == 1473.0
+    assert trips[0]["gross_pnl"] == 1500.0
+
+
+def test_merge_round_trips_keeps_open_position_as_its_own_row(db):
+    """A position with no exit yet must still show up (as 'open'), not
+    vanish just because there's nothing to pair it with."""
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 09:20:00", "contract": "NIFTY 25000 CE",
+        "side": "BUY", "qty": 75, "price": 100.0, "fees": 20.0,
+        "reason": "entry", "tag": "t3",
+    })
+
+    trips = db.merge_round_trips(db.all_trades())
+
+    assert len(trips) == 1
+    assert trips[0]["entry_ts"] == "2026-07-22 09:20:00"
+    assert trips[0]["exit_ts"] is None
+    assert trips[0]["exit_price"] is None
+    assert trips[0]["net_pnl"] is None
+    assert trips[0]["reason"] == "open"
+
+
+def test_merge_round_trips_keeps_orphaned_exit_instead_of_dropping_it(db):
+    """An exit with no matching entry in the fetched rows (e.g. wiped day)
+    must still surface, not disappear silently."""
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 10:20:00", "contract": "NIFTY 24000 PE",
+        "side": "BUY", "qty": 75, "price": 50.0, "fees": 10.0,
+        "reason": "squareoff", "tag": "t4",
+    })
+
+    trips = db.merge_round_trips(db.all_trades())
+
+    assert len(trips) == 1
+    assert trips[0]["entry_ts"] is None
+    assert trips[0]["exit_ts"] == "2026-07-22 10:20:00"
+    assert trips[0]["net_pnl"] is None
+
+
+def test_trades_endpoint_files_an_overnight_trip_under_its_exit_day(db):
+    """A position entered on day 1 and closed on day 2 must appear when
+    querying day 2 (where the realized P&L belongs) and NOT when querying
+    day 1 alone — merging needs the full history, not a date-bounded slice."""
+    from app.api.strategies import trade_history
+
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-21 15:00:00", "contract": "NIFTY 25000 CE",
+        "side": "BUY", "qty": 75, "price": 100.0, "fees": 20.0,
+        "reason": "entry", "tag": "overnight",
+    })
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 09:20:00", "contract": "NIFTY 25000 CE",
+        "side": "SELL", "qty": 75, "price": 110.0, "fees": 21.0,
+        "reason": "target", "tag": "overnight",
+    })
+
+    day1 = trade_history(from_date="2026-07-21", to_date="2026-07-21")
+    day2 = trade_history(from_date="2026-07-22", to_date="2026-07-22")
+
+    assert day1["count"] == 0
+    assert day2["count"] == 1
+    assert day2["trades"][0]["entry_ts"] == "2026-07-21 15:00:00"
+    assert day2["trades"][0]["exit_ts"] == "2026-07-22 09:20:00"
+
+
+def test_trades_endpoint_csv_stays_raw_per_fill(db):
+    """The CSV export is the audit ledger — it must keep showing individual
+    entry/exit legs, not the merged display view."""
+    from app.api.strategies import trade_history
+
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 09:20:00", "contract": "NIFTY 25000 CE",
+        "side": "BUY", "qty": 75, "price": 100.0, "fees": 20.0,
+        "reason": "entry", "tag": "t5",
+    })
+    db.record_trade("SCANNER", "PAPER", {
+        "ts": "2026-07-22 10:20:00", "contract": "NIFTY 25000 CE",
+        "side": "SELL", "qty": 75, "price": 120.0, "fees": 22.0,
+        "reason": "target", "tag": "t5",
+    })
+
+    resp = trade_history(from_date="2026-07-22", to_date="2026-07-22", fmt="csv")
+
+    lines = [l for l in resp.body.decode().splitlines() if l]
+    assert len(lines) == 3   # header + 2 raw legs

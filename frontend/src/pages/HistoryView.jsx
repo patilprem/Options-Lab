@@ -161,13 +161,15 @@ export default function HistoryView({ strategies }) {
                           <div className="table-scroll" ref={dragScrollRef}><table>
                             <thead>
                               <tr>
-                                <th>Time</th>
+                                <th>Entry</th>
+                                <th>Exit</th>
                                 <th>Source</th>
                                 <th>Mode</th>
                                 <th>Contract</th>
                                 <th>Side</th>
                                 <th>Qty</th>
-                                <th>Price</th>
+                                <th>Entry ₹</th>
+                                <th>Exit ₹</th>
                                 <th>Fees</th>
                                 <th>Net P&amp;L</th>
                                 <th>Gross P&amp;L</th>
@@ -177,15 +179,17 @@ export default function HistoryView({ strategies }) {
                             <tbody>
                               {day.trades.map((t, i) => (
                                 <tr key={i}>
-                                  <td>{timeOf(t.ts)}</td>
+                                  <td>{t.entry_ts ? timeOf(t.entry_ts) : '—'}</td>
+                                  <td>{t.exit_ts ? timeOf(t.exit_ts) : '—'}</td>
                                   <td>{t.strategy || ''}</td>
                                   <td style={{ textAlign: 'left' }}>
                                     <span className={`badge ${t.mode === 'LIVE' ? 'LIVE' : 'VALIDATED'}`}>{t.mode}</span>
                                   </td>
                                   <td style={{ textAlign: 'left' }}>{t.contract}</td>
-                                  <td className={t.side === 'BUY' ? 'pos' : 'neg'}>{t.side}</td>
+                                  <td className={t.side === 'BUY' ? 'pos' : 'neg'}>{t.side || ''}</td>
                                   <td>{t.qty}</td>
-                                  <td>{fmt2(t.price)}</td>
+                                  <td>{t.entry_price != null ? fmt2(t.entry_price) : '—'}</td>
+                                  <td>{t.exit_price != null ? fmt2(t.exit_price) : '—'}</td>
                                   <td>{fmt2(t.fees)}</td>
                                   <td className={t.net_pnl != null ? pnlCls(t.net_pnl) : ''}>
                                     {t.net_pnl != null ? sign(t.net_pnl) : '—'}
@@ -193,7 +197,7 @@ export default function HistoryView({ strategies }) {
                                   <td className={t.gross_pnl != null ? pnlCls(t.gross_pnl) : ''}>
                                     {t.gross_pnl != null ? sign(t.gross_pnl) : '—'}
                                   </td>
-                                  <td style={{ textAlign: 'left' }}>{t.reason}</td>
+                                  <td style={{ textAlign: 'left' }}>{t.reason === 'open' ? 'open position' : t.reason}</td>
                                 </tr>
                               ))}
                             </tbody>
