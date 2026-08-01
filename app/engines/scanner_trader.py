@@ -372,7 +372,8 @@ class ScannerTrader:
                         - pos.entry_fees - fill.fees)
             realized_today += realized
             fees_today += fill.fees
-            self._book_trade(sym, pos, "exit", fill.price, fill.fees, reason, now)
+            self._book_trade(sym, pos, "exit", fill.price, fill.fees, reason, now,
+                             realized=realized)
             self._journal_exit(sym, pos, fill, reason, realized, scanner, now,
                               held_days)
             registry.record_event(
@@ -946,14 +947,19 @@ class ScannerTrader:
                               f"adaptive update dismissed ({p.get('rule')})")
         return {"ok": True}
 
-    def _book_trade(self, sym, pos: SPosition, kind, price, fees, reason, ts):
+    def _book_trade(self, sym, pos: SPosition, kind, price, fees, reason, ts,
+                    realized=None):
         from app.core import registry
-        registry.record_trade(STRATEGY_ID, "PAPER", {
+        row = {
             "ts": ts.isoformat(sep=" ", timespec="seconds"),
             "contract": f"{sym} {pos.strike:g} {pos.side}",
             "side": "BUY" if kind == "entry" else "SELL",
             "qty": pos.qty_units, "price": price, "fees": fees,
-            "margin": 0.0, "reason": reason, "tag": f"scanner:{pos.bias}"})
+            "margin": 0.0, "reason": reason, "tag": f"scanner:{pos.bias}"}
+        if kind == "exit" and realized is not None:
+            row["net_pnl"] = round(realized, 2)
+            row["gross_pnl"] = round(realized + pos.entry_fees + fees, 2)
+        registry.record_trade(STRATEGY_ID, "PAPER", row)
 
     # -- API surface ---------------------------------------------------------
     def snapshot(self) -> dict:

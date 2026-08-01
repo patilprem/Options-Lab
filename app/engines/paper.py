@@ -1220,6 +1220,10 @@ class PaperContext(Context):
         }
         if reason == "entry" and p.entry_context:
             row["entry_context"] = p.entry_context   # signal attribution
+        elif p.exit_price is not None:
+            gross = (p.exit_price - p.entry_price) * p.qty
+            row["gross_pnl"] = round(gross, 2)
+            row["net_pnl"] = round(p.realized_pnl, 2)
         registry.record_trade(self.rec.id, "PAPER", row)
 
     def exit(self, position_id: str, reason: str = "signal") -> bool:
