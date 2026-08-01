@@ -6,6 +6,45 @@ const sign = n => (n >= 0 ? '+' : '') + fmt2(n)
 const pnlCls = n => n >= 0 ? 'pos' : 'neg'
 const timeOf = ts => (ts || '').slice(11, 16) || ts
 
+// overflow-x:auto only responds to a scrollbar/trackpad drag, not a mouse
+// grabbing the row itself — bind a plain pointer drag to scrollLeft so wide
+// tables (contract/side/qty/.../reason) can be dragged sideways with a mouse.
+function dragScrollRef(el) {
+  if (!el || el._dragScrollBound) return
+  el._dragScrollBound = true
+  let startX = 0, startScroll = 0, dragging = false
+  el.addEventListener('pointerdown', e => {
+    if (e.pointerType !== 'mouse' || e.button !== 0) return
+    startX = e.clientX
+    startScroll = el.scrollLeft
+    dragging = false
+  })
+  el.addEventListener('pointermove', e => {
+    if (e.buttons !== 1) return
+    const dx = e.clientX - startX
+    if (!dragging && Math.abs(dx) < 4) return
+    // only capture once an actual drag is confirmed — capturing on every
+    // pointerdown retargets the click event away from whatever's under the
+    // cursor, breaking plain clicks on buttons inside the container
+    if (!dragging) el.setPointerCapture(e.pointerId)
+    dragging = true
+    el.scrollLeft = startScroll - dx
+    el.classList.add('dragging')
+  })
+  const end = () => {
+    if (dragging) {
+      el.classList.remove('dragging')
+      // a drag shouldn't also fire a click on whatever's under the cursor
+      // (e.g. the "Show trades" button)
+      const swallow = ev => { ev.stopPropagation(); ev.preventDefault() }
+      el.addEventListener('click', swallow, { capture: true, once: true })
+    }
+    dragging = false
+  }
+  el.addEventListener('pointerup', end)
+  el.addEventListener('pointercancel', end)
+}
+
 export default function HistoryView({ strategies }) {
   const today = new Date().toISOString().slice(0, 10)
   const past = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
@@ -85,7 +124,7 @@ export default function HistoryView({ strategies }) {
       {days === null ? (
         <div className="empty">Loading...</div>
       ) : days.length ? (
-        <div className="table-scroll"><table>
+        <div className="table-scroll" ref={dragScrollRef}><table>
           <thead>
             <tr>
               <th>Date</th>
@@ -119,7 +158,7 @@ export default function HistoryView({ strategies }) {
                         {day.loading ? (
                           <div className="empty">Loading trades...</div>
                         ) : day.trades.length ? (
-                          <div className="table-scroll"><table>
+                          <div className="table-scroll" ref={dragScrollRef}><table>
                             <thead>
                               <tr>
                                 <th>Time</th>
