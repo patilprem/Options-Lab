@@ -756,6 +756,10 @@ table {
 .table-scroll td {
   white-space: nowrap;
 }
+.table-scroll.dragging {
+  cursor: grabbing;
+  user-select: none;
+}
 
 th {
   font-size: 10.5px;
