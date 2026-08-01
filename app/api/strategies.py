@@ -489,13 +489,15 @@ def manual_trade(sid: str, req: ManualTradeReq):
             "qty": leg.qty, "price": round(leg.entry_price, 2),
             "fees": round(e_fees, 2), "margin": round(leg.margin, 2),
             "reason": "entry", "tag": leg.tag or "manual"})
+        signed = leg.qty if side == "BUY" else -leg.qty
+        leg_pnl = (leg.exit_price - leg.entry_price) * signed - (e_fees + x_fees)
         registry.record_trade(sid, "PAPER", {
             "ts": _ts(leg.exit_ts), "contract": contract, "side": exit_side,
             "qty": leg.qty, "price": round(leg.exit_price, 2),
             "fees": round(x_fees, 2), "margin": 0.0,
-            "reason": leg.exit_reason, "tag": leg.tag or "manual"})
-        signed = leg.qty if side == "BUY" else -leg.qty
-        leg_pnl = (leg.exit_price - leg.entry_price) * signed - (e_fees + x_fees)
+            "reason": leg.exit_reason, "tag": leg.tag or "manual",
+            "net_pnl": round(leg_pnl, 2),
+            "gross_pnl": round(leg_pnl + e_fees + x_fees, 2)})
         realized += leg_pnl
         fees_total += e_fees + x_fees
         booked.append({"contract": contract, "side": side, "qty": leg.qty,
@@ -646,7 +648,7 @@ def trade_history(from_date: str = "", to_date: str = "",
         from fastapi.responses import PlainTextResponse
         buf = io.StringIO()
         cols = ["ts", "strategy", "mode", "contract", "side", "qty",
-                "price", "fees", "margin", "reason", "tag"]
+                "price", "fees", "margin", "reason", "tag", "net_pnl", "gross_pnl"]
         w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)

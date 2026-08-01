@@ -437,13 +437,18 @@ class LiveContext(Context):
                               f"{'[DRY] ' if dry else ''}{side} {abs(p.qty)} "
                               f"{p.underlying} {p.strike:g} {opt} @ {price} ({reason})",
                               self.rec.id)
-        registry.record_trade(self.rec.id, "LIVE", {
+        row = {
             "ts": self.now.isoformat(sep=" ", timespec="seconds"),
             "contract": f"{p.underlying} {p.strike:g} {opt}".upper(),
             "side": side, "qty": abs(p.qty), "price": round(price, 2),
             "fees": round(fees, 2), "reason": reason, "tag": p.tag,
             "dry_run": dry,
-        })
+        }
+        if reason != "entry" and p.exit_price is not None:
+            gross = (p.exit_price - p.entry_price) * p.qty
+            row["gross_pnl"] = round(gross, 2)
+            row["net_pnl"] = round(p.realized_pnl, 2)
+        registry.record_trade(self.rec.id, "LIVE", row)
 
     def log(self, msg: str) -> None:
         print(f"[LIVE {self.rec.id} {self.now:%H:%M}] {msg}")

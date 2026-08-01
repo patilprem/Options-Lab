@@ -130,6 +130,8 @@ export default function HistoryView({ strategies }) {
                                 <th>Qty</th>
                                 <th>Price</th>
                                 <th>Fees</th>
+                                <th>Net P&amp;L</th>
+                                <th>Gross P&amp;L</th>
                                 <th>Reason</th>
                               </tr>
                             </thead>
@@ -146,6 +148,12 @@ export default function HistoryView({ strategies }) {
                                   <td>{t.qty}</td>
                                   <td>{fmt2(t.price)}</td>
                                   <td>{fmt2(t.fees)}</td>
+                                  <td className={t.net_pnl != null ? pnlCls(t.net_pnl) : ''}>
+                                    {t.net_pnl != null ? sign(t.net_pnl) : '—'}
+                                  </td>
+                                  <td className={t.gross_pnl != null ? pnlCls(t.gross_pnl) : ''}>
+                                    {t.gross_pnl != null ? sign(t.gross_pnl) : '—'}
+                                  </td>
                                   <td style={{ textAlign: 'left' }}>{t.reason}</td>
                                 </tr>
                               ))}
