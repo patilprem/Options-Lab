@@ -642,8 +642,9 @@ trades_router = APIRouter(tags=["trades"])
 @trades_router.get("/trades")
 def trade_history(from_date: str = "", to_date: str = "",
                   strategy_id: str = "", mode: str = "", fmt: str = "json"):
-    rows = registry.all_trades(from_date, to_date, strategy_id, mode)
     if fmt == "csv":
+        # raw per-fill ledger (unchanged) — the audit trail, not the display view
+        rows = registry.all_trades(from_date, to_date, strategy_id, mode)
         import io, csv
         from fastapi.responses import PlainTextResponse
         buf = io.StringIO()
@@ -653,7 +654,18 @@ def trade_history(from_date: str = "", to_date: str = "",
         w.writeheader()
         w.writerows(rows)
         return PlainTextResponse(buf.getvalue(), media_type="text/csv")
-    return {"count": len(rows), "trades": rows}
+    # merge entry+exit into one round trip per trade — pairing needs the full
+    # history (an open position's entry, or an exit whose entry predates the
+    # window, must still be found), so date filtering happens AFTER merging,
+    # keyed by exit day (or entry day for a still-open position)
+    all_rows = registry.all_trades("", "", strategy_id, mode)
+    trips = registry.merge_round_trips(all_rows)
+    if from_date or to_date:
+        def _in_range(t):
+            d = str(t.get("exit_ts") or t.get("entry_ts") or "")[:10]
+            return (not from_date or d >= from_date) and (not to_date or d <= to_date)
+        trips = [t for t in trips if _in_range(t)]
+    return {"count": len(trips), "trades": trips}
 
 
 @trades_router.get("/trades/daily")
