@@ -24,6 +24,10 @@ from __future__ import annotations
 MIN_TRADES = 8          # below this, only "keep collecting" is honest
 MIN_BUCKET = 5          # min closed trades in a bucket before it's evidence
 CHURN_MINUTES = 30      # re-entry within this of the previous exit = churn
+TP_PROBE_PCT = 25.0     # MFE level the take-profit rule tests for (% of entry
+                        # premium); the 07-22..31 book peaked here on ~1 trade
+                        # in 3 while realizing far less — see scripts/
+                        # exit_counterfactual.py
 
 
 def _median(xs: list) -> float | None:
@@ -130,6 +134,33 @@ def suggestions_from(stats: dict, exits: list[dict]) -> list[dict]:
                               "run — consider a tighter trail_pct.",
                 "evidence": f"{len(tr)} trail exits: median peak +{_r(med_mfe)}% "
                             f"of entry premium, median giveback {_r(med_gb)}%."})
+
+    # 1b) the run was THERE and was handed back — a take-profit, not a tighter
+    # trail, is the other remedy for the same evidence. Deliberately a SECOND
+    # rule rather than a rewrite of trail_giveback: both are legitimate fixes
+    # for "peak reached, nothing booked", they map to different params, and the
+    # shadow challenger is exactly the machinery for letting the virtual book
+    # decide which one actually wins instead of us guessing here.
+    # A trail can only pay when the peak clears trail/(1-trail) — ~43% at
+    # trail_pct 0.30 — so entries that pop +20-40% and revert are structurally
+    # unable to profit under a trail alone, however tight.
+    with_mfe = [t for t in exits
+                if t.get("mfe_pct") is not None and t.get("ret_pct") is not None]
+    if len(with_mfe) >= MIN_TRADES:
+        reached = [t for t in with_mfe if t["mfe_pct"] >= TP_PROBE_PCT]
+        if len(reached) >= MIN_BUCKET:
+            med_ret = _median([t["ret_pct"] for t in reached])
+            if med_ret is not None and med_ret < 0.5 * TP_PROBE_PCT:
+                out.append({
+                    "rule": "mfe_take_profit",
+                    "suggestion": f"Trades reach +{_r(TP_PROBE_PCT)}% of entry "
+                                  "premium and then hand it back — consider "
+                                  "arming target_pct (a take-profit) instead of "
+                                  "relying on the trail alone.",
+                    "evidence": f"{len(reached)}/{len(with_mfe)} closed trades "
+                                f"peaked at +{_r(TP_PROBE_PCT)}% or better, but "
+                                f"their median realized exit was only "
+                                f"{_r(med_ret)}%."})
 
     # 2) hard stops hitting fast = entries are chasing extended moves
     hs = [t for t in exits if t.get("reason") == "hard_stop"]

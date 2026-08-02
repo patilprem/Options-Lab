@@ -56,6 +56,17 @@ ADAPTABLE: dict[str, dict] = {
     "tighten_hard_stop": {"param": "hard_stop_pct", "step": -0.05,
                           "lo": 0.15, "hi": 0.40,
                           "label": "tighten the hard stop"},
+    # mfe_take_profit: peaks reached and handed back -> arm target_pct.
+    # The step is large ON PURPOSE, same precedent as `churn` below: 1.00
+    # (+100%) is the OFF sentinel — a take-profit that never fires — so the
+    # first step must turn it ON at the level the evidence measures (+25%),
+    # not creep 1.00 -> 0.95. Creeping would spend a 21-day embargo per step
+    # trialling levels (+75%, +50%) the MFE distribution already says are
+    # unreachable, and the challenger would lose on a remedy that works,
+    # discarding it for the wrong reason. Later steps fine-tune 0.25 -> 0.20.
+    "mfe_take_profit":   {"param": "target_pct",    "step": -0.75,
+                          "lo": 0.20, "hi": 1.00,
+                          "label": "arm a take-profit (target_pct)"},
     "raise_entry_score": {"param": "entry_score",   "step": 5.0,
                           "lo": 50.0, "hi": 85.0,
                           "label": "raise the entry score"},

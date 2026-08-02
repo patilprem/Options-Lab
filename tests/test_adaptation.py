@@ -240,10 +240,23 @@ def test_every_scalar_insight_rule_is_adaptable():
     """Holistic coverage: every rule journal_insights can fire has an
     ADAPTABLE mapping, except fast_hard_stops (its remedy — a confirmation
     entry — is a state machine, not a scalar; documented human-only)."""
-    all_rules = {"trail_giveback", "fast_hard_stops", "raise_entry_score",
-                 "late_entries", "churn", "tighten_hard_stop",
-                 "fresh_buildup_only", "fee_drag"}
+    all_rules = {"trail_giveback", "mfe_take_profit", "fast_hard_stops",
+                 "raise_entry_score", "late_entries", "churn",
+                 "tighten_hard_stop", "fresh_buildup_only", "fee_drag"}
     assert set(A.ADAPTABLE) == all_rules - {"fast_hard_stops"}
+
+
+def test_take_profit_rule_arms_target_pct_at_the_measured_level():
+    """target_pct 1.00 is the OFF sentinel (a +100% take-profit never fires),
+    so the first bounded step must ARM it at the level the MFE evidence
+    measures, not creep down through unreachable levels."""
+    assert A.challenger_overrides({"target_pct": 1.00},
+                                  "mfe_take_profit") == {"target_pct": 0.25}
+    # already armed tight -> clamps, never below the floor
+    assert A.challenger_overrides({"target_pct": 0.25},
+                                  "mfe_take_profit") == {"target_pct": 0.20}
+    assert A.challenger_overrides({"target_pct": 0.20},
+                                  "mfe_take_profit") is None
 
 
 def test_behavioural_rule_overrides_step_and_clamp():
