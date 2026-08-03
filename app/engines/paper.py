@@ -354,9 +354,26 @@ class MarketHub:
     def _watch_segments(self) -> set[str]:
         """Exchanges whose sessions the watchdog/pill should judge — all
         WS-subscribed underlyings, incl. chain-only MCX names (their futures
-        tick 09:00-23:30, so they legitimately extend the watched window)."""
+        tick 09:00-23:30, so they legitimately extend the watched window).
+
+        SNAPSHOT FIRST. `_chain_only` is mutated from outside this coroutine
+        (enable_chain, called by the recorder and the scanner), so `set(...) |
+        self._chain_only` can raise "Set changed size during iteration" — the
+        exact fault that killed the chain poll loop on 2026-07-28. This runs on
+        three paths that must not die: the once-a-minute watchdog loop,
+        LiveFeed's watch_open callback, and now feed_status(), which the chain
+        self-heal reads to tell a real outage from a holiday. A safety net that
+        can be taken down by an unrelated set mutation is not a safety net."""
         segs = set()
-        for u in set(self._wanted) | self._chain_only:
+        for _ in range(3):
+            try:
+                names = list(self._wanted) + list(self._chain_only)
+                break
+            except RuntimeError:              # mutated while copying
+                continue
+        else:
+            return segs
+        for u in names:
             cfg = UNDERLYINGS.get(u)
             if cfg:
                 segs.add("MCX" if "MCX" in str(cfg.get("segment", "")) else "NSE")

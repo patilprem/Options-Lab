@@ -135,3 +135,47 @@ def test_poll_cycle_raising_is_reported_not_fatal(monkeypatch):
             loop.run_until_complete(hub._poll_cycle(None, loop, 0, set()))
     finally:
         loop.close()
+
+
+# --- _watch_segments: the same hazard, on the watchdog's path ---------------
+
+def test_watch_segments_survives_the_set_being_mutated_while_it_copies(monkeypatch):
+    """Same fault as _chain_order, different victim. _watch_segments feeds the
+    once-a-minute watchdog loop, LiveFeed's watch_open callback, and
+    feed_status() — which the chain self-heal reads to tell a real outage from
+    a holiday. A RuntimeError here takes down the safety net itself."""
+    from app.data.dhan_client import UNDERLYINGS
+    # MCX names only exist in UNDERLYINGS once resolve_mcx_ids has injected
+    # them at runtime; do the same here so the MCX branch is actually reached.
+    monkeypatch.setitem(UNDERLYINGS, "CRUDEOIL",
+                        {"security_id": 560977, "segment": "MCX_COMM"})
+    hub = _hub()
+    hub._wanted = {"NIFTY": {5}}
+
+    class Mutating(set):
+        def __init__(self, *a):
+            super().__init__(*a)
+            self.calls = 0
+
+        def __iter__(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("Set changed size during iteration")
+            return super().__iter__()
+
+    hub._chain_only = Mutating({"CRUDEOIL"})
+    assert hub._watch_segments() == {"NSE", "MCX"}
+
+
+def test_watch_segments_degrades_to_empty_rather_than_raising():
+    """If it never settles, an empty set is survivable — the next pass is a
+    minute away. A raise is not."""
+    hub = _hub()
+    hub._wanted = {}
+
+    class AlwaysMutating(set):
+        def __iter__(self):
+            raise RuntimeError("Set changed size during iteration")
+
+    hub._chain_only = AlwaysMutating({"GOLD"})
+    assert hub._watch_segments() == set()
