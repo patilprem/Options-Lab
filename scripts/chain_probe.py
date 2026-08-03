@@ -326,8 +326,10 @@ def main() -> int:
                     help="also ask Dhan directly (uses the account's API quota)")
     ap.add_argument("--names", default=",".join(CORE),
                     help=f"comma-separated underlyings (default: {','.join(CORE)})")
-    ap.add_argument("--events", type=int, default=40,
-                    help="how many chain events to print (default 40)")
+    ap.add_argument("--events", type=int, default=200,
+                    help="how many chain events to print (default 200 — the "
+                         "40 this started with was entirely consumed by "
+                         "repeating no-op lines during a live incident)")
     args = ap.parse_args()
     names = [n.strip().upper() for n in args.names.split(",") if n.strip()]
 

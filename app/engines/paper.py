@@ -874,11 +874,26 @@ class MarketHub:
                               # (underlying, reason) per 5 minutes — these
                               # branches can legitimately fire every ~1s poll
 
+    # ...except the reasons that are PERMANENT FACTS about an underlying rather
+    # than incidents. BANKNIFTY, CRUDEOIL and GOLD have no weekly expiry cycle
+    # and will not until an exchange changes its calendar, so `no-weekly-cycle`
+    # is correct behaviour reported forever: three names x every 5 minutes is
+    # ~36 lines an hour of noise. On 2026-08-03 that noise pushed the ACTUAL
+    # outage window out of the diagnostic view entirely — the last 40 chain
+    # events were 33 copies of this one line and nothing from the incident.
+    # A log nobody can find anything in is the same failure as no log, and this
+    # codebase has already paid five days for learning to ignore an alarm.
+    _NOOP_WARN_DAILY = ("no-weekly-cycle",)
+    _NOOP_WARN_DAILY_S = 86400.0
+
     def _noop_warn(self, u: str, reason: str, detail: str) -> None:
         key = (u, reason)
         last = self._noop_warned.get(key)
         now = time.monotonic()
-        if last is not None and (now - last) < self._NOOP_WARN_S:
+        window = (self._NOOP_WARN_DAILY_S
+                  if reason.startswith(self._NOOP_WARN_DAILY)
+                  else self._NOOP_WARN_S)
+        if last is not None and (now - last) < window:
             return
         self._noop_warned[key] = now
         registry.record_event("warn", "feed",

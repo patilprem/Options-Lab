@@ -254,3 +254,43 @@ def test_offset_zero_out_of_order_does_not_crash(monkeypatch):
     monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
     _call(hub, targets=(("WEEKLY", 1), ("WEEKLY", 0)))
     assert fetch_calls == [1, 1], "out-of-order targets must still attempt both"
+
+
+# --- permanent facts must not drown the log --------------------------------
+
+def _noop_events(monkeypatch, hub, u, reason, aged_by):
+    """Age the throttle entry by `aged_by` seconds, then call _noop_warn and
+    return whatever it logged."""
+    hub._noop_warned[(u, reason)] = time.monotonic() - aged_by
+    events = []
+    monkeypatch.setattr("app.core.registry.record_event",
+                        lambda *a, **k: events.append(a))
+    hub._noop_warn(u, reason, "detail")
+    return events
+
+
+def test_the_no_weekly_cycle_line_is_logged_once_a_day(monkeypatch):
+    """2026-08-03: BANKNIFTY/CRUDEOIL/GOLD have no weekly expiry cycle, so the
+    skip is CORRECT behaviour — and at the 5-minute throttle it reported itself
+    ~36 times an hour. The last 40 chain events during a live incident were 33
+    copies of this one line and nothing from the outage itself.
+
+    A permanent fact about an underlying is not an incident. Log it once."""
+    hub = _hub()
+    reason = "no-weekly-cycle[WEEKLY+1]"
+    assert _noop_events(monkeypatch, hub, "BANKNIFTY", reason,
+                        hub._NOOP_WARN_S + 1) == [], \
+        "5 minutes on is still inside the daily window — must stay quiet"
+    assert len(_noop_events(monkeypatch, hub, "BANKNIFTY", reason,
+                            hub._NOOP_WARN_DAILY_S + 1)) == 1
+
+
+def test_real_failures_keep_the_short_throttle(monkeypatch):
+    """The daily window is ONLY for permanent facts. An empty-failure or a
+    fetch no-op is an incident and must still surface every 5 minutes."""
+    hub = _hub()
+    for reason in ("fetch[WEEKLY+0]", "empty-failure-detail[IDX_I]",
+                   "resolve_expiry[WEEKLY+0]", "normalize[WEEKLY+0]"):
+        got = _noop_events(monkeypatch, hub, "NIFTY", reason,
+                           hub._NOOP_WARN_S + 1)
+        assert len(got) == 1, f"{reason} must not be throttled to daily"
