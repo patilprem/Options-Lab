@@ -131,7 +131,24 @@ off-hours window; genuinely urgent fixes get the marker.
   phone alert lands with a diagnosis attached. Each stage fires once per
   episode and movement re-arms the ladder; movement ELSEWHERE (a stock
   deep-dive still ticking) is the holiday discriminator — selective failure =
-  `error`, everything frozen = `warn`.
+  `error` AND an ntfy push carrying the detail (the bare 'NOT RECORDING' push
+  has left an SSH session as the only next step six times running), everything
+  frozen = `warn`, no push. Stage 3 is NOT terminal: both remedies re-apply
+  every 10min until the cache moves or the session closes — 08-03 had NIFTY
+  recover on a restart while BANKNIFTY/CRUDEOIL/GOLD stayed dead another half
+  hour with every stage spent and nothing left that would touch them. The
+  ladder advances ONE step per pass, so a late pass can never escalate to a
+  human without having tried the remedies first.
+  NOTE for the next occurrence: 08-03's selective failure (NIFTY fine, the
+  other three dead) rules out client/token/holiday/market-wide outage — all
+  four share those. The exact surviving correlation is that NIFTY is the only
+  one of the four with a REAL weekly expiry cycle, while `CHAIN_TARGETS` asks
+  every core name for `("WEEKLY", 0/1)`; BANKNIFTY's weeklies were discontinued
+  by NSE and MCX options are monthly-only. Unverified as the cause (offset 0
+  resolves to the nearest expiry either way, so the REQUEST is identical), but
+  it is the one property that separates the survivor from the casualties, and
+  the mislabeling is a real data bug regardless: those three cache and persist
+  their MONTHLY chains under `expiry_kind="WEEKLY"`.
 - `app/engines/risk.py` — M7 risk panel: pure `evaluate()` (portfolio max daily
   loss + per-strategy caps from settings), `exposure()` by underlying/expiry,
   `snapshot()` (margin utilization, day P&L vs max-loss). PaperRunner.enforce_risk
