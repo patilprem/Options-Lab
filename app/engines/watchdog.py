@@ -57,6 +57,17 @@ def session_open_for(segments: Iterable[str], now: datetime,
     return False
 
 
+def session_elapsed_s(segment: str, now: datetime) -> float:
+    """Seconds `segment`'s session has been open at `now` (0 before the open,
+    capped at the close). Used to turn a row COUNT into an average write
+    interval, which is how a sparse instrument gets judged on its own cadence
+    instead of a flat clock."""
+    start, end = MCX_SESSION if segment == "MCX" else NSE_SESSION
+    start_dt = datetime.combine(now.date(), start)
+    end_dt = datetime.combine(now.date(), end)
+    return max(0.0, (min(now, end_dt) - start_dt).total_seconds())
+
+
 def push_ntfy(message: str, kind: str) -> bool:
     """Same channel as the token-refresh link (NTFY_TOPIC env)."""
     topic = os.environ.get("NTFY_TOPIC", "")

@@ -13,7 +13,7 @@ that: a table aggregated over two independent writers is simply the wrong unit
 to judge. These tests pin the right one.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -208,3 +208,104 @@ def test_end_to_end_store_to_alert(tmp_path):
 ])
 def test_segment_for_matches_the_recorders_own_session_gate(underlying, expected):
     assert rw.segment_for(underlying) == expected
+
+
+# --- sparse instruments must not cry wolf -----------------------------------
+#
+# 2026-08-03, from the phone: underlying_bars[GOLD] alerted at 14:55 and
+# recovered at 15:09, then alerted at 15:55 and recovered at 15:58. Nothing
+# that is actually broken recovers in three minutes — a tick simply arrived and
+# the 5-min candle completed. CRUDEOIL, on the same feed and the same MCX
+# session but far more liquid, was never flagged once.
+
+MCX_SEGS = {"GOLD": "MCX", "CRUDEOIL": "MCX"}
+
+
+def _bar_row(u, last_ts, rows_today, table="underlying_bars"):
+    return {"table": table, "underlying": u, "present": True,
+            "last_ts": last_ts.isoformat(sep=" "), "rows_today": rows_today}
+
+
+def test_a_thin_contracts_quiet_stretch_is_not_an_outage():
+    """GOLD at ~10 minutes between bars: 16 minutes of silence is normal for
+    it, and used to fire the alarm."""
+    now = datetime(2026, 8, 3, 15, 55)          # MCX open since 09:00 = 415 min
+    gold = _bar_row("GOLD", now - timedelta(minutes=16), rows_today=41)   # ~10m avg
+    assert rw.stale_underlyings([gold], now, MCX_SEGS,
+                             {"underlying_bars"}) == []
+
+
+def test_a_liquid_contract_keeps_the_tight_threshold():
+    """CRUDEOIL writes every ~5 minutes, so 16 minutes of silence IS wrong and
+    must still alert — the adaptive threshold can never relax below the flat
+    one."""
+    now = datetime(2026, 8, 3, 15, 55)
+    crude = _bar_row("CRUDEOIL", now - timedelta(minutes=16), rows_today=83)
+    assert rw.stale_underlyings([crude], now, MCX_SEGS,
+                             {"underlying_bars"}) == ["underlying_bars[CRUDEOIL]"]
+
+
+def test_a_genuinely_dead_thin_contract_still_trips():
+    """The trade is DELAY, not blindness: a sparse name that really stops has
+    an age that keeps growing past any threshold."""
+    now = datetime(2026, 8, 3, 15, 55)
+    gold = _bar_row("GOLD", now - timedelta(minutes=90), rows_today=41)
+    assert rw.stale_underlyings([gold], now, MCX_SEGS,
+                             {"underlying_bars"}) == ["underlying_bars[GOLD]"]
+
+
+def test_the_threshold_is_never_looser_than_the_flat_one_for_a_busy_name():
+    now = datetime(2026, 8, 3, 15, 55)
+    busy = _bar_row("CRUDEOIL", now - timedelta(minutes=16), rows_today=400)
+    assert rw.stale_underlyings([busy], now, MCX_SEGS,
+                             {"underlying_bars"}) == ["underlying_bars[CRUDEOIL]"]
+
+
+def test_too_few_rows_to_infer_a_cadence_falls_back_to_the_flat_clock():
+    """One row says nothing about spacing; don't invent a cadence from it."""
+    now = datetime(2026, 8, 3, 15, 55)
+    thin = _bar_row("GOLD", now - timedelta(minutes=16), rows_today=1)
+    assert rw.stale_underlyings([thin], now, MCX_SEGS,
+                             {"underlying_bars"}) == ["underlying_bars[GOLD]"]
+
+
+def test_never_written_is_still_stale_regardless_of_cadence():
+    now = datetime(2026, 8, 3, 15, 55)
+    row = {"table": "underlying_bars", "underlying": "GOLD", "present": True,
+           "last_ts": None, "rows_today": 0}
+    assert rw.stale_underlyings([row], now, MCX_SEGS,
+                             {"underlying_bars"}) == ["underlying_bars[GOLD]"]
+
+
+def test_the_multiple_is_what_sets_the_tolerance():
+    """Hand-computed so the boundary is a deliberate decision, not a formula
+    restated. Last write 15:00 = 360 min into the MCX session over 36 rows =
+    a 10-minute cadence, so the tolerance is 3 x 10 = 30 minutes."""
+    last = datetime(2026, 8, 3, 15, 0)
+    row = _bar_row("GOLD", last, rows_today=36)
+    inside = datetime(2026, 8, 3, 15, 29)        # 29 min quiet
+    outside = datetime(2026, 8, 3, 15, 31)       # 31 min quiet
+    assert rw.stale_underlyings([row], inside, MCX_SEGS, {"underlying_bars"}) == []
+    assert rw.stale_underlyings([row], outside, MCX_SEGS,
+                                {"underlying_bars"}) == ["underlying_bars[GOLD]"]
+
+
+def test_a_name_that_died_early_is_not_given_a_looser_threshold():
+    """The trap in measuring cadence to NOW: a name that stopped at 09:30 has
+    few rows, which reads as 'writes rarely' and would RELAX the threshold
+    exactly when it should tighten. Cadence is measured to the LAST WRITE."""
+    now = datetime(2026, 8, 3, 15, 55)
+    died = _bar_row("GOLD", datetime(2026, 8, 3, 9, 30), rows_today=10)
+    assert rw.stale_underlyings([died], now, MCX_SEGS,
+                                {"underlying_bars"}) == ["underlying_bars[GOLD]"]
+
+
+def test_chain_tables_keep_the_flat_threshold():
+    """Only underlying_bars adapts. chain_snapshots is written by the recorder
+    on its own cycle whenever quotes move, so loosening it would blunt the
+    detector that has caught seven chain outages."""
+    now = datetime(2026, 8, 3, 15, 55)
+    sparse_chain = _bar_row("GOLD", now - timedelta(minutes=20), rows_today=10,
+                            table="chain_snapshots")
+    assert rw.stale_underlyings([sparse_chain], now, MCX_SEGS,
+                                {"chain_snapshots"}) == ["chain_snapshots[GOLD]"]

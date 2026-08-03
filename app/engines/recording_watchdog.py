@@ -43,17 +43,22 @@ from app.engines.watchdog import GRACE_MIN, REALERT_MIN, session_open_for
 STALE_AFTER_S = 900          # 15 minutes
 
 
+def _parse_ts(last_ts) -> Optional[datetime]:
+    if not last_ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(last_ts))
+    except (ValueError, TypeError):
+        return None
+
+
 def _age_s(last_ts: Optional[str], now: datetime) -> Optional[float]:
     """Seconds since a recording_health() last_ts string. None if never
     written or unparseable — 'never written today' is handled by the caller,
     since a table with no history at all is a different thing from a stalled
     one."""
-    if not last_ts:
-        return None
-    try:
-        return (now - datetime.fromisoformat(str(last_ts))).total_seconds()
-    except (ValueError, TypeError):
-        return None
+    ts = _parse_ts(last_ts)
+    return None if ts is None else (now - ts).total_seconds()
 
 
 def recorded_underlyings() -> list:
@@ -81,6 +86,47 @@ def segment_for(underlying: str) -> str:
     return "MCX" if underlying in MCX_DYNAMIC else "NSE"
 
 
+# Only underlying_bars gets an adaptive threshold, and the distinction is real:
+# chain_snapshots and option_bars are written by the RECORDER on its own ~5-min
+# cycle whenever the chain cache moves, which quotes do even when the contract
+# barely trades — those are genuinely periodic, and loosening them would blunt
+# the detector that has caught seven chain outages. underlying_bars is the odd
+# one out: a row lands only when a 5-min candle COMPLETES, and that needs a tick
+# in the next bucket, so a thin contract is event-driven in disguise.
+SPARSE_TABLES = ("underlying_bars",)
+
+# How many of a name's own typical write-intervals to tolerate before calling it
+# stale. 3 absorbs an ordinary quiet stretch without letting a dead one hide.
+SPARSE_MULTIPLE = 3.0
+
+
+def _limit_s(row: dict, segment: str, stale_after_s: float) -> float:
+    """Staleness threshold for one (table, underlying), never below
+    `stale_after_s`.
+
+    Pure. Infers the name's own write cadence from its row count and the time
+    it spent writing — no per-instrument configuration to go stale when
+    liquidity changes or a contract rolls.
+
+    Cadence is measured up to the LAST WRITE, not up to `now`. Measuring to now
+    would divide by the outage itself: a name that died at 09:30 has few rows,
+    which would read as 'writes rarely' and RELAX the threshold exactly when it
+    should tighten. Measuring to the last write asks 'how fast was it going
+    while it was alive?', which is the question that matters."""
+    from app.engines.watchdog import session_elapsed_s
+
+    if row.get("table") not in SPARSE_TABLES:
+        return stale_after_s
+    n = row.get("rows_today") or 0
+    last = _parse_ts(row.get("last_ts"))
+    if n < 2 or last is None:
+        return stale_after_s          # too little history to infer a cadence
+    elapsed = session_elapsed_s(segment, last)
+    if elapsed <= 0:
+        return stale_after_s
+    return max(stale_after_s, SPARSE_MULTIPLE * (elapsed / n))
+
+
 def stale_underlyings(rows: list, now: datetime, segments: dict,
                       fresh_tables: set,
                       stale_after_s: float = STALE_AFTER_S,
@@ -100,16 +146,33 @@ def stale_underlyings(rows: list, now: datetime, segments: dict,
     fresh from stock deep-dives, all four core underlyings frozen 90 minutes).
 
     A name that has NEVER been written (last_ts=None) is stale as soon as its
-    session is open past the grace period."""
+    session is open past the grace period.
+
+    THRESHOLDS ADAPT TO THE INSTRUMENT. A flat 15 minutes assumes every name
+    writes on a regular beat, and underlying_bars does not: a row only lands
+    when a 5-min candle COMPLETES, and a candle only completes when a tick
+    arrives in the next bucket. Big GOLD is thin — on 2026-08-03 it tripped
+    this twice in an hour and recovered in 14 and 3 minutes, which is what a
+    quiet contract looks like, not an outage (CRUDEOIL, same feed and same MCX
+    session but far more liquid, was never flagged). Judging it on a clock it
+    was never going to meet is how an alarm becomes noise, and this codebase
+    has already paid five days for an alarm nobody trusted.
+
+    So a name that has been writing every ~N seconds today is given
+    SPARSE_MULTIPLE x N before it counts as stale, never less than
+    `stale_after_s`. A genuinely dead sparse name still trips — its age keeps
+    growing past any threshold — just later, which for a 5-minute recorder is
+    the right trade."""
     out = []
     for row in rows:
         table, u = row.get("table"), row.get("underlying")
         if not u or table not in fresh_tables or not row.get("present", True):
             continue
-        if not session_open_for((segments.get(u) or "NSE",), now, grace_min):
+        seg = segments.get(u) or "NSE"
+        if not session_open_for((seg,), now, grace_min):
             continue
         age = _age_s(row.get("last_ts"), now)
-        if age is None or age > stale_after_s:
+        if age is None or age > _limit_s(row, seg, stale_after_s):
             out.append(f"{table}[{u}]")
     return sorted(out)
 
