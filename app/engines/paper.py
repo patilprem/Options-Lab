@@ -142,7 +142,12 @@ def _pos_from_dict(d: dict) -> Position:
 # far outside normal.
 CHAIN_STALL_CLIENT_S = 180.0      # 3 min  -> rebuild the client
 CHAIN_STALL_EXPIRY_S = 360.0      # 6 min  -> + refetch the expiry list
-CHAIN_STALL_ESCALATE_S = 540.0    # 9 min  -> give up and escalate
+CHAIN_STALL_ESCALATE_S = 540.0    # 9 min  -> escalate to a human
+CHAIN_STALL_RETRY_S = 600.0       # ...then re-apply BOTH remedies this often.
+# Stage 3 used to be terminal, and 2026-08-03 showed what that costs: NIFTY
+# recovered on a restart while BANKNIFTY/CRUDEOIL/GOLD stayed dead for another
+# half hour with every stage already actioned and no code left that would touch
+# them again. Escalating to a human is not a reason to stop trying.
 
 
 def chain_stall_stage(stalled_s: float,
@@ -236,6 +241,7 @@ class MarketHub:
         self._chain_moved_at: dict[str, datetime] = {}
         self._chain_watch_since: dict[str, datetime] = {}
         self._chain_heal_stage: dict[str, int] = {}
+        self._chain_retry_at: dict[str, datetime] = {}   # post-stage-3 retries
         self._margin_client = None            # lazy dhanhq client for real margin (M5)
         self._last_heal: Optional[datetime] = None   # feed self-heal cooldown
         # Gated index-futures companion (volume/OI for volumeless index spot):
@@ -1032,6 +1038,7 @@ class MarketHub:
                 continue
             self._chain_seen_fp[u] = fp
             self._chain_moved_at[u] = now
+            self._chain_retry_at.pop(u, None)
             if self._chain_heal_stage.pop(u, 0):
                 registry.record_event(
                     "info", "feed",
@@ -1069,20 +1076,51 @@ class MarketHub:
             since = max(self._chain_moved_at.get(u, self._chain_watch_since[u]),
                         self._chain_watch_since[u])
             stalled = (now - since).total_seconds()
-            stage = chain_stall_stage(stalled)
-            if stage <= self._chain_heal_stage.get(u, 0):
+            done = self._chain_heal_stage.get(u, 0)
+            # ONE STEP PER PASS. The stage follows elapsed time, so a pass that
+            # arrives late — a busy executor, a paused process, or a chain that
+            # recovered and re-froze between two ticks — would otherwise jump
+            # straight to "escalate to a human" without ever having tried the
+            # two remedies that actually fix things. Every remedy gets applied,
+            # and gets a minute to work, before the next one escalates.
+            stage = min(chain_stall_stage(stalled), done + 1)
+            mins = int(stalled // 60)
+            if stage == 0:
+                continue
+            if stage <= done:
+                # STAGE 3 IS NOT THE END OF THE STORY. It used to be: the
+                # ladder logged once and then sat there, remedies spent,
+                # trying nothing further. 2026-08-03 showed what that costs —
+                # NIFTY recovered on a restart while BANKNIFTY/CRUDEOIL/GOLD
+                # stayed dead for another half hour with every stage already
+                # actioned and no code left that would touch them. A stall
+                # that outlives the ladder gets both remedies re-applied on a
+                # slow clock until the cache moves or the session closes.
+                if done < 3:
+                    continue
+                last = self._chain_retry_at.get(u)
+                if last is not None and \
+                        (now - last).total_seconds() < CHAIN_STALL_RETRY_S:
+                    continue
+                self._chain_retry_at[u] = now
+                self._rearm_chain_remedies(u)
+                actioned.append((u, done))
+                registry.record_event(
+                    "warn", "feed",
+                    f"chain STILL dead [{u}] {mins}min — retrying both "
+                    f"remedies (client rebuild + expiry refetch), every "
+                    f"{int(CHAIN_STALL_RETRY_S // 60)}min until it moves or "
+                    f"the session closes; {self._chain_detail(u)}")
                 continue
             self._chain_heal_stage[u] = stage
             actioned.append((u, stage))
-            mins = int(stalled // 60)
-            # Any heal attempt also clears the no-op log throttle for this
-            # name, so whatever reason the next poll hits is logged
-            # immediately instead of being swallowed for up to 5 more minutes.
-            # The whole point of acting is to learn what happens next.
             if stage < 3:
+                # Any heal attempt also clears the no-op log throttle for this
+                # name, so whatever reason the next poll hits is logged
+                # immediately instead of being swallowed for up to 5 more
+                # minutes. The point of acting is to learn what happens next.
                 self._chain_client_dirty = True
-                for key in [k for k in self._noop_warned if k[0] == u]:
-                    self._noop_warned.pop(key, None)
+                self._clear_noop_throttle(u)
             if stage == 1:
                 registry.record_event(
                     "warn", "feed",
@@ -1090,36 +1128,75 @@ class MarketHub:
                     f"rebuilding the Dhan client (a rotated token leaves a "
                     f"live-looking client that answers nothing)")
             elif stage == 2:
-                self._expiries_cache.pop(u, None)
-                self._expiries_fail.pop(u, None)
-                self._expiry_warned.discard(u)
+                self._drop_expiries(u)
                 registry.record_event(
                     "warn", "feed",
                     f"chain stalled [{u}] {mins}min — the client rebuild did "
                     f"not help; dropping the cached expiry list so the next "
                     f"poll refetches it")
             else:
-                registry.record_event(
-                    *self._chain_dead_event(u, mins, now))
+                self._chain_retry_at[u] = now
+                lvl, src, msg = self._chain_dead_event(u, mins, now)
+                registry.record_event(lvl, src, msg)
+                # PUSH THE DIAGNOSIS, don't just file it. Six incidents have
+                # now ended with a "NOT RECORDING" push whose only next step
+                # was an SSH session, by which time the evidence had aged out.
+                # A SELECTIVE failure (other chains still moving) is worth a
+                # phone alert carrying the security id, segment and expiry
+                # list; a market-wide freeze is far more likely a holiday and
+                # stays in the log where it belongs.
+                if lvl == "error":
+                    self._push_chain_alert(msg)
         return actioned
+
+    def _clear_noop_throttle(self, u: str) -> None:
+        for key in [k for k in self._noop_warned if k[0] == u]:
+            self._noop_warned.pop(key, None)
+
+    def _drop_expiries(self, u: str) -> None:
+        self._expiries_cache.pop(u, None)
+        self._expiries_fail.pop(u, None)
+        self._expiry_warned.discard(u)
+
+    def _rearm_chain_remedies(self, u: str) -> None:
+        """Both remedies at once, for a stall that has outlived the ladder."""
+        self._chain_client_dirty = True
+        self._clear_noop_throttle(u)
+        self._drop_expiries(u)
+
+    def _push_chain_alert(self, message: str) -> None:
+        """Best-effort ntfy push. Never raises: a failed push must not take
+        down the watchdog loop that was trying to report a failure."""
+        try:
+            from app.engines.watchdog import push_ntfy
+            push_ntfy(message, "chain-dead")
+        except Exception as e:
+            registry.record_event("warn", "feed",
+                                  f"chain alert push failed: {e!r}")
+
+    def _chain_detail(self, u: str) -> str:
+        """What a human needs to diagnose one dead chain, in one line.
+
+        Every previous occurrence ended with someone on the VPS reconstructing
+        which security id, segment and expiry list were in play after the
+        evidence had aged out. Put them in the message."""
+        cfg = UNDERLYINGS.get(u)
+        if not cfg:
+            return ("no entry in UNDERLYINGS — nothing was ever polled for "
+                    "it (an MCX contract that never resolved?)")
+        cached = self._expiries_cache.get(u)
+        return (f"sid={cfg.get('security_id')} seg={cfg.get('segment')} "
+                f"targets={self.CHAIN_TARGETS} "
+                f"expiries={(cached[1] if cached else None)!r} "
+                f"cached_quotes={len(self._chain_cache.get(u) or {})}")
 
     def _chain_dead_event(self, u: str, mins: int, now: datetime) -> tuple:
         """(level, source, message) for a chain that survived both remedies.
 
-        Split out because getting this message RIGHT is the whole value of the
-        stage: every previous occurrence ended with someone on the VPS
-        reconstructing which security id, segment and expiry list were in play
-        after the evidence had aged out. Put them in the line."""
-        cfg = UNDERLYINGS.get(u)
-        if not cfg:
-            detail = ("no entry in UNDERLYINGS — nothing was ever polled for "
-                      "it (an MCX contract that never resolved?)")
-        else:
-            cached = self._expiries_cache.get(u)
-            detail = (f"sid={cfg.get('security_id')} seg={cfg.get('segment')} "
-                      f"targets={self.CHAIN_TARGETS} "
-                      f"expiries={(cached[1] if cached else None)!r} "
-                      f"cached_quotes={len(self._chain_cache.get(u) or {})}")
+        The level is the whole judgement: this is what decides whether a phone
+        alert goes out, so it must separate a real selective fault from a
+        holiday without a holiday calendar."""
+        detail = self._chain_detail(u)
         # Is anything ELSE moving? A stock deep-dive still ticking proves the
         # market is open and the token is good, which makes this a selective
         # failure worth waking someone for. Nothing moving anywhere is far
