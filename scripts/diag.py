@@ -163,9 +163,25 @@ def main() -> int:
 
     # -- events: today's warn/error (SPACE-separator-safe filter) ------------
     section("today's warn/error events")
+    ev_tmp = None
     try:
         import sqlite3
-        db = sqlite3.connect(os.path.join(ROOT, "optionslab.db"))
+        # NOT a bare connect(): the DB is in WAL mode, so SQLite wants to write
+        # the -shm/-wal sidecars even to READ, and a plain connect as anyone
+        # but the service user dies with "attempt to write a readonly
+        # database" — taking this whole section, and everything after it, with
+        # it (2026-08-03, running as `ubuntu`). Copy first, same as the DuckDB
+        # handling above; fall back to an immutable read-only URI.
+        src = os.path.join(ROOT, "optionslab.db")
+        try:
+            ev_tmp = tempfile.mkdtemp(prefix="olab-diag-ev-")
+            for f in glob.glob(src + "*"):
+                shutil.copy(f, ev_tmp)
+            db = sqlite3.connect(os.path.join(ev_tmp, "optionslab.db"))
+        except Exception:
+            shutil.rmtree(ev_tmp, ignore_errors=True)
+            ev_tmp = None
+            db = sqlite3.connect(f"file:{src}?immutable=1", uri=True)
         day = now.strftime("%Y-%m-%d")
         rows = db.execute(
             "SELECT ts, level, kind, message FROM events "
@@ -196,6 +212,10 @@ def main() -> int:
         db.close()
     except Exception as e:
         print(f"  (skipped: {e!r})")
+        flag(f"could not read the events log: {e!r}")
+    finally:
+        if ev_tmp:
+            shutil.rmtree(ev_tmp, ignore_errors=True)
 
     # -- books ---------------------------------------------------------------
     section("positions")
