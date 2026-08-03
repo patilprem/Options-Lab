@@ -316,6 +316,16 @@ Flip live on only via /live/settings ON the VPS. (a) and (b) verified
 2026-07-27/28. For any "is it healthy?" question run `scripts/diag.py` on the
 VPS — one command: sha, service, token, per-table + per-underlying freshness,
 scanner cadence/scores, warn/error tail, RED-flag verdict.
+For "why is THIS chain not recording?" run `scripts/chain_probe.py` instead:
+per-underlying freshness across BOTH chain tables (plus who else is keeping the
+table warm), the self-heal ladder's timeline and every chain no-op printed IN
+FULL (diag truncates at 70 chars, cutting off `raw_response=` exactly where it
+matters), and with `--probe` it calls Dhan directly — expiry_list then
+option_chain for the nearest expiry — printing the raw response. That last part
+is the answer six incidents never captured. `--probe` uses its own client, so
+its requests are OUTSIDE MarketHub's 3s gate and count against the same
+per-account budget: it spaces them 5s and takes `--names` to probe only the
+dark ones.
 - Index-futures VOLUME companion (engines/feed.py + paper.py, gated behind the
   `index_futures_volume` setting, default OFF). VERIFIED against the installed
   dhanhq SDK: feed-mode/segment ints (Ticker15/Full21/IDX0/NSE_FNO2/BSE_FNO8),
