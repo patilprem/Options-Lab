@@ -450,3 +450,54 @@ def test_the_poll_loop_drops_its_client_when_asked():
     out = asyncio.run(hub._poll_cycle("stale-client", None, 0, set()))
     assert out is None
     assert hub._chain_client_dirty is False
+
+
+# --- cross-thread safety ----------------------------------------------------
+#
+# _chain_stall_step runs in an EXECUTOR THREAD (the watchdog loop hands it off)
+# while _poll_one_chain updates the same dicts on the event loop. An unguarded
+# read raises "dictionary changed size during iteration" — which would abort
+# not just the heal but the recording watchdog that runs after it in the same
+# try. This codebase has already been bitten three times by exactly this shape.
+
+class _RacyDict(dict):
+    """Raises on the first iteration, then behaves — a mutation landing mid-read."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.raised = False
+
+    def __iter__(self):
+        if not self.raised:
+            self.raised = True
+            raise RuntimeError("dictionary changed size during iteration")
+        return super().__iter__()
+
+
+def test_a_racing_chain_cache_does_not_abort_the_pass():
+    hub = _hub(tick_age=1.0)
+    hub._chain_cache = _RacyDict({"NIFTY": {("WEEKLY", 0, 0, "CE"): _Q(100.0)}})
+    hub._chain_stall_step(OPEN, ["NIFTY"])          # must not raise
+    assert hub._chain_cache.raised
+
+
+def test_a_racing_quote_dict_only_skips_that_name():
+    """The inner read races too: _chain_fingerprint sums a name's quotes while
+    _poll_one_chain is calling .update() on the very same dict."""
+    hub = _hub(tick_age=1.0)
+    hub._chain_cache = {"NIFTY": _RacyDict({("WEEKLY", 0, 0, "CE"): _Q(100.0)}),
+                        "BANKNIFTY": {("WEEKLY", 0, 0, "CE"): _Q(50.0)}}
+    hub._chain_stall_step(OPEN, ["NIFTY", "BANKNIFTY"])
+    # BANKNIFTY still got its fingerprint recorded despite NIFTY racing
+    assert "BANKNIFTY" in hub._chain_seen_fp
+
+
+def test_a_racing_noop_throttle_does_not_abort_the_heal():
+    hub = _hub(tick_age=1.0)
+    hub._chain_cache = {"NIFTY": {("WEEKLY", 0, 0, "CE"): _Q(100.0)}}
+    hub._noop_warned = _RacyDict({("NIFTY", "fetch[WEEKLY+0]"): 1.0})
+    hub._chain_stall_step(OPEN, ["NIFTY"])
+    out = hub._chain_stall_step(
+        OPEN + timedelta(seconds=CHAIN_STALL_CLIENT_S), ["NIFTY"])
+    assert out == [("NIFTY", 1)]                  # stage 1 still actioned
+    assert hub._chain_client_dirty is True        # and the remedy still applied

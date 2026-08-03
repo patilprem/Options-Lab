@@ -1064,8 +1064,22 @@ class MarketHub:
         and Dhan is answering, which is what separates "these four names are
         broken" from "it's a holiday". Movement also clears the heal stage, so
         recovery re-arms the whole escalation for a future episode."""
-        for u in list(self._chain_cache):
-            fp = self._chain_fingerprint(u)
+        # This runs in an EXECUTOR THREAD (the watchdog loop hands it off), while
+        # _poll_one_chain updates _chain_cache on the event loop. Both the outer
+        # copy and _chain_fingerprint's pass over a name's quotes can therefore
+        # hit "dictionary changed size during iteration". Skipping a name for
+        # one 60-second pass costs nothing; raising would abort the whole heal
+        # AND the recording watchdog below it, which is how a safety net turns
+        # into a liability.
+        try:
+            names = list(self._chain_cache)
+        except RuntimeError:
+            return
+        for u in names:
+            try:
+                fp = self._chain_fingerprint(u)
+            except RuntimeError:          # updated mid-read; catch it next pass
+                continue
             if fp is None or self._chain_seen_fp.get(u) == fp:
                 continue
             self._chain_seen_fp[u] = fp
@@ -1182,7 +1196,13 @@ class MarketHub:
         return actioned
 
     def _clear_noop_throttle(self, u: str) -> None:
-        for key in [k for k in self._noop_warned if k[0] == u]:
+        # Same cross-thread hazard as _note_chain_movement: the poll loop
+        # inserts into _noop_warned while this executor thread reads it.
+        try:
+            keys = [k for k in self._noop_warned if k[0] == u]
+        except RuntimeError:
+            return                        # throttle survives one more cycle
+        for key in keys:
             self._noop_warned.pop(key, None)
 
     def _drop_expiries(self, u: str) -> None:
