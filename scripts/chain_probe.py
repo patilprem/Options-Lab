@@ -169,14 +169,42 @@ def show_recording(now, names) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def open_events_db():
+    """(connection, tempdir) for the events DB, WITHOUT needing write access.
+
+    A plain sqlite3.connect() fails with "attempt to write a readonly
+    database" when you are not the user the service runs as: the DB is in WAL
+    mode, and SQLite wants to create/modify the -shm and -wal sidecars even to
+    READ. Observed on the VPS running as `ubuntu` against the service-owned
+    file — and scripts/diag.py has always had the same hole, it just happened
+    to be run as a user who could write.
+
+    So copy it first, exactly as diag.py already does for DuckDB's writer
+    lock, and fall back to an immutable read-only URI if even the copy is not
+    possible. Reading a diagnostic log must never require write permission on
+    production state."""
+    src = os.path.join(ROOT, "optionslab.db")
+    tmp = tempfile.mkdtemp(prefix="olab-events-")
+    try:
+        for f in glob.glob(src + "*"):        # .db, -wal, -shm
+            shutil.copy(f, tmp)
+        return sqlite3.connect(os.path.join(tmp, "optionslab.db")), tmp
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # immutable=1 tells SQLite the file cannot change, so it skips the WAL
+    # sidecars entirely. Safe here precisely because we only ever read.
+    return sqlite3.connect(f"file:{src}?immutable=1", uri=True), None
+
+
 def show_events(now, limit: int) -> None:
     """The self-heal ladder's own account of itself, plus every chain no-op —
     UNTRUNCATED. The `empty-failure-detail ... raw_response=` line is the
     single most valuable thing in this whole script."""
     section("chain events today (full text, oldest first)")
     day = now.strftime("%Y-%m-%d")
+    tmp = None
     try:
-        db = sqlite3.connect(os.path.join(ROOT, "optionslab.db"))
+        db, tmp = open_events_db()
         where = " OR ".join("message LIKE ?" for _ in CHAIN_EVENT_LIKES)
         rows = db.execute(
             f"SELECT ts, level, message FROM events "                    # noqa: S608
@@ -199,6 +227,9 @@ def show_events(now, limit: int) -> None:
     except Exception as e:
         print(f"  (skipped: {e!r})")
         flag(f"could not read the events log: {e!r}")
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --- what Dhan says ---------------------------------------------------------
