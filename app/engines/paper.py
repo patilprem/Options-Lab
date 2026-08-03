@@ -108,6 +108,63 @@ def _pos_from_dict(d: dict) -> Position:
         mfe=d.get("mfe", 0.0), mae=d.get("mae", 0.0))
 
 
+# --- chain-cache stall self-heal -------------------------------------------
+# The chain poller has now frozen SIX times (2026-07-23..27, 07-28, 07-29,
+# 07-30, 07-31, 08-03) and every fix so far only made it more visible: a
+# top-level guard so the task can't die, no-op logging, raw-response logging,
+# a per-underlying watchdog push. None of them RECOVER anything. The 08-03
+# outage looked exactly like 07-30 — poll loop alive, every cycle completing
+# in ~20s (only the four recorder names are in _chain_only, so a cycle is 4-8
+# requests), requests going out, nothing coming back, cache frozen.
+#
+# Meanwhile the FEED has had a self-heal since 07-27 (MarketHub.self_heal_feed,
+# driven by feed_broken in _watchdog_loop) precisely because "a silent socket
+# won't fix itself". A silent chain poller doesn't either, and the two remedies
+# a human applies are already in the code, just never triggered automatically:
+#
+#   stage 1 — REBUILD THE DHAN CLIENT. Proven cause 2026-07-13: after the 24h
+#     token rotated, a keyword-gated rebuild kept a dead client all session and
+#     the cache froze at Friday's prices. _poll_cycle only rebuilds on a RAISED
+#     exception, and the sustained failure mode (DhanEmptyFailure) is swallowed
+#     by _fetch_chain_ratelimited by design — so the one path that has actually
+#     killed a session is the one path that never rebuilds.
+#   stage 2 — DROP THE CACHED EXPIRY LIST. Proven cause 2026-07-23..27: a bad
+#     expiry list makes every subsequent poll a no-op over an empty target set.
+#   stage 3 — ESCALATE. If neither worked it is not ours to fix, so say so
+#     LOUDLY (error, not warn) with the security id, segment and expiry list in
+#     the message, ~6 minutes BEFORE the 15-minute watchdog push — so the phone
+#     alert arrives with the diagnosis already sitting in the log instead of
+#     sending someone to the VPS to start from scratch.
+#
+# Thresholds are in wall-clock seconds of NO CACHE MOVEMENT while the name's
+# session is open. Generous vs. the ~20s poll cycle: a healthy chain moves
+# every cycle, so three minutes of stillness during live trading is already
+# far outside normal.
+CHAIN_STALL_CLIENT_S = 180.0      # 3 min  -> rebuild the client
+CHAIN_STALL_EXPIRY_S = 360.0      # 6 min  -> + refetch the expiry list
+CHAIN_STALL_ESCALATE_S = 540.0    # 9 min  -> give up and escalate
+
+
+def chain_stall_stage(stalled_s: float,
+                      client_s: float = CHAIN_STALL_CLIENT_S,
+                      expiry_s: float = CHAIN_STALL_EXPIRY_S,
+                      escalate_s: float = CHAIN_STALL_ESCALATE_S) -> int:
+    """How far to escalate for a chain cache stalled `stalled_s` seconds.
+
+    Pure. 0 = healthy, 1 = rebuild the client, 2 = also refetch expiries,
+    3 = both failed, escalate to a human. Stages are cumulative and only ever
+    advance within one stall episode (the caller remembers what it has already
+    actioned), so a name that stays dark all day costs three log lines, not one
+    per minute."""
+    if stalled_s >= escalate_s:
+        return 3
+    if stalled_s >= expiry_s:
+        return 2
+    if stalled_s >= client_s:
+        return 1
+    return 0
+
+
 class MarketHub:
     """Single source of live data shared by all strategies.
 
@@ -129,6 +186,12 @@ class MarketHub:
     # fetch yields every strike_offset for that expiry.
     RECORD_INTERVAL = 5       # timeframe built for recorder-only (chain-only)
                               # names so their spot/futures history persists
+    # Set by the stall self-heal, consumed (and cleared) by _poll_cycle, which
+    # owns the chain client's lifetime. A CLASS attribute so the flag has a safe
+    # default on any hub — including the MarketHub.__new__ stand-ins several
+    # tests build to exercise the poll loop without a store or an event loop.
+    _chain_client_dirty = False
+
     CHAIN_TARGETS = (("WEEKLY", 0), ("WEEKLY", 1))
     CHAIN_MIN_INTERVAL = 3.0  # Dhan option-chain rate limit: 1 req / 3 s
     # Requests share one global 3s gate, so every extra (underlying, expiry)
@@ -164,6 +227,15 @@ class MarketHub:
         self._chain_only: set[str] = set()   # polled for snapshots, no strategy (MCX recorder)
         self._chain_gate = asyncio.Lock()
         self._last_chain_ts = 0.0
+        # Chain-cache stall self-heal (see chain_stall_stage). _chain_seen_fp /
+        # _chain_moved_at track when each underlying's cache last actually
+        # MOVED — deliberately separate from _chain_persisted_fp, which the
+        # recorder owns and only advances on a successful WRITE, so it can't
+        # tell "the poller is dead" from "the recorder hasn't run yet".
+        self._chain_seen_fp: dict[str, tuple] = {}
+        self._chain_moved_at: dict[str, datetime] = {}
+        self._chain_watch_since: dict[str, datetime] = {}
+        self._chain_heal_stage: dict[str, int] = {}
         self._margin_client = None            # lazy dhanhq client for real margin (M5)
         self._last_heal: Optional[datetime] = None   # feed self-heal cooldown
         # Gated index-futures companion (volume/OI for volumeless index spot):
@@ -324,6 +396,17 @@ class MarketHub:
                 else:
                     self._last_heal = None      # healthy again → reset cooldown
 
+                names = await loop.run_in_executor(
+                    None, rec_wd_mod.recorded_underlyings)
+
+                # CHAIN SELF-HEAL: the recording watchdog below pushes at 15
+                # minutes; this tries to fix it at 3, 6 and 9 — and if it
+                # can't, escalates with the details so the 15-minute push
+                # isn't the first anyone hears of it. See chain_stall_stage.
+                await loop.run_in_executor(
+                    None, self._chain_stall_step, now,
+                    sorted(set(names) | set(self._wanted)))
+
                 # Recorders: are rows actually landing? Independent of the
                 # feed's health — see this method's docstring.
                 if hasattr(self.store, "recording_health"):
@@ -332,8 +415,6 @@ class MarketHub:
                     # Per-underlying too: a table-level check cannot see the
                     # core index/commodity names going dark while the scanner
                     # keeps chain_snapshots warm with stock deep-dives.
-                    names = await loop.run_in_executor(
-                        None, rec_wd_mod.recorded_underlyings)
                     urows = await loop.run_in_executor(
                         None, self.store.recording_underlying_health, names)
                     segs = {u: rec_wd_mod.segment_for(u) for u in names}
@@ -650,6 +731,13 @@ class MarketHub:
         sets the scanner mutates concurrently. Returns the client to reuse
         (None when it needs rebuilding)."""
         from app.data import dhan_client
+        if self._chain_client_dirty:
+            # The stall self-heal asked for a fresh client. It can't just
+            # reassign one — the client is a local threaded through this loop —
+            # so it raises a flag and we honour it here, at the one place that
+            # owns the client's lifetime.
+            self._chain_client_dirty = False
+            client = None
         for u in self._chain_order():
             cfg = UNDERLYINGS.get(u)
             if not cfg:
@@ -927,6 +1015,127 @@ class MarketHub:
             fp = self._chain_fingerprint(u)
             if fp is not None:
                 self._chain_persisted_fp[u] = fp
+
+    # -- chain-cache stall self-heal -----------------------------------------
+
+    def _note_chain_movement(self, now: datetime) -> None:
+        """Stamp, per underlying, the last time its cached chain CHANGED.
+
+        Covers every name in the cache — stock deep-dives included — because a
+        stock chain that is still moving is the proof that the market is live
+        and Dhan is answering, which is what separates "these four names are
+        broken" from "it's a holiday". Movement also clears the heal stage, so
+        recovery re-arms the whole escalation for a future episode."""
+        for u in list(self._chain_cache):
+            fp = self._chain_fingerprint(u)
+            if fp is None or self._chain_seen_fp.get(u) == fp:
+                continue
+            self._chain_seen_fp[u] = fp
+            self._chain_moved_at[u] = now
+            if self._chain_heal_stage.pop(u, 0):
+                registry.record_event(
+                    "info", "feed",
+                    f"chain RECOVERED [{u}] — cache moving again")
+
+    def _chain_stall_step(self, now: datetime, watch: list) -> list:
+        """One pass of the stall self-heal. Returns the (underlying, stage)
+        pairs actioned this pass — for tests and for the caller's log.
+
+        `watch` is the names we're responsible for keeping fresh (the
+        recorder's list plus any deployed strategy underlying), passed in so
+        the settings read stays off the event loop in the caller.
+
+        Synchronous and side-effect-only on hub state + the events log: the
+        actual remedies are a flag the poll loop reads and a dict the poll loop
+        refills, so nothing here can block or reorder a fetch in flight."""
+        from app.engines.recording_watchdog import segment_for
+        from app.engines.watchdog import session_open_for
+        self._note_chain_movement(now)
+        actioned = []
+        for u in watch:
+            if not session_open_for((segment_for(u),), now):
+                # Closed session: forget the episode entirely, or tomorrow's
+                # first pass would see an overnight-sized stall and escalate
+                # straight to stage 3 before a single poll had run.
+                self._chain_watch_since.pop(u, None)
+                self._chain_moved_at.pop(u, None)
+                self._chain_heal_stage.pop(u, None)
+                continue
+            self._chain_watch_since.setdefault(u, now)
+            # max(), not `or`: the stall clock can never predate the moment we
+            # started watching. A restart mid-session, or a reopen after the
+            # overnight reset, must give the poller the full ladder from
+            # scratch rather than judging it on a stamp from the last session.
+            since = max(self._chain_moved_at.get(u, self._chain_watch_since[u]),
+                        self._chain_watch_since[u])
+            stalled = (now - since).total_seconds()
+            stage = chain_stall_stage(stalled)
+            if stage <= self._chain_heal_stage.get(u, 0):
+                continue
+            self._chain_heal_stage[u] = stage
+            actioned.append((u, stage))
+            mins = int(stalled // 60)
+            # Any heal attempt also clears the no-op log throttle for this
+            # name, so whatever reason the next poll hits is logged
+            # immediately instead of being swallowed for up to 5 more minutes.
+            # The whole point of acting is to learn what happens next.
+            if stage < 3:
+                self._chain_client_dirty = True
+                for key in [k for k in self._noop_warned if k[0] == u]:
+                    self._noop_warned.pop(key, None)
+            if stage == 1:
+                registry.record_event(
+                    "warn", "feed",
+                    f"chain stalled [{u}] {mins}min with the session open — "
+                    f"rebuilding the Dhan client (a rotated token leaves a "
+                    f"live-looking client that answers nothing)")
+            elif stage == 2:
+                self._expiries_cache.pop(u, None)
+                self._expiries_fail.pop(u, None)
+                self._expiry_warned.discard(u)
+                registry.record_event(
+                    "warn", "feed",
+                    f"chain stalled [{u}] {mins}min — the client rebuild did "
+                    f"not help; dropping the cached expiry list so the next "
+                    f"poll refetches it")
+            else:
+                registry.record_event(
+                    *self._chain_dead_event(u, mins, now))
+        return actioned
+
+    def _chain_dead_event(self, u: str, mins: int, now: datetime) -> tuple:
+        """(level, source, message) for a chain that survived both remedies.
+
+        Split out because getting this message RIGHT is the whole value of the
+        stage: every previous occurrence ended with someone on the VPS
+        reconstructing which security id, segment and expiry list were in play
+        after the evidence had aged out. Put them in the line."""
+        cfg = UNDERLYINGS.get(u)
+        if not cfg:
+            detail = ("no entry in UNDERLYINGS — nothing was ever polled for "
+                      "it (an MCX contract that never resolved?)")
+        else:
+            cached = self._expiries_cache.get(u)
+            detail = (f"sid={cfg.get('security_id')} seg={cfg.get('segment')} "
+                      f"targets={self.CHAIN_TARGETS} "
+                      f"expiries={(cached[1] if cached else None)!r} "
+                      f"cached_quotes={len(self._chain_cache.get(u) or {})}")
+        # Is anything ELSE moving? A stock deep-dive still ticking proves the
+        # market is open and the token is good, which makes this a selective
+        # failure worth waking someone for. Nothing moving anywhere is far
+        # more likely a holiday than four simultaneous per-symbol faults.
+        others = [t for u2, t in self._chain_moved_at.items() if u2 != u]
+        live = any((now - t).total_seconds() < CHAIN_STALL_CLIENT_S
+                   for t in others)
+        if live:
+            return ("error", "feed",
+                    f"chain DEAD [{u}] {mins}min — client rebuild AND expiry "
+                    f"refetch both failed while OTHER chains are still moving, "
+                    f"so this is selective, not a market-wide freeze; {detail}")
+        return ("warn", "feed",
+                f"chain DEAD [{u}] {mins}min — client rebuild AND expiry "
+                f"refetch both failed, and NO chain is moving anywhere "
+                f"(holiday, dead token, or a Dhan-side outage); {detail}")
 
     def persist_chain_full(self, store, underlyings=None,
                            max_age_s: float = 600.0) -> int:
