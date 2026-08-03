@@ -139,16 +139,30 @@ off-hours window; genuinely urgent fixes get the marker.
   hour with every stage spent and nothing left that would touch them. The
   ladder advances ONE step per pass, so a late pass can never escalate to a
   human without having tried the remedies first.
-  NOTE for the next occurrence: 08-03's selective failure (NIFTY fine, the
-  other three dead) rules out client/token/holiday/market-wide outage — all
-  four share those. The exact surviving correlation is that NIFTY is the only
-  one of the four with a REAL weekly expiry cycle, while `CHAIN_TARGETS` asks
-  every core name for `("WEEKLY", 0/1)`; BANKNIFTY's weeklies were discontinued
-  by NSE and MCX options are monthly-only. Unverified as the cause (offset 0
-  resolves to the nearest expiry either way, so the REQUEST is identical), but
-  it is the one property that separates the survivor from the casualties, and
-  the mislabeling is a real data bug regardless: those three cache and persist
-  their MONTHLY chains under `expiry_kind="WEEKLY"`.
+  ROOT CAUSE, CONFIRMED 08-03 (supersedes the earlier "selective failure /
+  monthly-only expiry" theory, which the full event log refutes — 08-03 only
+  LOOKED selective because NIFTY's last success fell inside the 15-min alert
+  window): the DHAN CLIENT GOES BAD and every option_chain call then returns
+  `{'status':'failure','remarks':{all None},'data':''}` for EVERY underlying
+  and EVERY expiry — NIFTY 08-04+08-11, BANKNIFTY 08-25, CRUDEOIL 08-17, GOLD
+  08-31, 90 minutes straight — while ticks keep flowing and underlying_bars
+  keeps writing. It never self-recovers. A process restart fixed all four at
+  once; later the same day an automatic stage-1 client rebuild fixed GOLD in
+  60s. `_poll_cycle` DID always have a rebuild path, but only on a RAISED
+  exception, and `_fetch_chain_ratelimited` swallows DhanEmptyFailure by
+  design — so the one failure mode that actually kills a session was the one
+  that never triggered a rebuild. That is exactly what stage 1 now fixes.
+  Corollary: the holiday discriminator must NOT be "is another chain moving?"
+  (that would have silenced this outage). A holiday still SERVES a frozen
+  chain — fetches succeed, the cache just stops changing — so what a holiday
+  looks like from here is a SILENT FEED. `_chain_dead_event` judges on
+  `feed_status()['tick_age_sec']` first.
+  Separately and still open: `CHAIN_TARGETS` asks every core name for
+  `("WEEKLY", 0/1)`, but BANKNIFTY's weeklies were discontinued by NSE and MCX
+  options are monthly-only, so those three cache and persist their MONTHLY
+  chains under `expiry_kind="WEEKLY"` and never record a second expiry at all
+  (the WEEKLY+1 guard skips it). A data-labelling bug, unrelated to the
+  outage — do not conflate the two again.
 - `app/engines/risk.py` — M7 risk panel: pure `evaluate()` (portfolio max daily
   loss + per-strategy caps from settings), `exposure()` by underlying/expiry,
   `snapshot()` (margin utilization, day P&L vs max-loss). PaperRunner.enforce_risk

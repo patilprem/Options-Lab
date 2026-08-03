@@ -1212,22 +1212,42 @@ class MarketHub:
         alert goes out, so it must separate a real selective fault from a
         holiday without a holiday calendar."""
         detail = self._chain_detail(u)
-        # Is anything ELSE moving? A stock deep-dive still ticking proves the
-        # market is open and the token is good, which makes this a selective
-        # failure worth waking someone for. Nothing moving anywhere is far
-        # more likely a holiday than four simultaneous per-symbol faults.
-        others = [t for u2, t in self._chain_moved_at.items() if u2 != u]
-        live = any((now - t).total_seconds() < CHAIN_STALL_CLIENT_S
-                   for t in others)
-        if live:
+        # IS THE MARKET ACTUALLY LIVE? Two independent proofs, and the FEED is
+        # the one that matters.
+        #
+        # This started as "is another chain moving?", on the theory that a
+        # total freeze is more likely a holiday than four simultaneous
+        # per-symbol faults. The 2026-08-03 log killed that theory: for 90
+        # minutes every underlying AND every expiry came back
+        # {'status':'failure','remarks':{all None},'data':''} — NIFTY 08-04 and
+        # 08-11, BANKNIFTY 08-25, CRUDEOIL 08-17, GOLD 08-31 — while ticks kept
+        # flowing and underlying_bars kept writing. Nothing was moving anywhere
+        # and it was not remotely a holiday. Judging that case by other chains
+        # alone would have downgraded the single loudest outage of the day to a
+        # silent `warn`.
+        #
+        # A holiday is distinguishable without a calendar: Dhan still SERVES a
+        # frozen chain, so fetches succeed and the cache simply stops changing.
+        # A dead feed is what a holiday actually looks like from here. So a
+        # fresh tick is positive evidence that the market is open and our
+        # credentials are good, which makes a dead chain a real fault.
+        tick_age = (self.feed_status() or {}).get("tick_age_sec")
+        feed_live = tick_age is not None and tick_age < CHAIN_STALL_CLIENT_S
+        others_live = any(
+            (now - t).total_seconds() < CHAIN_STALL_CLIENT_S
+            for u2, t in self._chain_moved_at.items() if u2 != u)
+        if feed_live or others_live:
+            why = ("ticks are still arriving" if feed_live
+                   else "OTHER chains are still moving")
             return ("error", "feed",
                     f"chain DEAD [{u}] {mins}min — client rebuild AND expiry "
-                    f"refetch both failed while OTHER chains are still moving, "
-                    f"so this is selective, not a market-wide freeze; {detail}")
+                    f"refetch both failed while {why}, so the market is live "
+                    f"and this is a real fault; {detail}")
         return ("warn", "feed",
                 f"chain DEAD [{u}] {mins}min — client rebuild AND expiry "
-                f"refetch both failed, and NO chain is moving anywhere "
-                f"(holiday, dead token, or a Dhan-side outage); {detail}")
+                f"refetch both failed, and the feed is silent too "
+                f"(tick_age={tick_age}) — most likely a holiday or a closed "
+                f"session rather than a per-symbol fault; {detail}")
 
     def persist_chain_full(self, store, underlyings=None,
                            max_age_s: float = 600.0) -> int:

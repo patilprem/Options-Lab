@@ -17,14 +17,27 @@ two remedies that have actually resolved past incidents (rebuild the client,
 drop the cached expiry list) before the 15-minute push, and escalating with
 the security id / segment / expiry list in the line when neither works.
 
-12:34 the same day sharpened it: NIFTY had come back on the restart while
-BANKNIFTY, CRUDEOIL and GOLD stayed dead — a SELECTIVE failure, which rules
-out the client, the token, a holiday and a market-wide outage, since all four
-share every one of those. Two things that first pass got wrong follow from it:
-stage 3 was terminal, so three names sat there with every remedy spent and no
-code left that would touch them again; and the diagnosis went only to the
-events log, i.e. behind an SSH session, which is why six incidents in a row
-were reconstructed after the evidence had aged out.
+12:34 the same day LOOKED selective — NIFTY back, the other three still dead —
+and that reading was wrong. The full event log settles it: for 90 minutes EVERY
+underlying and EVERY expiry came back
+
+    {'status': 'failure', 'remarks': {'error_code': None, 'error_type': None,
+     'error_message': None}, 'data': ''}
+
+— NIFTY 08-04 and 08-11, BANKNIFTY 08-25, CRUDEOIL 08-17, GOLD 08-31 — while
+ticks kept flowing and underlying_bars kept writing. NIFTY was only missing
+from that alert because its last success happened to fall inside the 15-minute
+window; it was failing too. A process restart fixed all four at once, and later
+that day an automatic client rebuild fixed GOLD in 60 seconds. The failure is a
+poisoned Dhan client, not a per-symbol data problem, and the pre-existing
+rebuild path never fired because DhanEmptyFailure is swallowed before it can
+raise.
+
+That also refutes the first version of the holiday discriminator, which asked
+"is another chain moving?" and would have downgraded the loudest outage of the
+day to a silent warn. A holiday still SERVES a frozen chain, so fetches succeed
+and the cache merely stops changing; what a holiday actually looks like from
+here is a silent FEED. A fresh tick is positive evidence the market is open.
 
 These tests pin the escalation ladder, one step per pass, the slow remedy
 retry that outlives the ladder, the phone push for a selective failure, the
@@ -44,8 +57,12 @@ OPEN = datetime(2026, 8, 3, 12, 5)
 CLOSED = datetime(2026, 8, 3, 3, 0)
 
 
-def _hub():
+def _hub(tick_age=None):
+    """tick_age: seconds since the last feed tick, as feed_status() reports it.
+    None = no feed / no tick, which is what a holiday looks like from here."""
     hub = MarketHub.__new__(MarketHub)
+    hub.feed_status = lambda: {"mode": "live", "connected": True,
+                               "tick_age_sec": tick_age}
     hub._wanted = {}
     hub._chain_only = {"NIFTY", "BANKNIFTY"}
     hub._chain_cache = {}
@@ -304,33 +321,54 @@ def test_a_name_that_never_cached_anything_still_escalates():
 
 # --- the holiday discriminator ---------------------------------------------
 
-def test_a_selective_failure_is_an_error():
-    """Stocks still ticking proves the market is open and the token is good,
-    so four dead index/commodity chains are a real fault worth waking someone
-    for — the 07-31 and 08-03 signature exactly."""
-    hub = _hub()
+def test_a_total_outage_with_a_live_feed_is_an_error():
+    """THE 2026-08-03 CASE, and the one the first discriminator got wrong.
+    Every chain dead, nothing moving anywhere — but ticks still arriving, so
+    the market is open and the credentials are good. That is a real fault and
+    must not be filed as a holiday."""
+    hub = _hub(tick_age=2.0)
     hub._chain_cache["NIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
-    hub._chain_cache["INFY"] = {("MONTHLY", 0, 0, "CE"): _Q(50.0)}
     hub._chain_stall_step(OPEN, ["NIFTY"])
     dead = OPEN + timedelta(seconds=CHAIN_STALL_ESCALATE_S)
-    hub._chain_cache["INFY"][("MONTHLY", 0, 0, "CE")] = _Q(51.0)   # still live
-    hub._note_chain_movement(dead)
-    lvl, src, msg = hub._chain_dead_event("NIFTY", 9, dead)
+    lvl, _, msg = hub._chain_dead_event("NIFTY", 9, dead)
     assert lvl == "error"
-    assert "selective" in msg
+    assert "ticks are still arriving" in msg
 
 
-def test_a_market_wide_freeze_is_only_a_warning():
-    """Nothing moving anywhere is far more likely a holiday than four
-    simultaneous per-symbol faults. Don't push a red alert for a Monday off."""
-    hub = _hub()
+def test_a_selective_failure_is_an_error():
+    """Even with no feed signal, a stock deep-dive still ticking proves the
+    market is open — the 07-31 signature."""
+    hub = _hub(tick_age=None)
     hub._chain_cache["NIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
     hub._chain_cache["INFY"] = {("MONTHLY", 0, 0, "CE"): _Q(50.0)}
     hub._chain_stall_step(OPEN, ["NIFTY"])
     dead = OPEN + timedelta(seconds=CHAIN_STALL_ESCALATE_S)
-    lvl, src, msg = hub._chain_dead_event("NIFTY", 9, dead)
+    hub._chain_cache["INFY"][("MONTHLY", 0, 0, "CE")] = _Q(51.0)
+    hub._note_chain_movement(dead)
+    lvl, _, msg = hub._chain_dead_event("NIFTY", 9, dead)
+    assert lvl == "error"
+    assert "OTHER chains are still moving" in msg
+
+
+def test_a_silent_feed_and_silent_chains_is_only_a_warning():
+    """Don't wake anyone for a Monday off. A holiday keeps serving a frozen
+    chain, so the giveaway is that the FEED is silent too."""
+    hub = _hub(tick_age=None)
+    hub._chain_cache["NIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
+    hub._chain_stall_step(OPEN, ["NIFTY"])
+    lvl, _, msg = hub._chain_dead_event(
+        "NIFTY", 9, OPEN + timedelta(seconds=CHAIN_STALL_ESCALATE_S))
     assert lvl == "warn"
-    assert "NO chain is moving anywhere" in msg
+    assert "the feed is silent too" in msg
+
+
+def test_a_stale_tick_does_not_count_as_a_live_market():
+    hub = _hub(tick_age=CHAIN_STALL_CLIENT_S + 1)
+    hub._chain_cache["NIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
+    hub._chain_stall_step(OPEN, ["NIFTY"])
+    lvl, _, _ = hub._chain_dead_event(
+        "NIFTY", 9, OPEN + timedelta(seconds=CHAIN_STALL_ESCALATE_S))
+    assert lvl == "warn"
 
 
 def test_a_selective_failure_pushes_the_diagnosis_to_the_phone(monkeypatch):
@@ -342,7 +380,7 @@ def test_a_selective_failure_pushes_the_diagnosis_to_the_phone(monkeypatch):
     sent = []
     monkeypatch.setattr(watchdog, "push_ntfy",
                         lambda msg, kind: sent.append((msg, kind)) or True)
-    hub = _hub()
+    hub = _hub(tick_age=None)
     hub._chain_cache["BANKNIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
     hub._chain_cache["NIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(50.0)}
     for m in range(STAGE_MIN[3] + 1):
@@ -364,7 +402,7 @@ def test_a_market_wide_freeze_does_not_push(monkeypatch):
     sent = []
     monkeypatch.setattr(watchdog, "push_ntfy",
                         lambda msg, kind: sent.append(msg) or True)
-    hub = _hub()
+    hub = _hub(tick_age=None)          # silent feed == the holiday signature
     hub._chain_cache["BANKNIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
     _run(hub, ["BANKNIFTY"], OPEN, STAGE_MIN[3])
     assert sent == []
@@ -377,7 +415,7 @@ def test_a_failing_push_cannot_kill_the_watchdog(monkeypatch):
         raise RuntimeError("ntfy down")
 
     monkeypatch.setattr(watchdog, "push_ntfy", boom)
-    hub = _hub()
+    hub = _hub(tick_age=None)
     hub._chain_cache["BANKNIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(100.0)}
     hub._chain_cache["NIFTY"] = {("WEEKLY", 0, 0, "CE"): _Q(50.0)}
     acted = []
