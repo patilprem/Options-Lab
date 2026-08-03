@@ -116,6 +116,22 @@ off-hours window; genuinely urgent fixes get the marker.
   because the 07-23..27 outage never touched the socket. Segment-aware and
   event-table-aware so idle-but-correct tables never cry wolf; one push on
   state change, re-push every 15 min, one all-clear.
+  The chain poller also SELF-HEALS now (`MarketHub._chain_stall_step`, pure
+  ladder in `chain_stall_stage`, driven by that same once-a-minute loop). It
+  had frozen SIX times (07-23..27, 07-28, 07-29, 07-30, 07-31, 08-03) and every
+  fix only made it more VISIBLE — task alive, cycles completing in ~20s,
+  requests going out, cache not moving. Tracking when each underlying's chain
+  cache last CHANGED (not when it was last persisted — `_chain_persisted_fp`
+  can't tell a dead poller from an idle recorder) drives escalating remedies
+  while its session is open: 3min → rebuild the Dhan client (the sustained
+  failure mode, DhanEmptyFailure, is swallowed by design, so the one path that
+  killed a session on 07-13 was the one path that never rebuilt); 6min → also
+  drop the cached expiry list (07-23..27's root cause); 9min → escalate with
+  sid/segment/expiries in the line, deliberately BEFORE the 15-min push so the
+  phone alert lands with a diagnosis attached. Each stage fires once per
+  episode and movement re-arms the ladder; movement ELSEWHERE (a stock
+  deep-dive still ticking) is the holiday discriminator — selective failure =
+  `error`, everything frozen = `warn`.
 - `app/engines/risk.py` — M7 risk panel: pure `evaluate()` (portfolio max daily
   loss + per-strategy caps from settings), `exposure()` by underlying/expiry,
   `snapshot()` (margin utilization, day P&L vs max-loss). PaperRunner.enforce_risk
