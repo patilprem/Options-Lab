@@ -101,21 +101,81 @@ def resolve_mcx_ids(max_age_h: float = 24.0) -> dict:
     rows = list(csv.DictReader(io.StringIO(
         _MASTER_CACHE.read_text(encoding="utf-8"))))
     today = datetime.now(IST).strftime("%Y-%m-%d")
-    out = {}
+    candidates = {}
     for name, prefix in MCX_DYNAMIC.items():
         futs = [r for r in rows
                 if r.get("SEM_INSTRUMENT_NAME") == "FUTCOM"
                 and (r.get("SEM_TRADING_SYMBOL") or "").startswith(prefix + "-")
                 and (r.get("SEM_EXPIRY_DATE") or "") >= today]
-        if not futs:
-            continue
-        fut = min(futs, key=lambda r: r["SEM_EXPIRY_DATE"])
+        if futs:
+            candidates[name] = sorted(
+                futs, key=lambda r: r["SEM_EXPIRY_DATE"])[:MCX_CANDIDATES]
+
+    quotes = _mcx_candidate_quotes(candidates)
+    out = {}
+    for name, futs in candidates.items():
+        fut = pick_active_contract(futs, quotes)
         sid = int(fut["SEM_SMST_SECURITY_ID"])
         UNDERLYINGS[name] = {"security_id": sid, "segment": "MCX_COMM",
                              "fno_segment": "MCX_COMM", "instrument": "OPTFUT",
                              "expiry": fut["SEM_EXPIRY_DATE"][:10]}
         out[name] = sid
     return out
+
+
+# How many near contracts to weigh. Two is enough for a normal roll; three
+# covers a name whose front month is dead AND whose next is barely started.
+MCX_CANDIDATES = 3
+
+
+def pick_active_contract(futs: list, quotes: dict) -> dict:
+    """The contract the market is actually TRADING, not merely the nearest one
+    that hasn't expired.
+
+    Pure. `futs` is scrip-master rows sorted by expiry; `quotes` maps
+    security_id (str) -> a fetch_quotes node. Falls back to the nearest expiry
+    when there is no usable quote data, which is exactly the old behaviour.
+
+    2026-08-04: GOLD resolved to GOLD-05Aug2026-FUT — expiring the NEXT DAY,
+    with the whole market long since rolled to Oct (gold contracts are
+    bi-monthly, so the roll happens weeks out). The dead contract printed no
+    ticks for 75+ minutes and its chain served a last_price frozen at 142204
+    for six hours, so GOLD's spot bars AND its option chain were recording a
+    contract nobody traded. CRUDEOIL was fine on the same code path only
+    because its front month was still 15 days out and still the active one —
+    'nearest' and 'active' happened to coincide.
+
+    OPEN INTEREST is the discriminator, not volume: OI is the standing
+    position book, so a contract being rolled out of shows its OI collapse
+    days ahead, and unlike volume it is not near-zero for everything before
+    the session warms up. Volume only breaks ties."""
+    def score(r):
+        node = quotes.get(str(r.get("SEM_SMST_SECURITY_ID"))) or {}
+        return (float(node.get("oi") or 0), float(node.get("volume") or 0))
+
+    best = max(futs, key=score)
+    return best if score(best) > (0.0, 0.0) else futs[0]
+
+
+def _mcx_candidate_quotes(candidates: dict) -> dict:
+    """Batched quotes for every candidate contract, or {} on any failure.
+
+    Best-effort BY DESIGN: resolve_mcx_ids has always worked from a cached CSV
+    with no credentials and no network, and several callers (tests, offline
+    tooling) rely on that. A missing or broken quote call must degrade to the
+    old nearest-expiry pick, never raise."""
+    sids = [str(r["SEM_SMST_SECURITY_ID"])
+            for futs in candidates.values() for r in futs]
+    if not sids:
+        return {}
+    try:
+        client = get_client()
+        data = fetch_quotes(client, {"MCX_COMM": [int(s) for s in sids]})
+        return data.get("MCX_COMM") or {}
+    except Exception as e:
+        _log.warning("MCX candidate quotes unavailable (%r) — "
+                     "falling back to nearest-expiry contract selection", e)
+        return {}
 
 
 # Index names whose front-month FUTIDX supplies the traded volume/OI their

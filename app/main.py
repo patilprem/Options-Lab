@@ -87,6 +87,7 @@ async def _market_recorder():
     loop = asyncio.get_running_loop()
     delay = 15    # first pass right after boot: registers MCX names with the
     skips = 0     # consecutive in-session cycles that persisted nothing
+    mcx_day = ""  # last date the MCX contract choice was re-checked
     while True:   # feed (canary + recorder) instead of waiting out a full tick
         await asyncio.sleep(delay)
         delay = 300
@@ -102,10 +103,18 @@ async def _market_recorder():
             from app.data.dhan_client import MCX_DYNAMIC, UNDERLYINGS, resolve_mcx_ids
             from datetime import datetime as _dt
             _today = _dt.now().date().isoformat()
-            if any(n in MCX_DYNAMIC and (
-                    n not in UNDERLYINGS
-                    or UNDERLYINGS[n].get("expiry", "9999") < _today)  # rolled
-                   for n in names):
+            # Re-check DAILY, not only once the contract has expired. The
+            # choice is now liquidity-based (see pick_active_contract), and
+            # liquidity rolls WEEKS before expiry — GOLD's front month was
+            # dead a fortnight before its 2026-08-05 expiry. An expiry-only
+            # trigger would freeze the pick for a whole contract cycle in any
+            # process that stays up that long (gold's are two months).
+            if mcx_day != _today or any(
+                    n in MCX_DYNAMIC and (
+                        n not in UNDERLYINGS
+                        or UNDERLYINGS[n].get("expiry", "9999") < _today)
+                    for n in names):
+                mcx_day = _today
                 old_ids = {n: UNDERLYINGS.get(n, {}).get("security_id")
                            for n in MCX_DYNAMIC}
                 try:
