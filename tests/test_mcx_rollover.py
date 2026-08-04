@@ -77,3 +77,60 @@ def test_gold_rollover_id_change_is_detected(master):
               if old_ids.get(n) is not None and old_ids[n] != sid]
     assert rolled == ["GOLD"]                           # -> feed resubscribes
     assert ids["GOLD"] == 2002 and ids["CRUDEOIL"] == 1001  # crude unchanged
+
+
+# --- MCX names whose security id resolves at RUNTIME ------------------------
+
+def test_enable_chain_refreshes_once_the_runtime_id_arrives(monkeypatch):
+    """2026-08-04 09:21: underlying_bars[GOLD] dead all morning while
+    chain_snapshots[GOLD] recorded fine — ticks absent, REST chain present.
+
+    An MCX security id is resolved at runtime, and _instruments() skips any
+    name missing from UNDERLYINGS. If the recorder's FIRST enable_chain("GOLD")
+    lands before that resolve succeeds, the old `first_time` guard skipped the
+    refresh — and every later call had first_time=False, so the id arriving a
+    minute later could never trigger one. GOLD stayed off the socket for the
+    session while the chain poller, which reads UNDERLYINGS at poll time, kept
+    working."""
+    from app.data.dhan_client import UNDERLYINGS
+    from app.engines.paper import MarketHub
+
+    hub = MarketHub.__new__(MarketHub)
+    hub._wanted, hub._chain_only, hub._builders = {}, set(), {}
+    hub._chain_subscribed = set()
+    hub._started = True
+    refreshes = []
+    hub._livefeed = type("F", (), {"refresh": lambda self: refreshes.append(1)})()
+
+    # first call: id not resolved yet -> nothing to subscribe, no refresh
+    hub.enable_chain("GOLD")
+    assert refreshes == []
+    assert "GOLD" in hub._chain_only
+
+    # resolve_mcx_ids lands; the very next recorder cycle must put it on the wire
+    monkeypatch.setitem(UNDERLYINGS, "GOLD",
+                        {"security_id": 466583, "segment": "MCX_COMM"})
+    hub.enable_chain("GOLD")
+    assert refreshes == [1], "the id arrived and nothing resubscribed"
+
+    # ...and not once per cycle thereafter
+    hub.enable_chain("GOLD")
+    hub.enable_chain("GOLD")
+    assert refreshes == [1]
+
+
+def test_enable_chain_still_refreshes_a_name_that_was_ready_immediately(monkeypatch):
+    from app.data.dhan_client import UNDERLYINGS
+    from app.engines.paper import MarketHub
+
+    hub = MarketHub.__new__(MarketHub)
+    hub._wanted, hub._chain_only, hub._builders = {}, set(), {}
+    hub._chain_subscribed = set()
+    hub._started = True
+    refreshes = []
+    hub._livefeed = type("F", (), {"refresh": lambda self: refreshes.append(1)})()
+
+    monkeypatch.setitem(UNDERLYINGS, "CRUDEOIL",
+                        {"security_id": 560977, "segment": "MCX_COMM"})
+    hub.enable_chain("CRUDEOIL")
+    assert refreshes == [1]
