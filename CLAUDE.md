@@ -260,6 +260,18 @@ off-hours window; genuinely urgent fixes get the marker.
 8. UI is one static file; server-rendered nothing; keep zero build step.
 
 ## Domain gotchas
+- MCX CONTRACT CHOICE IS BY OPEN INTEREST, not by nearest expiry
+  (`dhan_client.pick_active_contract`). Liquidity rolls WEEKS before expiry:
+  2026-08-04 GOLD resolved to GOLD-05Aug2026-FUT — expiring the next day, with
+  the market long since on Oct — so its WS printed no ticks for 75+ min and its
+  chain served a last_price frozen at 142204 for six hours. Both GOLD's
+  underlying_bars AND its chain_snapshots recorded a contract nobody traded.
+  CRUDEOIL survived the same code path only because its front month was still
+  15 days out, so 'nearest' and 'active' coincided. OI (not volume) decides —
+  volume is ~0 for everything pre-open, exactly when the roll matters. Falls
+  back to nearest-expiry when quotes are unavailable, so the resolver still
+  works offline from the cached CSV. Re-checked DAILY (main.py), not only after
+  expiry, or a long-lived process freezes the pick for a whole cycle.
 - Dhan intraday history: 90 days/call; expired options: 30 days/call,
   ATM-relative, NSE/BSE only (record MCX chain snapshots ourselves).
 - Option Chain API rate limit: 1 unique request per 3 seconds.

@@ -134,3 +134,74 @@ def test_enable_chain_still_refreshes_a_name_that_was_ready_immediately(monkeypa
                         {"security_id": 560977, "segment": "MCX_COMM"})
     hub.enable_chain("CRUDEOIL")
     assert refreshes == [1]
+
+
+# --- contract selection: liquid, not merely unexpired ------------------------
+
+def _fut(sym, exp, sid):
+    return {"SEM_TRADING_SYMBOL": sym, "SEM_EXPIRY_DATE": exp,
+            "SEM_SMST_SECURITY_ID": str(sid), "SEM_INSTRUMENT_NAME": "FUTCOM"}
+
+
+# The real 2026-08-04 scrip-master rows.
+GOLD_FUTS = [_fut("GOLD-05Aug2026-FUT", "2026-08-05", 466583),
+             _fut("GOLD-05Oct2026-FUT", "2026-10-05", 483079),
+             _fut("GOLD-04Dec2026-FUT", "2026-12-04", 495213)]
+CRUDE_FUTS = [_fut("CRUDEOIL-19Aug2026-FUT", "2026-08-19", 560977),
+              _fut("CRUDEOIL-21Sep2026-FUT", "2026-09-21", 565899)]
+
+
+def test_a_contract_expiring_tomorrow_loses_to_the_one_holding_the_open_interest():
+    """THE 2026-08-04 bug. GOLD resolved to a contract expiring the next day;
+    its chain served a last_price frozen at 142204 for six hours and the WS
+    printed no ticks for 75+ minutes, so both GOLD's spot bars and its option
+    chain were recording a contract nobody traded."""
+    from app.data.dhan_client import pick_active_contract
+
+    quotes = {"466583": {"oi": 120.0, "volume": 4.0},        # expiring, rolled out of
+              "483079": {"oi": 18400.0, "volume": 9100.0},   # where the market is
+              "495213": {"oi": 900.0, "volume": 30.0}}
+    assert pick_active_contract(GOLD_FUTS, quotes)["SEM_TRADING_SYMBOL"] \
+        == "GOLD-05Oct2026-FUT"
+
+
+def test_a_healthy_front_month_is_still_chosen():
+    """CRUDEOIL was fine on the same code path only because 'nearest' and
+    'active' happened to coincide — that case must not regress."""
+    from app.data.dhan_client import pick_active_contract
+
+    quotes = {"560977": {"oi": 41000.0, "volume": 22000.0},
+              "565899": {"oi": 3100.0, "volume": 500.0}}
+    assert pick_active_contract(CRUDE_FUTS, quotes)["SEM_TRADING_SYMBOL"] \
+        == "CRUDEOIL-19Aug2026-FUT"
+
+
+def test_no_quote_data_falls_back_to_the_nearest_expiry():
+    """resolve_mcx_ids has always worked from a cached CSV with no credentials
+    and no network. A missing quote call must degrade to the old behaviour."""
+    from app.data.dhan_client import pick_active_contract
+
+    assert pick_active_contract(GOLD_FUTS, {})["SEM_TRADING_SYMBOL"] \
+        == "GOLD-05Aug2026-FUT"
+    zeros = {"466583": {"oi": 0, "volume": 0}, "483079": {"oi": 0, "volume": 0}}
+    assert pick_active_contract(GOLD_FUTS, zeros)["SEM_TRADING_SYMBOL"] \
+        == "GOLD-05Aug2026-FUT"
+
+
+def test_open_interest_decides_before_volume_has_built_up():
+    """Pre-open every contract has ~zero volume, so a volume-only rule would
+    fall back to 'nearest' exactly when the roll matters most. OI is the
+    standing position book and shows the roll days ahead."""
+    from app.data.dhan_client import pick_active_contract
+
+    quotes = {"466583": {"oi": 120.0, "volume": 0},
+              "483079": {"oi": 18400.0, "volume": 0}}
+    assert pick_active_contract(GOLD_FUTS, quotes)["SEM_TRADING_SYMBOL"] \
+        == "GOLD-05Oct2026-FUT"
+
+
+def test_quote_failure_does_not_raise_into_the_resolver():
+    from app.data import dhan_client
+
+    assert dhan_client._mcx_candidate_quotes({"GOLD": GOLD_FUTS}) == {} \
+        or True          # no creds here; the point is that it returns, not raises
