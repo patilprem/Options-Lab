@@ -13,6 +13,18 @@ Fix: from a running event loop, dispatch the actual write to a worker thread
 and return immediately (fire-and-forget — callers never awaited this, and
 never should have to). From sync context (FastAPI request handlers, scripts,
 most tests), nothing changes: the write still happens inline.
+
+EVERY assertion here filters to its OWN message, and must keep doing so. The
+fire-and-forget write resolves DB_PATH when the worker thread RUNS, not when
+the call was dispatched, so a write queued by an EARLIER test can execute after
+conftest has repointed DB_PATH at the next test's file — and land there. That
+made two whole-table assertions here fail about one full-suite run in three
+(2026-08-04: `assert 26 == 20`, and a stray "live feed disconnected" turning up
+in the bare-thread test). Both were counting other tests' rows, not detecting
+anything real. Production is unaffected: DB_PATH never changes there.
+
+The flake was not free — deploy/deploy.sh gates the service restart on this
+suite, so a test that fails at random can abort a deploy for no reason.
 """
 
 import asyncio
@@ -32,7 +44,8 @@ def test_sync_call_writes_immediately_and_synchronously(tmp_path, monkeypatch):
     registry.record_event("info", "test", "sync write")
 
     with registry._conn() as c:
-        rows = c.execute("SELECT message FROM events").fetchall()
+        rows = c.execute(
+            "SELECT message FROM events WHERE message='sync write'").fetchall()
     assert [r[0] for r in rows] == ["sync write"]
 
 
@@ -69,7 +82,8 @@ def test_async_call_eventually_persists(tmp_path, monkeypatch):
         for _ in range(50):
             await asyncio.sleep(0.02)
             with registry._conn() as c:
-                if c.execute("SELECT count(*) FROM events").fetchone()[0]:
+                if c.execute("SELECT count(*) FROM events "
+                             "WHERE message='eventually there'").fetchone()[0]:
                     return True
         return False
 
@@ -87,10 +101,26 @@ def test_concurrent_async_writes_do_not_lose_events(tmp_path, monkeypatch):
     async def run():
         for i in range(20):
             registry.record_event("info", "test", f"burst {i}")
-        for _ in range(100):
+        # Count OUR OWN events, not every row in the table.
+        #
+        # This asserted `count(*) == 20` and failed about one full-suite run in
+        # three — with 26, not 14. Not lost events: EXTRA ones. record_event is
+        # fire-and-forget, and its _write() resolves DB_PATH when the worker
+        # thread RUNS, not when the call was dispatched. So a write queued by an
+        # earlier test can execute after conftest's monkeypatch has repointed
+        # DB_PATH at this test's file, and lands here. Harmless in production,
+        # where DB_PATH never changes; purely an artifact of per-test redirection.
+        #
+        # The claim in the docstring is that none of the burst is silently
+        # dropped, so filter to the burst. Counting foreign rows was never what
+        # this meant to assert, and the flake was not free: deploy.sh gates the
+        # service restart on this suite, so it could abort a deploy for no reason.
+        for _ in range(200):
             await asyncio.sleep(0.02)
             with registry._conn() as c:
-                n = c.execute("SELECT count(*) FROM events").fetchone()[0]
+                n = c.execute(
+                    "SELECT count(*) FROM events WHERE message LIKE 'burst %'"
+                ).fetchone()[0]
             if n == 20:
                 return n
         return n
@@ -121,5 +151,6 @@ def test_sync_call_from_a_thread_with_no_loop_still_works(tmp_path, monkeypatch)
     t.join(timeout=2)
     assert not errors, errors
     with registry._conn() as c:
-        rows = c.execute("SELECT message FROM events").fetchall()
+        rows = c.execute("SELECT message FROM events "
+                         "WHERE message='from a bare thread'").fetchall()
     assert [r[0] for r in rows] == ["from a bare thread"]

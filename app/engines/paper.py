@@ -904,6 +904,20 @@ class MarketHub:
     _NOOP_WARN_DAILY_S = 86400.0
 
     def _noop_warn(self, u: str, reason: str, detail: str) -> None:
+        # OUTSIDE THE SESSION, A NO-OP IS THE EXPECTED ANSWER, NOT A SYMPTOM.
+        # Dhan serves no chain before the open, so from whenever the process
+        # starts until 09:00/09:15 every name logs the same empty-failure line
+        # every 5 minutes (observed 2026-08-04 08:45: all four, pre-open).
+        #
+        # That is worse than ordinary noise. `empty-failure-detail ...
+        # raw_response=` is the exact signature of the 08-03 outage — the one
+        # line that finally identified a poisoned client after six incidents —
+        # and printing it every morning for a benign reason makes the real
+        # thing indistinguishable from the routine one without cross-checking
+        # the clock. Keep the signature meaningful: log it only when the chain
+        # was actually supposed to answer.
+        if not self._session_open_for_chain(u):
+            return
         key = (u, reason)
         last = self._noop_warned.get(key)
         now = time.monotonic()
@@ -915,6 +929,19 @@ class MarketHub:
         self._noop_warned[key] = now
         registry.record_event("warn", "feed",
                               f"chain poll no-op [{u}] {reason}: {detail}")
+
+    def _session_open_for_chain(self, u: str) -> bool:
+        """Is `u`'s exchange session open right now? Best-effort: on any
+        failure, say yes. A logging gate must fail LOUD — losing the one line
+        that diagnoses an outage is far worse than printing it off-hours."""
+        try:
+            from app.engines.recording_watchdog import segment_for
+            from app.engines.watchdog import session_open_for
+            return session_open_for(
+                (segment_for(u),),
+                datetime.now(IST).replace(tzinfo=None), grace_min=0)
+        except Exception:
+            return True
 
     EXPIRY_RETRY_S = 60.0     # after an EMPTY expiry_list, wait this long
                               # before refetching (the poll loop runs ~1/s)

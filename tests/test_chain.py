@@ -133,7 +133,11 @@ def test_fetch_chain_retries_once_on_transient_failure(monkeypatch):
 
     monkeypatch.setattr(dhan_client, "fetch_option_chain", flaky_fetch)
     hub = MarketHub(_Store())
-    hub.CHAIN_MIN_INTERVAL = 0.0   # don't burn 3 real seconds on the retry wait
+    hub.CHAIN_MIN_INTERVAL = 0.0          # don't burn 3 real seconds on the retry wait
+    # _noop_warn only logs while the underlying's session is open (off-hours a
+    # no-op is the expected answer, not a symptom). Pin it so these assertions
+    # don't depend on the wall clock the suite happens to run at.
+    hub._session_open_for_chain = lambda u: True
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -163,6 +167,10 @@ def test_fetch_chain_returns_none_on_persistent_empty_failure(monkeypatch):
     monkeypatch.setattr(dhan_client, "fetch_option_chain", always_empty)
     hub = MarketHub(_Store())
     hub.CHAIN_MIN_INTERVAL = 0.0
+    # _noop_warn only logs while the underlying's session is open (off-hours a
+    # no-op is the expected answer, not a symptom). Pin it so these assertions
+    # don't depend on the wall clock the suite happens to run at.
+    hub._session_open_for_chain = lambda u: True
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -188,6 +196,10 @@ def test_fetch_chain_raises_on_real_failure(monkeypatch):
     monkeypatch.setattr(dhan_client, "fetch_option_chain", always_fails)
     hub = MarketHub(_Store())
     hub.CHAIN_MIN_INTERVAL = 0.0
+    # _noop_warn only logs while the underlying's session is open (off-hours a
+    # no-op is the expected answer, not a symptom). Pin it so these assertions
+    # don't depend on the wall clock the suite happens to run at.
+    hub._session_open_for_chain = lambda u: True
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -222,6 +234,10 @@ def test_empty_failure_logs_the_raw_response_once_diagnosable(monkeypatch):
                         lambda *a, **k: events.append(a))
     hub = MarketHub(_Store())
     hub.CHAIN_MIN_INTERVAL = 0.0
+    # _noop_warn only logs while the underlying's session is open (off-hours a
+    # no-op is the expected answer, not a symptom). Pin it so these assertions
+    # don't depend on the wall clock the suite happens to run at.
+    hub._session_open_for_chain = lambda u: True
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -252,6 +268,10 @@ def test_empty_failure_with_no_response_does_not_crash_the_logger(monkeypatch):
                         lambda *a, **k: events.append(a))
     hub = MarketHub(_Store())
     hub.CHAIN_MIN_INTERVAL = 0.0
+    # _noop_warn only logs while the underlying's session is open (off-hours a
+    # no-op is the expected answer, not a symptom). Pin it so these assertions
+    # don't depend on the wall clock the suite happens to run at.
+    hub._session_open_for_chain = lambda u: True
 
     async def run():
         loop = asyncio.get_running_loop()

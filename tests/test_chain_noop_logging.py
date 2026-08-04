@@ -26,6 +26,10 @@ def _hub():
     hub._chain_cache = {}
     hub._chain_spot = {}
     hub._noop_warned = {}
+    # _noop_warn is gated on the underlying's session being open. Pin it here
+    # rather than letting these tests depend on the wall clock they happen to
+    # run at — the gate itself is exercised explicitly further down.
+    hub._session_open_for_chain = lambda u: True
     return hub
 
 
@@ -294,3 +298,44 @@ def test_real_failures_keep_the_short_throttle(monkeypatch):
         got = _noop_events(monkeypatch, hub, "NIFTY", reason,
                            hub._NOOP_WARN_S + 1)
         assert len(got) == 1, f"{reason} must not be throttled to daily"
+
+
+# --- off-hours no-ops are the expected answer, not a symptom ----------------
+
+def test_no_op_before_the_open_is_not_logged(monkeypatch):
+    """2026-08-04 08:45, pre-open: all four names logged empty-failure warns
+    every 5 minutes because Dhan serves no chain before the session.
+
+    That noise is worse than ordinary noise. `empty-failure-detail ...
+    raw_response=` is the exact signature of the 08-03 poisoned-client outage,
+    and printing it every morning for a benign reason makes the real thing
+    indistinguishable from the routine one."""
+    hub = _hub()
+    monkeypatch.setattr(hub, "_session_open_for_chain", lambda u: False)
+    events = []
+    monkeypatch.setattr("app.core.registry.record_event",
+                        lambda *a, **k: events.append(a))
+    hub._noop_warn("NIFTY", "empty-failure-detail[IDX_I]", "raw_response=...")
+    assert events == []
+
+
+def test_the_same_no_op_during_the_session_is_logged(monkeypatch):
+    hub = _hub()
+    monkeypatch.setattr(hub, "_session_open_for_chain", lambda u: True)
+    events = []
+    monkeypatch.setattr("app.core.registry.record_event",
+                        lambda *a, **k: events.append(a))
+    hub._noop_warn("NIFTY", "empty-failure-detail[IDX_I]", "raw_response=...")
+    assert len(events) == 1
+
+
+def test_the_gate_fails_loud_if_it_cannot_tell(monkeypatch):
+    """Losing the one line that diagnoses an outage is far worse than printing
+    it off-hours, so an unusable session check must not silence anything."""
+    hub = _hub()
+
+    def boom(*a, **k):
+        raise RuntimeError("no session table")
+
+    monkeypatch.setattr("app.engines.recording_watchdog.segment_for", boom)
+    assert hub._session_open_for_chain("NIFTY") is True
