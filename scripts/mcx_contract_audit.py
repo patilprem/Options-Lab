@@ -58,6 +58,48 @@ def connect():
     return duckdb.connect(os.path.join(tmp, "marketdata.duckdb")), tmp
 
 
+def collect(con, name: str, control: str) -> list:
+    """Per-day [(date, bars, control_bars, coverage, distinct_spots, spot_range)].
+
+    Shared with scripts.mcx_purge_dead_contract so the audit and the DELETE can
+    never disagree about which days are suspect — this codebase has already
+    paid for two copies of one rule drifting apart (see the Tier-2 shortlist vs
+    entry gate, 2026-07-28)."""
+    bars = dict(con.execute(
+        "SELECT CAST(ts AS DATE) d, count(*) FROM underlying_bars "
+        "WHERE underlying = ? GROUP BY 1", [name]).fetchall())
+    ctrl = dict(con.execute(
+        "SELECT CAST(ts AS DATE) d, count(*) FROM underlying_bars "
+        "WHERE underlying = ? GROUP BY 1", [control]).fetchall())
+    spot = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+        "SELECT CAST(ts AS DATE) d, count(DISTINCT spot), min(spot), max(spot) "
+        "FROM chain_snapshots WHERE underlying = ? GROUP BY 1",
+        [name]).fetchall()}
+    out = []
+    for d in sorted(set(bars) | set(ctrl) | set(spot)):
+        n, c = bars.get(d, 0), ctrl.get(d, 0)
+        ds, lo, hi = spot.get(d, (0, None, None))
+        out.append((d, n, c, (n / c) if c else None, ds,
+                    (hi - lo) if lo is not None and hi is not None else None))
+    return out
+
+
+def reasons(row) -> list:
+    """Why this day is suspect ([] = looks fine). Pure — the single definition
+    of 'suspect', used by the report and by the purge."""
+    _d, _n, _c, cover, ds, _rng = row
+    why = []
+    if cover is not None and cover < COVERAGE_SUSPECT:
+        why.append("thin bars")
+    if ds and ds <= SPOT_DISTINCT_SUSPECT:
+        why.append("frozen spot")
+    return why
+
+
+def suspect_days(rows: list) -> list:
+    return [r[0] for r in rows if reasons(r)]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -73,44 +115,26 @@ def main() -> int:
         print(f"cannot read the market store: {e!r}")
         return 1
     try:
-        bars = dict(con.execute(
-            "SELECT CAST(ts AS DATE) d, count(*) FROM underlying_bars "
-            "WHERE underlying = ? GROUP BY 1", [args.name]).fetchall())
-        ctrl = dict(con.execute(
-            "SELECT CAST(ts AS DATE) d, count(*) FROM underlying_bars "
-            "WHERE underlying = ? GROUP BY 1", [args.control]).fetchall())
-        spot = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
-            "SELECT CAST(ts AS DATE) d, count(DISTINCT spot), min(spot), max(spot) "
-            "FROM chain_snapshots WHERE underlying = ? GROUP BY 1",
-            [args.name]).fetchall()}
+        rows = collect(con, args.name, args.control)
     finally:
         con.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
-    days = sorted(set(bars) | set(ctrl) | set(spot))
-    if not days:
+    if not rows:
         print(f"no recorded days for {args.name}")
         return 1
 
     print(f"{args.name} vs {args.control} — bar coverage and chain movement\n")
     print(f"{'date':<12}{'bars':>7}{'ctrl':>7}{'cover':>8}"
           f"{'spots':>7}{'spot range':>14}  verdict")
-    suspect = []
-    for d in days:
-        n, c = bars.get(d, 0), ctrl.get(d, 0)
-        cover = (n / c) if c else None
-        ds, lo, hi = spot.get(d, (0, None, None))
-        rng = f"{(hi - lo):,.0f}" if lo is not None and hi is not None else "-"
-        why = []
-        if cover is not None and cover < COVERAGE_SUSPECT:
-            why.append("thin bars")
-        if ds and ds <= SPOT_DISTINCT_SUSPECT:
-            why.append("frozen spot")
-        if why:
-            suspect.append(d)
+    suspect = suspect_days(rows)
+    for row in rows:
+        d, n, c, cover, ds, rng = row
+        why = reasons(row)
         print(f"{str(d):<12}{n:>7}{c:>7}"
               f"{(f'{cover:.0%}' if cover is not None else '-'):>8}"
-              f"{ds:>7}{rng:>14}  {', '.join(why) or 'ok'}")
+              f"{ds:>7}{(f'{rng:,.0f}' if rng is not None else '-'):>14}"
+              f"  {', '.join(why) or 'ok'}")
 
     print()
     if not suspect:

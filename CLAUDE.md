@@ -348,6 +348,12 @@ CRUDEOIL as the control (same session, feed and recorder, so it says what
 'fully recorded' looked like that day — no absolute thresholds to re-tune).
 Read-only by design: it names the suspect days and prints the DELETEs, but
 removal is a deliberate decision, since MCX data can never be re-fetched.
+`scripts/mcx_purge_dead_contract.py` does the removal when you've decided —
+dry-run by default, imports the audit's suspect rule rather than restating it,
+refuses to run while the service holds the DuckDB write lock, and writes every
+affected row to Parquet and reads it back at the exact row count BEFORE
+deleting, so the operation is reversible (the restore SQL is printed on
+completion).
 For "why is THIS chain not recording?" run `scripts/chain_probe.py` instead:
 per-underlying freshness across BOTH chain tables (plus who else is keeping the
 table warm), the self-heal ladder's timeline and every chain no-op printed IN
