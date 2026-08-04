@@ -342,6 +342,12 @@ Flip live on only via /live/settings ON the VPS. (a) and (b) verified
 2026-07-27/28. For any "is it healthy?" question run `scripts/diag.py` on the
 VPS — one command: sha, service, token, per-table + per-underlying freshness,
 scanner cadence/scores, warn/error tail, RED-flag verdict.
+For "did we record the RIGHT MCX contract?" run `scripts/mcx_contract_audit.py`:
+per-day bar coverage and chain-spot movement for an MCX name measured against
+CRUDEOIL as the control (same session, feed and recorder, so it says what
+'fully recorded' looked like that day — no absolute thresholds to re-tune).
+Read-only by design: it names the suspect days and prints the DELETEs, but
+removal is a deliberate decision, since MCX data can never be re-fetched.
 For "why is THIS chain not recording?" run `scripts/chain_probe.py` instead:
 per-underlying freshness across BOTH chain tables (plus who else is keeping the
 table warm), the self-heal ladder's timeline and every chain no-op printed IN
