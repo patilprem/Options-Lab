@@ -17,17 +17,22 @@ table. That matters more here than almost anywhere else in the codebase —
 Dhan serves no expired-option history for MCX, we are the only recorder, and a
 mistaken DELETE would otherwise be permanent.
 
-It will also refuse to run while the service is up. DuckDB is single-writer,
-so the delete would fail on the lock anyway; failing early with an instruction
-beats failing halfway with a lock error.
+Dry run is the DEFAULT and prints exactly what would go, per table per day. It
+reads a COPY of the database, so the service can stay up while you look — the
+first version pointed the preview at the live file, and since DuckDB refuses
+even a read_only open against a held write lock, that meant taking recording
+down just to see what a delete WOULD do. A dry run you have to stop the world
+to run is one people skip.
 
-Dry run is the default and prints exactly what would go, per table per day.
+`--yes` does need the service stopped, and refuses early with the stop/start
+commands rather than failing halfway through on a lock error.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -87,8 +92,20 @@ def main() -> int:
               "    sudo systemctl start optionslab")
         return 1
 
+    # A DRY RUN MUST NEVER NEED THE SERVICE STOPPED. DuckDB refuses even a
+    # read_only open while another process holds the write lock, so pointing
+    # the preview at the live file meant you had to take recording down just to
+    # LOOK at what would be deleted — the exact opposite of what a dry run is
+    # for, and it would push anyone toward skipping straight to --yes. The
+    # preview reads a copy (same trick as the audit and scripts/diag.py); only
+    # the real delete touches the live database.
+    tmp = None
     try:
-        con = duckdb.connect(DB, read_only=not args.yes)
+        if args.yes:
+            con = duckdb.connect(DB, read_only=False)
+        else:
+            from scripts.mcx_contract_audit import connect as audit_connect
+            con, tmp = audit_connect()
     except Exception as e:
         print(f"cannot open {DB}: {e!r}\n"
               "(if the service is running, stop it first — DuckDB is "
@@ -131,8 +148,9 @@ def main() -> int:
             return 0
 
         if not args.yes:
-            print(f"\nDRY RUN — nothing changed. {total} rows would go.")
-            print("Re-run with --yes (service stopped) to back up and delete.")
+            print(f"\nDRY RUN — nothing changed (read from a COPY, so the "
+                  f"service can stay up). {total} rows would go.")
+            print("Re-run with --yes, service stopped, to back up and delete.")
             return 0
 
         # --- backup BEFORE touching anything --------------------------------
@@ -182,6 +200,8 @@ def main() -> int:
         return 0
     finally:
         con.close()
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
