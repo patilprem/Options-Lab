@@ -230,6 +230,9 @@ class MarketHub:
                                      # monotonic time of last _poll_one_chain
                                      # silent-no-op log (throttle)
         self._chain_only: set[str] = set()   # polled for snapshots, no strategy (MCX recorder)
+        # chain-only names we have actually put on the WS instrument list; see
+        # enable_chain for why this is not the same as "seen before"
+        self._chain_subscribed: set[str] = set()
         self._chain_gate = asyncio.Lock()
         self._last_chain_ts = 0.0
         # Chain-cache stall self-heal (see chain_stall_stage). _chain_seen_fp /
@@ -280,11 +283,24 @@ class MarketHub:
         # spot history absent and unbacktestable.
         self._builders.setdefault(
             (underlying, self.RECORD_INTERVAL), CandleBuilder(self.RECORD_INTERVAL))
-        # a name added AFTER the socket connected needs a resubscribe, same
-        # as register() — else the WS carries the old instrument list until
-        # some unrelated reconnect (observed: MCX canary missing post-boot)
-        if (self._started and self._livefeed and first_time
-                and underlying in UNDERLYINGS):
+        # A name added AFTER the socket connected needs a resubscribe, same as
+        # register() — else the WS carries the old instrument list until some
+        # unrelated reconnect (observed: MCX canary missing post-boot).
+        #
+        # KEYED ON "HAS IT BEEN PUT ON THE SOCKET", NOT ON "IS THIS THE FIRST
+        # CALL". Those differ for exactly the MCX names this exists for: an
+        # MCX security id is resolved at RUNTIME (resolve_mcx_ids), so if the
+        # recorder's first enable_chain lands while GOLD is not yet in
+        # UNDERLYINGS — a failed or not-yet-run resolve — the refresh is
+        # skipped, `first_time` is False on every later call, and the id
+        # arriving a minute later can never trigger one. _instruments() skips
+        # names missing from UNDERLYINGS, so GOLD stays off the socket for the
+        # whole session while its REST chain polls fine, because the poller
+        # reads UNDERLYINGS at poll time. Ticks absent, chain present.
+        if (self._started and self._livefeed
+                and underlying in UNDERLYINGS
+                and underlying not in self._chain_subscribed):
+            self._chain_subscribed.add(underlying)
             self._livefeed.refresh()
 
     def resubscribe(self) -> None:
@@ -536,6 +552,11 @@ class MarketHub:
             self._tasks.append(asyncio.create_task(self._index_vol_check_loop()))
 
     async def stop(self) -> None:
+        # A fresh start rebuilds _instruments() from scratch, so nothing is
+        # "already subscribed" any more — keeping the set would suppress the
+        # refresh for a name that start-up skipped because its runtime id had
+        # not resolved yet.
+        self._chain_subscribed.clear()
         if self._livefeed:
             self._livefeed.stop()
         for t in self._tasks:
