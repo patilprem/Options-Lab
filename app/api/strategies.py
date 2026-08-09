@@ -1046,6 +1046,9 @@ def live_status():
         "max_lots": L.max_lots(),
         "kill_armed": registry.setting("live_kill_armed", "no") == "yes",
         "deployed": list(live_runner.contexts),
+        # reconciled=false means the ledger is running as-PLACED: not
+        # necessarily wrong, but unverified against the broker.
+        "fills": live_runner.reconcile_status(),
         "note": ("DRY-RUN: orders are logged, not sent. Real orders also require "
                  "running on the whitelisted static IP." if L.dry_run()
                  else "REAL ORDERS ENABLED — orders will be sent to Dhan."),

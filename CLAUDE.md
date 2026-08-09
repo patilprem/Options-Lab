@@ -157,12 +157,22 @@ off-hours window; genuinely urgent fixes get the marker.
   chain — fetches succeed, the cache just stops changing — so what a holiday
   looks like from here is a SILENT FEED. `_chain_dead_event` judges on
   `feed_status()['tick_age_sec']` first.
-  Separately and still open: `CHAIN_TARGETS` asks every core name for
-  `("WEEKLY", 0/1)`, but BANKNIFTY's weeklies were discontinued by NSE and MCX
-  options are monthly-only, so those three cache and persist their MONTHLY
-  chains under `expiry_kind="WEEKLY"` and never record a second expiry at all
-  (the WEEKLY+1 guard skips it). A data-labelling bug, unrelated to the
-  outage — do not conflate the two again.
+  Separately (FIXED, do not conflate with the outage): `CHAIN_TARGETS` asks
+  every core name for `("WEEKLY", 0/1)`, but BANKNIFTY's weeklies were
+  discontinued by NSE and MCX options are monthly-only, so those three cached
+  and persisted their MONTHLY chains under `expiry_kind="WEEKLY"` and never
+  recorded a second expiry. `chain.has_weekly_cycle`/`effective_targets` now
+  derive the kind FROM THE EXPIRY LIST (no hardcoded name list to go stale) and
+  remap WEEKLY→MONTHLY when there is no weekly cadence — fixing the label AND
+  making offset 1 a real next-month expiry. MONTHLY 0 resolves to the same
+  contract WEEKLY 0 did, so it re-labels without re-pointing.
+  `MarketHub._effective_leg` translates a still-WEEKLY LegSpec on those names so
+  running strategies keep pricing the same contract; `scripts/
+  relabel_chain_expiry_kind.py` fixes the history (data-driven both ways —
+  BANKNIFTY genuinely HAD weeklies pre-Nov-2024, so a blanket relabel would
+  corrupt them; dry-run default, Parquet backup + readback, PK-collision check).
+  AFTER RUNNING IT: strategies/backtests declaring WEEKLY on those underlyings
+  read an EMPTY series from the store — change the declaration to MONTHLY.
 - `app/engines/risk.py` — M7 risk panel: pure `evaluate()` (portfolio max daily
   loss + per-strategy caps from settings), `exposure()` by underlying/expiry,
   `snapshot()` (margin utilization, day P&L vs max-loss). PaperRunner.enforce_risk
@@ -178,7 +188,28 @@ off-hours window; genuinely urgent fixes get the marker.
   DryRunOrderClient unless fully enabled (default = dry-run, logs not sends).
   Endpoints: /live/status, /live/settings, /live/kill, /strategies/{id}/live/ack,
   deploy_live, live/{play|pause|stop}. Frontend LiveModal checklist gates deploy.
-  Fill reconciliation (OrderUpdate WS) + real market-hours run are the next step.
+  A real market-hours run is the remaining step.
+- `app/engines/order_updates.py` — M8 FILL RECONCILIATION. LiveContext books a
+  position the instant an order is ACCEPTED, at the LIMIT price it asked for —
+  intent, not fact. Every order is now tracked to a terminal broker status and
+  the ledger corrected: real avg price, real qty, a rejected entry's position
+  DROPPED, a rejected EXIT's position REOPENED (the ledger reading flat while
+  the broker still holds it is the worst divergence there is), and a partial
+  exit SPLIT so the unfilled units don't vanish. Pure `parse_order_update` /
+  `reconcile` + `FillReconciler` (in-flight book, dedupes replays, sweeps orders
+  with no terminal update after STALE_S) + `LiveOrderFeed` (dhanhq `OrderUpdate`
+  socket on its own thread, own reconnect — the SDK's `connect_order_update()`
+  just returns when the socket drops). BOOK-THEN-CORRECT, never wait-for-fill:
+  waiting on a confirmation that may never arrive would lose positions the
+  broker really opened. So an unreconciled ledger is the degraded mode and it is
+  VISIBLE — `/live/status` → `fills.reconciled: false`. Corrections happen ONLY
+  on the terminal update (PART_TRADED's filled qty keeps moving; acting on both
+  would double-apply). `registry.amend_trade` corrects the blotter row IN PLACE
+  — one row per fill, so a correction must never append a second.
+  VPS-PENDING: only `Data.orderNo`/`Data.status` are confirmed against the
+  installed SDK; the filled-qty and avg-price field names are not in it, so the
+  parser accepts every spelling Dhan's REST order object uses. Run one real
+  order through it and watch for the `unparseable order update` warn.
 - `app/engines/paper.py` — MarketHub (shared feed) + PaperContext +
   PaperRunner (asyncio task per strategy, play/pause). M4: PaperContext
   persists open positions + margin/P&L to registry.paper_state on every
@@ -335,8 +366,9 @@ tested (M6/M7 browser-verified); M5 real margin (equity live-verified); M8 live
 execution + kill switch built & gated, verified in DRY-RUN (no real orders).
 Before real capital, ON THE VPS during market hours: (a) live tick→candle flow,
 (b) chain poller under load, (c) real FNO margin + `scripts/calibrate_margin`,
-(d) M8 real-order path incl. OrderUpdate fill reconciliation (not yet built) +
-kill_switch action strings. (MCX chain recording is LIVE since 2026-07-27 —
+(d) M8 real-order path incl. the OrderUpdate socket + fill reconciliation (BUILT
+and unit-tested offline; the payload field names beyond orderNo/status are
+unverified — see engines/order_updates.py) + kill_switch action strings. (MCX chain recording is LIVE since 2026-07-27 —
 the dynamic resolver populates CRUDEOIL/GOLD ids; verified 100k+ rows/day.)
 Flip live on only via /live/settings ON the VPS. (a) and (b) verified
 2026-07-27/28. For any "is it healthy?" question run `scripts/diag.py` on the
