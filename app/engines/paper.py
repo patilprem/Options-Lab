@@ -229,6 +229,11 @@ class MarketHub:
         self._noop_warned: dict[tuple, float] = {}  # (underlying, reason) ->
                                      # monotonic time of last _poll_one_chain
                                      # silent-no-op log (throttle)
+        # Underlyings whose live expiry list proved they have NO weekly cycle
+        # (BANKNIFTY since NSE dropped its weeklies; every MCX name). Their
+        # chains are cached under MONTHLY, so a LegSpec still declaring WEEKLY
+        # is re-labelled at lookup — see _effective_leg.
+        self._chain_no_weekly: set[str] = set()
         self._chain_only: set[str] = set()   # polled for snapshots, no strategy (MCX recorder)
         # chain-only names we have actually put on the WS instrument list; see
         # enable_chain for why this is not the same as "seen before"
@@ -853,43 +858,36 @@ class MarketHub:
         fingerprint itself (MarketHub._chain_fingerprint) — this logging is
         for a human diagnosing 'why', not a machine deciding 'did it work'.
 
-        A WEEKLY secondary target (offset>0) that resolves implausibly far
-        from the nearest one is SKIPPED without a fetch, not requested and
-        left to fail. CHAIN_TARGETS' ("WEEKLY", 1) assumes every configured
-        underlying has a genuine weekly expiry cycle; NSE discontinued
-        BANKNIFTY's, so its expiry list only advances monthly and offset 1
-        lands ~2 months out (observed 2026-07-29: resolved to a date 2 months
-        away, and the wasted fetch for it came back message-less). Rather
-        than hardcode a list of which underlyings still have real weeklies —
-        stale the moment an exchange changes a rule again — this checks the
-        DATA: if resolve_expiry's offset>0 result is farther from offset 0
-        than a real weekly gap can be, that itself proves there is no weekly
-        entry there, so the request (and its 3s rate-gate slot) is skipped
-        entirely rather than spent on a call we're already confident fails."""
-        WEEKLY_GAP_MAX_DAYS = 15   # a missed week (holiday) still fits; a
-                                   # monthly-only underlying's "next" entry
-                                   # never does
+        TARGETS ARE RE-LABELLED FROM THE EXPIRY LIST before anything is
+        fetched. CHAIN_TARGETS' ("WEEKLY", 0/1) assumes every configured
+        underlying has a genuine weekly cycle; NSE discontinued BANKNIFTY's
+        and MCX options are monthly-only, so for those three the list only
+        advances monthly. resolve_expiry answered ("WEEKLY", 0) with their
+        nearest MONTHLY expiry regardless, so their chains were cached,
+        recorded and PERSISTED under expiry_kind="WEEKLY" while holding
+        monthly contracts, while offset 1 landed ~2 months out (observed
+        2026-07-29) and was skipped — one expiry, wrongly labelled, and never
+        a second. chainmod.effective_targets asks the DATA whether a weekly
+        cycle exists (no hardcoded list to go stale the next time an exchange
+        changes a rule) and remaps WEEKLY->MONTHLY when it doesn't, which
+        both fixes the label and turns offset 1 into a real next-month expiry
+        worth the fetch. MONTHLY 0 resolves to the same contract WEEKLY 0
+        did, so nothing re-points; only the label changes."""
         expiries = await self._get_expiries(client, u, cfg, loop)
-        nearest_weekly: Optional[date] = None
+        weekly = chainmod.has_weekly_cycle(expiries)
+        self._note_weekly_cycle(u, weekly)
+        targets = chainmod.effective_targets(targets, expiries)
         for kind, off in targets:
             exp = chainmod.resolve_expiry(expiries, kind, off)
             if not exp:
-                self._noop_warn(u, f"resolve_expiry[{kind}+{off}]",
-                                f"no match in expiries={expiries!r}")
+                # A missing SECONDARY expiry is a permanent fact about what the
+                # exchange lists (daily throttle); a missing offset 0 is an
+                # incident (5-minute throttle). See _NOOP_WARN_DAILY.
+                self._noop_warn(
+                    u, f"no-secondary-expiry[{kind}+{off}]" if off
+                    else f"resolve_expiry[{kind}+{off}]",
+                    f"no match in expiries={expiries!r}")
                 continue
-            exp_date = date.fromisoformat(exp)
-            if kind == "WEEKLY":
-                if off == 0:
-                    nearest_weekly = exp_date
-                elif nearest_weekly is not None and \
-                        (exp_date - nearest_weekly).days > WEEKLY_GAP_MAX_DAYS:
-                    self._noop_warn(
-                        u, f"no-weekly-cycle[{kind}+{off}]",
-                        f"offset {off} resolved to {exp} — "
-                        f"{(exp_date - nearest_weekly).days}d past the "
-                        f"nearest weekly ({nearest_weekly}); this underlying "
-                        f"likely has no weekly cycle here, skipping the fetch")
-                    continue
             data = await self._fetch_chain_ratelimited(u, client, cfg, exp, loop)
             if not data:
                 self._noop_warn(u, f"fetch[{kind}+{off}]",
@@ -913,15 +911,17 @@ class MarketHub:
                               # branches can legitimately fire every ~1s poll
 
     # ...except the reasons that are PERMANENT FACTS about an underlying rather
-    # than incidents. BANKNIFTY, CRUDEOIL and GOLD have no weekly expiry cycle
-    # and will not until an exchange changes its calendar, so `no-weekly-cycle`
-    # is correct behaviour reported forever: three names x every 5 minutes is
-    # ~36 lines an hour of noise. On 2026-08-03 that noise pushed the ACTUAL
-    # outage window out of the diagnostic view entirely — the last 40 chain
-    # events were 33 copies of this one line and nothing from the incident.
-    # A log nobody can find anything in is the same failure as no log, and this
-    # codebase has already paid five days for learning to ignore an alarm.
-    _NOOP_WARN_DAILY = ("no-weekly-cycle",)
+    # than incidents. A SECONDARY target (offset>0) that the exchange simply
+    # does not list is correct behaviour reported forever: an underlying with
+    # one live contract has no "next" one, and at the 5-minute throttle that is
+    # ~12 lines an hour per name. On 2026-08-03 exactly this noise (then worded
+    # `no-weekly-cycle`) pushed the ACTUAL outage window out of the diagnostic
+    # view — the last 40 chain events were 33 copies of one benign line and
+    # nothing from the incident. A log nobody can find anything in is the same
+    # failure as no log, and this codebase has already paid five days for
+    # learning to ignore an alarm.
+    # Offset 0 missing is NOT in here: that one is an incident, every time.
+    _NOOP_WARN_DAILY = ("no-secondary-expiry",)
     _NOOP_WARN_DAILY_S = 86400.0
 
     def _noop_warn(self, u: str, reason: str, detail: str) -> None:
@@ -1374,6 +1374,38 @@ class MarketHub:
     QUOTE_MAX_AGE_S = 600.0   # a cached quote older than this is FROZEN, not live
     TICK_FRESHNESS_S: Optional[float] = 600.0   # tick wall-clock sanity (None = off)
 
+    def _note_weekly_cycle(self, u: str, weekly: bool) -> None:
+        """Record what the live expiry list just proved about this underlying.
+        getattr-guarded because several tests drive the poll loop through a
+        MarketHub.__new__ stand-in that sets only the attributes it needs."""
+        s = getattr(self, "_chain_no_weekly", None)
+        if s is None:
+            s = self._chain_no_weekly = set()
+        if weekly:
+            s.discard(u)
+        else:
+            s.add(u)
+
+    def no_weekly_cycle(self, underlying: str) -> bool:
+        """True once the live expiry list has shown this underlying has no
+        weekly cycle (BANKNIFTY post-discontinuation, every MCX name)."""
+        return underlying in getattr(self, "_chain_no_weekly", ())
+
+    def _effective_leg(self, underlying: str, leg: LegSpec) -> LegSpec:
+        """Re-label a WEEKLY LegSpec to MONTHLY on an underlying that has no
+        weekly cycle, so lookups land on the chain we actually hold.
+
+        The poller now caches and persists those underlyings under MONTHLY
+        (see _poll_one_chain), which is the honest label — but strategies
+        written while the cache was mislabelled still declare WEEKLY, and a
+        silent None here means no fills at all. Translating keeps them
+        pricing exactly the contract they priced before, against correctly
+        labelled data. Same remap on the store fallback: the migration
+        (scripts/relabel_chain_expiry_kind.py) relabels history too."""
+        if leg.expiry_kind != ExpiryKind.WEEKLY or not self.no_weekly_cycle(underlying):
+            return leg
+        return replace(leg, expiry_kind=ExpiryKind.MONTHLY)
+
     def quote(self, underlying: str, ts: datetime, leg: LegSpec) -> Optional[OptionQuote]:
         """Real bid/ask/greeks from the live chain cache when available, else
         the store (backfill / synthetic) so backtests and dev keep working.
@@ -1385,6 +1417,7 @@ class MarketHub:
         poller once served Friday's closes as 'live' and a paper entry filled
         ~25% off the real market). No store fallback in that case: on a live
         trading day the store is even staler."""
+        leg = self._effective_leg(underlying, leg)
         cache = self._chain_cache.get(underlying)
         if cache:
             key = (leg.expiry_kind.value, leg.expiry_offset,
@@ -1414,14 +1447,15 @@ class MarketHub:
                         and q.expiry != pos.expiry:
                     continue
                 return replace(q, ts=ts)
+        leg = self._effective_leg(underlying, pos.leg)
         if hasattr(self.store, "option_series_by_strike"):
             rows = self.store.option_series_by_strike(
                 underlying, pos.strike, otype.value,
-                pos.leg.expiry_kind.value, pos.leg.expiry_offset, ts)
+                leg.expiry_kind.value, leg.expiry_offset, ts)
             if rows:
                 return OptionQuote(ts, underlying, pos.expiry, pos.strike,
                                    otype, ltp=rows[-1][1])
-        return self.store.option_close(underlying, ts, pos.leg)
+        return self.store.option_close(underlying, ts, leg)
 
 
 class PaperContext(Context):

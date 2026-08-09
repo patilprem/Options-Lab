@@ -33,7 +33,11 @@ def _hub():
     return hub
 
 
-def _patch_common(monkeypatch, hub, expiries=("2026-08-06",)):
+def _patch_common(monkeypatch, hub,
+                  expiries=("2026-08-06", "2026-08-13", "2026-08-20")):
+    # A genuine WEEKLY cadence by default: _poll_one_chain now derives the
+    # expiry KIND from this list (chain.effective_targets), so a one-entry
+    # list would silently re-label these NIFTY cases MONTHLY.
     async def fake_expiries(*a, **k):
         return list(expiries)
 
@@ -151,113 +155,109 @@ def test_different_underlyings_throttle_independently(monkeypatch):
     assert len(events) == 4, "each underlying should log once independently"
 
 
-# --- WEEKLY secondary target sanity check (2026-07-29 BANKNIFTY finding) ---
+# --- expiry KIND is derived from the list (2026-07-29 BANKNIFTY finding) ---
+#
+# CHAIN_TARGETS asks every underlying for ("WEEKLY", 0/1). BANKNIFTY's weeklies
+# are discontinued and MCX is monthly-only, so resolve_expiry answered
+# ("WEEKLY", 0) with their nearest MONTHLY contract and we cached, recorded and
+# PERSISTED it as WEEKLY — while offset 1 landed ~2 months out. One expiry,
+# wrongly labelled, and never a second. The kind now comes from the data.
 
-def _resolver(near, far):
-    """resolve_expiry mock: offset 0 -> near, offset>0 -> far."""
-    def fn(expiries, kind, off):
-        return near if off == 0 else far
-    return fn
+# A real weekly cadence, and a monthly-only list (BANKNIFTY/MCX shaped).
+WEEKLIES = ("2026-08-06", "2026-08-13", "2026-08-20", "2026-08-27")
+MONTHLIES = ("2026-08-25", "2026-09-29", "2026-10-27")
 
 
-def test_implausible_weekly_gap_is_skipped_without_fetching(monkeypatch):
-    """THE finding. BANKNIFTY's offset-1 resolved 2 months past offset-0 —
-    no real weekly entry exists there, so the fetch (and its rate-gate slot)
-    must not be spent on a call we're already confident fails."""
-    hub = _hub()
-    events = _patch_common(monkeypatch, hub)
-    monkeypatch.setattr("app.engines.chain.resolve_expiry",
-                        _resolver("2026-08-05", "2026-09-29"))
-    fetch_calls = []
+def _fetch_recorder(monkeypatch, hub):
+    """Capture the expiry each fetch was made for."""
+    fetched = []
 
-    async def fake_fetch(*a, **k):
-        fetch_calls.append(1)
-        return {"data": {}}
+    async def fake_fetch(u, client, cfg, exp, loop):
+        fetched.append(exp)
+        return None      # message-less blip; irrelevant to these tests
 
     monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
-    _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)))
-    assert fetch_calls == [1], "offset 0 must still be fetched normally"
-    msgs = [a[2] for a in events]
-    assert any("no-weekly-cycle" in m for m in msgs), msgs
-    assert not any("fetch[" in m for m in msgs), (
-        "must skip before attempting the fetch, not log a fetch failure")
+    return fetched
 
 
-def test_a_genuine_weekly_gap_still_fetches_normally(monkeypatch):
-    """A real 7-day-out next weekly must NOT be caught by the guard."""
+def test_monthly_only_underlying_is_polled_as_monthly(monkeypatch):
+    """THE fix. A monthly-only expiry list must re-label WEEKLY targets to
+    MONTHLY, so the chain is stored under the kind it actually is AND offset 1
+    becomes a real next-month expiry instead of a skipped phantom weekly."""
     hub = _hub()
-    events = _patch_common(monkeypatch, hub)
-    monkeypatch.setattr("app.engines.chain.resolve_expiry",
-                        _resolver("2026-08-05", "2026-08-12"))
-    fetch_calls = []
+    _patch_common(monkeypatch, hub, expiries=MONTHLIES)
+    fetched = _fetch_recorder(monkeypatch, hub)
+    _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)), underlying="BANKNIFTY")
+    assert fetched == ["2026-08-25", "2026-09-29"], (
+        "both monthly offsets should be fetched, offset 1 being a genuine "
+        "next-month expiry rather than a phantom weekly")
+    assert hub.no_weekly_cycle("BANKNIFTY") is True
 
-    async def fake_fetch(*a, **k):
-        fetch_calls.append(1)
-        return None   # message-less blip; irrelevant to this test
 
-    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+def test_monthly_only_relabel_points_at_the_same_front_contract(monkeypatch):
+    """Re-labelling must not RE-POINT: MONTHLY 0 has to resolve to the very
+    expiry WEEKLY 0 did, or the fix would silently switch which contract the
+    live cache (and every open position marked through it) prices."""
+    from app.engines import chain as chainmod
+    assert (chainmod.resolve_expiry(list(MONTHLIES), "MONTHLY", 0)
+            == chainmod.resolve_expiry(list(MONTHLIES), "WEEKLY", 0))
+
+
+def test_a_real_weekly_underlying_is_left_alone(monkeypatch):
+    """A genuine 7-day cadence must stay WEEKLY — the remap is for lists that
+    prove there is no weekly cycle, not for every underlying."""
+    hub = _hub()
+    _patch_common(monkeypatch, hub, expiries=WEEKLIES)
+    fetched = _fetch_recorder(monkeypatch, hub)
     _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)))
-    assert fetch_calls == [1, 1], "both offsets should be fetched"
-    msgs = [a[2] for a in events]
-    assert not any("no-weekly-cycle" in m for m in msgs), msgs
+    assert fetched == ["2026-08-06", "2026-08-13"]
+    assert hub.no_weekly_cycle("NIFTY") is False
 
 
-def test_a_skipped_holiday_week_within_threshold_still_fetches(monkeypatch):
+def test_a_skipped_holiday_week_is_still_a_weekly_cycle(monkeypatch):
     """A missed week (exchange holiday shifting the cycle) is still a real
     weekly market, just ~14 days out instead of 7 — must not be misread as
-    'no weekly cycle exists here'."""
+    'no weekly cycle exists here' and demoted to MONTHLY."""
     hub = _hub()
-    events = _patch_common(monkeypatch, hub)
-    monkeypatch.setattr("app.engines.chain.resolve_expiry",
-                        _resolver("2026-08-05", "2026-08-19"))  # 14 days
-    fetch_calls = []
-
-    async def fake_fetch(*a, **k):
-        fetch_calls.append(1)
-        return None
-
-    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _patch_common(monkeypatch, hub,
+                  expiries=("2026-08-05", "2026-08-19", "2026-08-26"))
+    fetched = _fetch_recorder(monkeypatch, hub)
     _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)))
-    assert fetch_calls == [1, 1]
-    assert not any("no-weekly-cycle" in a[2] for a in events)
+    assert fetched == ["2026-08-05", "2026-08-19"]
+    assert hub.no_weekly_cycle("NIFTY") is False
 
 
-def test_monthly_targets_are_never_gap_checked(monkeypatch):
-    """MONTHLY offsets are naturally ~30 days apart — the WEEKLY-only guard
-    must not misfire on them."""
+def test_monthly_targets_pass_through_unchanged(monkeypatch):
+    """The scanner already asks stocks for ("MONTHLY", 0) — an explicit
+    MONTHLY target must never be rewritten."""
     hub = _hub()
-    events = _patch_common(monkeypatch, hub)
-    monkeypatch.setattr("app.engines.chain.resolve_expiry",
-                        _resolver("2026-08-05", "2026-09-30"))
-    fetch_calls = []
-
-    async def fake_fetch(*a, **k):
-        fetch_calls.append(1)
-        return None
-
-    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
-    _call(hub, targets=(("MONTHLY", 0), ("MONTHLY", 1)))
-    assert fetch_calls == [1, 1]
-    assert not any("no-weekly-cycle" in a[2] for a in events)
+    _patch_common(monkeypatch, hub, expiries=MONTHLIES)
+    fetched = _fetch_recorder(monkeypatch, hub)
+    _call(hub, targets=(("MONTHLY", 0), ("MONTHLY", 1)), underlying="INFY")
+    assert fetched == ["2026-08-25", "2026-09-29"]
 
 
-def test_offset_zero_out_of_order_does_not_crash(monkeypatch):
-    """If targets ever listed offset>0 before offset 0, nearest_weekly is
-    still None when it's evaluated — must fail open (attempt the fetch)
-    rather than raise or wrongly skip."""
+def test_offset_order_does_not_matter(monkeypatch):
+    """Targets listed offset>0 first must still resolve both."""
     hub = _hub()
-    _patch_common(monkeypatch, hub)
-    monkeypatch.setattr("app.engines.chain.resolve_expiry",
-                        _resolver("2026-08-05", "2026-09-29"))
-    fetch_calls = []
-
-    async def fake_fetch(*a, **k):
-        fetch_calls.append(1)
-        return None
-
-    monkeypatch.setattr(hub, "_fetch_chain_ratelimited", fake_fetch)
+    _patch_common(monkeypatch, hub, expiries=WEEKLIES)
+    fetched = _fetch_recorder(monkeypatch, hub)
     _call(hub, targets=(("WEEKLY", 1), ("WEEKLY", 0)))
-    assert fetch_calls == [1, 1], "out-of-order targets must still attempt both"
+    assert sorted(fetched) == ["2026-08-06", "2026-08-13"]
+
+
+def test_a_missing_secondary_expiry_is_a_permanent_fact(monkeypatch):
+    """One listed contract means there is no "next" one — correct behaviour,
+    reported forever. It must take the DAILY throttle, not the 5-minute one,
+    or it becomes the noise that hid the 2026-08-03 outage."""
+    hub = _hub()
+    events = _patch_common(monkeypatch, hub, expiries=("2026-08-25",))
+    _fetch_recorder(monkeypatch, hub)
+    _call(hub, targets=(("WEEKLY", 0), ("WEEKLY", 1)), underlying="GOLD")
+    reasons = [a[2] for a in events]
+    assert any("no-secondary-expiry[MONTHLY+1]" in m for m in reasons), reasons
+    assert not any("resolve_expiry[" in m for m in reasons), (
+        "offset 0 resolved fine — only the secondary is missing")
 
 
 # --- permanent facts must not drown the log --------------------------------
@@ -273,15 +273,15 @@ def _noop_events(monkeypatch, hub, u, reason, aged_by):
     return events
 
 
-def test_the_no_weekly_cycle_line_is_logged_once_a_day(monkeypatch):
-    """2026-08-03: BANKNIFTY/CRUDEOIL/GOLD have no weekly expiry cycle, so the
-    skip is CORRECT behaviour — and at the 5-minute throttle it reported itself
-    ~36 times an hour. The last 40 chain events during a live incident were 33
-    copies of this one line and nothing from the outage itself.
+def test_the_missing_secondary_line_is_logged_once_a_day(monkeypatch):
+    """2026-08-03: BANKNIFTY/CRUDEOIL/GOLD reported a benign, permanent fact
+    about their expiry list at the 5-minute throttle — ~36 lines an hour. The
+    last 40 chain events during a live incident were 33 copies of that one line
+    and nothing from the outage itself.
 
     A permanent fact about an underlying is not an incident. Log it once."""
     hub = _hub()
-    reason = "no-weekly-cycle[WEEKLY+1]"
+    reason = "no-secondary-expiry[MONTHLY+1]"
     assert _noop_events(monkeypatch, hub, "BANKNIFTY", reason,
                         hub._NOOP_WARN_S + 1) == [], \
         "5 minutes on is still inside the daily window — must stay quiet"
