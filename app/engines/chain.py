@@ -88,6 +88,65 @@ def chain_spot(data: dict) -> Optional[float]:
     return _f(data.get("last_price"))
 
 
+# The widest gap that can still separate two consecutive WEEKLY expiries. A
+# holiday can skip a week (and festival clusters shift one), so 15 days still
+# fits a real weekly cycle; a monthly-only underlying's next listed expiry
+# never does.
+WEEKLY_GAP_MAX_DAYS = 15
+
+
+def has_weekly_cycle(expiries: list[str],
+                     max_gap_days: int = WEEKLY_GAP_MAX_DAYS) -> bool:
+    """Does this expiry list actually advance WEEKLY at its front?
+
+    Asks the DATA instead of keeping a table of which underlyings still have
+    weeklies: NSE discontinued BANKNIFTY's, MCX options are monthly-only, and
+    any hardcoded list goes stale the next time an exchange changes a rule.
+
+    Fewer than two parseable expiries proves nothing, so this answers False —
+    MONTHLY offset 0 resolves to the same single contract either way, and the
+    conservative label is the one that doesn't invent a weekly cycle.
+    """
+    dates = []
+    for e in sorted(expiries or []):
+        try:
+            dates.append(date.fromisoformat(e))
+        except (TypeError, ValueError):
+            continue
+    if len(dates) < 2:
+        return False
+    return (dates[1] - dates[0]).days <= max_gap_days
+
+
+def effective_targets(targets, expiries,
+                      max_gap_days: int = WEEKLY_GAP_MAX_DAYS) -> tuple:
+    """Rewrite WEEKLY targets to MONTHLY for an underlying with no weekly cycle.
+
+    MarketHub.CHAIN_TARGETS asks every configured underlying for
+    ("WEEKLY", 0) and ("WEEKLY", 1). For BANKNIFTY and the MCX names that is
+    not a thing that exists, and resolve_expiry answers ("WEEKLY", 0) with
+    their nearest MONTHLY expiry anyway — so their chains were cached,
+    recorded and persisted under expiry_kind="WEEKLY" while actually holding
+    monthly contracts, and offset 1 resolved ~2 months out and was skipped,
+    leaving those underlyings with exactly one recorded expiry, mislabelled.
+
+    Remapping up front fixes both halves: the stored label matches the
+    contract, and MONTHLY offset 1 is a genuine next-month expiry worth
+    recording. Offsets are preserved, and for a monthly-only list MONTHLY 0
+    resolves to the very expiry WEEKLY 0 did — so this RE-LABELS what we
+    record without RE-POINTING it at a different contract.
+    """
+    if has_weekly_cycle(expiries, max_gap_days):
+        return tuple(targets)
+    out, seen = [], set()
+    for kind, off in targets:
+        t = ("MONTHLY", off) if kind == "WEEKLY" else (kind, off)
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return tuple(out)
+
+
 def resolve_expiry(expiries: list[str], expiry_kind: str, offset: int) -> Optional[str]:
     """Pick the ISO expiry for an ATM-relative (kind, offset) from a sorted-
     ascending expiry list. WEEKLY offset 0 = nearest; MONTHLY offset 0 = nearest

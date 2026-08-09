@@ -19,15 +19,25 @@ Invariants honored:
   * Orders use place_super_order so the STOP-LOSS lives on Dhan's servers and
     protects the position even if this process dies.
 
-NOTE: full fill reconciliation (OrderUpdate WS, partials, broker position sync)
-is the next increment; positions here are recorded as-placed. Live behaviour
-MUST be verified on the VPS during market hours before real capital is used.
+FILLS ARE RECONCILED, not assumed. A position is still BOOKED the moment the
+order is accepted (waiting for a confirmation that may never arrive would lose
+positions the broker really did open), but every order is then tracked through
+engines/order_updates until the broker says what actually happened to it, and
+the ledger is corrected: real average price, real quantity, and — the case
+that matters most — a rejected order's position removed, or a rejected EXIT's
+position reopened. Orders that never reach a terminal state are swept and
+reported. If the update socket is down the ledger runs as-placed, exactly as
+before, and /live/status says `reconciled: false`.
+
+Live behaviour MUST be verified on the VPS during market hours before real
+capital is used.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 
@@ -37,6 +47,7 @@ from app.core.contract import (Action, Bar, Context, LegSpec, OptionQuote,
 from app.data.dhan_client import UNDERLYINGS
 from app.engines import fills as F
 from app.engines import margin as M
+from app.engines import order_updates as OU
 from app.engines import risk as R
 from app.engines.backtest import lot_size_on
 
@@ -189,13 +200,21 @@ class LiveGate:
 
 class LiveContext(Context):
     def __init__(self, record: registry.StrategyRecord, underlying: str, hub,
-                 interval: int = 5, client=None):
+                 interval: int = 5, client=None, reconciler=None):
         self.rec = record
         self.underlying = underlying
         self.hub = hub
         self.interval = int(interval)
         self.fee_cfg, self.slip_cfg = F.FeeConfig(), F.SlippageConfig()
         self._client = client or make_order_client()
+        # One reconciler per PROCESS in production (LiveRunner owns it and the
+        # single order-update socket, dispatching by intent.sid). A context
+        # built standalone — tests, or a one-off — gets its own so it is never
+        # silently unreconciled.
+        self.reconciler = reconciler or OU.FillReconciler(
+            on_correction=lambda i, c: self.apply_correction(i, c),
+            on_event=lambda lvl, sid, msg: registry.record_event(
+                lvl, "live", msg, sid or self.rec.id))
         self.kill = KillSwitch(self._client)
         self.paused = record.state != registry.State.RUNNING
         self._bars: list[Bar] = []
@@ -371,7 +390,13 @@ class LiveContext(Context):
             self._open.append(pos)
             self._fees_today += fees
             self._blotter(pos, leg.action.value, price, fees, "entry",
-                          dry=bool(resp.get("dry_run")))
+                          dry=bool(resp.get("dry_run")), order_id=oid)
+            # Booked at the price we ASKED for. Track it until the broker says
+            # what actually filled — see apply_correction.
+            self.reconciler.track(OU.Intent(
+                order_id=oid, sid=self.rec.id, kind="entry", position_id=pos.id,
+                price=round(price, 2), qty=float(units), fees=fees,
+                placed_ts=self.now, label=self._label(pos)))
             placed += 1
         if placed:
             self._margin_used += est
@@ -418,6 +443,7 @@ class LiveContext(Context):
             order_type=_ORDER_TYPE, product_type=_PRODUCT, price=round(price, 2),
             tag=f"exit_{reason}"[:24])
         fees = F.charges(price * abs(p.qty), exit_action, self.fee_cfg)
+        units = abs(p.qty)
         p.exit_price = round(price, 2)
         p.exit_ts = self.now
         p.exit_reason = reason
@@ -426,12 +452,152 @@ class LiveContext(Context):
         self._realized_today += p.realized_pnl
         self.closed_today.append(p)
         self._open.remove(p)
+        oid = str((resp.get("data") or {}).get("orderId", ""))
         self._blotter(p, exit_action.value, price, fees, reason,
-                      dry=bool(resp.get("dry_run")))
+                      dry=bool(resp.get("dry_run")), order_id=oid)
+        # An exit that does NOT fill is the most dangerous divergence there is:
+        # the ledger reads flat while the broker still holds the position.
+        self.reconciler.track(OU.Intent(
+            order_id=oid, sid=self.rec.id, kind="exit", position_id=p.id,
+            price=round(price, 2), qty=float(units), fees=fees,
+            placed_ts=self.now, label=self._label(p)))
+
+    # -- fill reconciliation -------------------------------------------------
+    def _label(self, p: Position) -> str:
+        opt = "CE" if p.leg.option_type.value == "CALL" else "PE"
+        return f"{p.underlying} {p.strike:g} {opt}"
+
+    def _find_position(self, position_id: str) -> Optional[Position]:
+        for p in self._open:
+            if p.id == position_id:
+                return p
+        for p in self.closed_today:
+            if p.id == position_id:
+                return p
+        return None
+
+    def apply_correction(self, intent: "OU.Intent", corr: "OU.Correction") -> None:
+        """Make the ledger agree with what the broker actually did.
+
+        Called by FillReconciler once an order reaches a terminal state, and
+        only when something diverged. The reconciler decides WHAT changed; this
+        owns HOW it lands on positions, fees and the day's realized P&L, so the
+        decision path stays testable without a ledger.
+        """
+        if not corr.changes_ledger:
+            return
+        pos = self._find_position(intent.position_id)
+        if pos is None:
+            self.log(f"fill correction for unknown position "
+                     f"{intent.position_id} ({intent.label}) — ignored")
+            return
+        if intent.kind == "entry":
+            self._correct_entry(pos, intent, corr)
+        else:
+            self._correct_exit(pos, intent, corr)
+
+    def _correct_entry(self, p: Position, intent, corr) -> None:
+        if corr.action == "void":
+            # The order never filled: this position never existed. Remove it
+            # and give back the fees we charged for a trade that didn't happen.
+            if p in self._open:
+                self._open.remove(p)
+            elif not p.is_open:
+                # Squared before the rejection arrived, so its realized P&L is
+                # for a round trip whose entry never happened. Rare, and worth
+                # a human look rather than a silent guess at the unwind.
+                self.log(f"entry rejected AFTER the position was squared "
+                         f"[{intent.label}] — realized P&L for it is not real")
+            p.fees_paid -= intent.fees
+            self._fees_today -= intent.fees
+            if not self._open:
+                # Margin is blocked per ENTER call, not per leg, so it can only
+                # be reversed exactly when nothing is left holding any.
+                self._margin_used = 0.0
+            self.log(f"entry never filled [{intent.label}] — position dropped: "
+                     f"{corr.reason}")
+            registry.amend_trade(self.rec.id, "LIVE", intent.order_id,
+                                 {"voided": True, "fees": 0.0,
+                                  "reconciled": corr.reason})
+            return
+        sign = 1 if p.qty > 0 else -1
+        units = int(round(corr.qty)) if corr.qty is not None else abs(p.qty)
+        price = round(corr.price if corr.price is not None else p.entry_price, 2)
+        fees = F.charges(price * units, p.leg.action, self.fee_cfg)
+        p.qty = sign * units
+        p.entry_price = price
+        p.mtm_price = price
+        p.mfe = p.mae = 0.0        # excursions measured from the wrong entry
+        p.fees_paid += fees - intent.fees
+        self._fees_today += fees - intent.fees
+        registry.amend_trade(self.rec.id, "LIVE", intent.order_id,
+                             {"qty": units, "price": price,
+                              "fees": round(fees, 2),
+                              "requested_price": intent.price,
+                              "reconciled": corr.reason})
+
+    def _correct_exit(self, p: Position, intent, corr) -> None:
+        old_realized = p.realized_pnl
+        exit_action = Action.SELL if p.qty > 0 else Action.BUY
+        if corr.action == "void":
+            # THE DANGEROUS ONE. We booked flat; the broker still holds it.
+            p.exit_price = None
+            p.exit_ts = None
+            p.exit_reason = ""
+            p.fees_paid -= intent.fees
+            self._fees_today -= intent.fees
+            self._realized_today -= old_realized
+            if p in self.closed_today:
+                self.closed_today.remove(p)
+            if p not in self._open:
+                self._open.append(p)
+            self.log(f"EXIT NOT FILLED [{intent.label}] — position REOPENED "
+                     f"({corr.reason}); it is still live at the broker")
+            registry.amend_trade(self.rec.id, "LIVE", intent.order_id,
+                                 {"voided": True, "fees": 0.0,
+                                  "reconciled": corr.reason})
+            return
+        held = abs(p.qty)
+        filled = int(round(corr.qty)) if corr.qty is not None else held
+        filled = min(filled, held)
+        price = round(corr.price if corr.price is not None else p.exit_price, 2)
+        entry_fees = p.fees_paid - intent.fees      # what entry cost us
+        residual = held - filled
+        if residual > 0:
+            # A PARTIAL exit closes part of the position and leaves the rest
+            # live. Splitting it keeps both halves honest: the closed part
+            # books its real P&L, the remainder stays open and marked, instead
+            # of the unfilled units silently vanishing from the ledger.
+            sign = 1 if p.qty > 0 else -1
+            share = residual / held
+            rest = replace(p, id=f"{p.id}-r", qty=sign * residual,
+                           exit_price=None, exit_ts=None, exit_reason="",
+                           fees_paid=entry_fees * share, mfe=0.0, mae=0.0,
+                           entry_context=dict(p.entry_context))
+            self._open.append(rest)
+            self.log(f"partial exit [{intent.label}] — {filled}/{held} filled, "
+                     f"{residual} still open as {rest.id}")
+            entry_fees *= (1 - share)
+            p.qty = sign * filled
+        fees = F.charges(price * filled, exit_action, self.fee_cfg)
+        p.exit_price = price
+        p.fees_paid = entry_fees + fees
+        self._fees_today += fees - intent.fees
+        self._realized_today += p.realized_pnl - old_realized
+        registry.amend_trade(self.rec.id, "LIVE", intent.order_id,
+                             {"qty": filled, "price": price,
+                              "fees": round(fees, 2),
+                              "requested_price": intent.price,
+                              "gross_pnl": round((price - p.entry_price) * p.qty, 2),
+                              "net_pnl": round(p.realized_pnl, 2),
+                              "reconciled": corr.reason})
+
+    def reconcile_status(self) -> dict:
+        return self.reconciler.status()
 
     # -- ledger --------------------------------------------------------------
     def _blotter(self, p: Position, side: str, price: float, fees: float,
-                 reason: str, dry: bool = False) -> None:
+                 reason: str, dry: bool = False, order_id: str = "") -> None:
         opt = "CE" if p.leg.option_type.value == "CALL" else "PE"
         registry.record_event("info", "live",
                               f"{'[DRY] ' if dry else ''}{side} {abs(p.qty)} "
@@ -443,6 +609,9 @@ class LiveContext(Context):
             "side": side, "qty": abs(p.qty), "price": round(price, 2),
             "fees": round(fees, 2), "reason": reason, "tag": p.tag,
             "dry_run": dry,
+            # The handle fill reconciliation amends this row by. A blotter is
+            # one row per fill, so a correction must never append a second.
+            "order_id": order_id,
         }
         if reason != "entry" and p.exit_price is not None:
             gross = (p.exit_price - p.entry_price) * p.qty
@@ -487,17 +656,68 @@ class LiveRunner:
         self.hub = hub
         self.contexts: dict[str, LiveContext] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        # ONE reconciler and ONE order-update socket per process; corrections
+        # are routed back to the owning strategy by intent.sid.
+        self.reconciler = OU.FillReconciler(
+            on_correction=self._dispatch_correction,
+            on_event=lambda lvl, sid, msg: registry.record_event(
+                lvl, "live", msg, sid or None))
+        self._order_feed: Optional[OU.LiveOrderFeed] = None
+
+    def _dispatch_correction(self, intent, corr) -> None:
+        ctx = self.contexts.get(intent.sid)
+        if ctx is None:
+            registry.record_event("warn", "live",
+                                  f"fill correction for a strategy that is no "
+                                  f"longer deployed ({intent.label}): "
+                                  f"{corr.reason}", intent.sid)
+            return
+        ctx.apply_correction(intent, corr)
+
+    def _ensure_order_feed(self) -> None:
+        """Start the order-update socket once, when live trading is switched
+        on. Deliberately started in DRY-RUN too: no orders means no updates,
+        but the socket connecting is exactly the pre-flight check you want to
+        have passed on the VPS before real orders depend on it."""
+        if self._order_feed is not None or not live_enabled():
+            return
+        try:
+            from app.data import dhan_client
+            feed = OU.LiveOrderFeed(
+                context_factory=dhan_client.get_dhan_context,
+                on_message=self._on_order_update,
+                on_event=lambda lvl, msg: registry.record_event(lvl, "live", msg))
+            feed.start(asyncio.get_running_loop())
+            self._order_feed = feed
+        except Exception as e:
+            registry.record_event(
+                "error", "live",
+                f"order update socket unavailable — the LIVE ledger will run "
+                f"UNRECONCILED (as-placed): {e!r}")
+
+    def _on_order_update(self, msg) -> None:
+        self.reconciler.connected = bool(
+            self._order_feed and self._order_feed.connected)
+        self.reconciler.apply(msg)
+
+    def reconcile_status(self) -> dict:
+        st = self.reconciler.status()
+        st["connected"] = bool(self._order_feed and self._order_feed.connected)
+        st["reconciled"] = st["connected"]
+        return st
 
     async def deploy(self, record: registry.StrategyRecord, strategy: Strategy) -> None:
         meta = strategy.meta()
         interval = int(meta.timeframe)
-        ctx = LiveContext(record, meta.underlying, self.hub, interval)
+        ctx = LiveContext(record, meta.underlying, self.hub, interval,
+                          reconciler=self.reconciler)
         self.contexts[record.id] = ctx
         w = int((meta.params or {}).get("warmup_bars", 0) or 0)
         if w:
             ctx.warmup(self.hub.store, w)
         self.hub.register(meta.underlying, interval)
         await self.hub.ensure_started()
+        self._ensure_order_feed()
         registry.record_event("warn", "live",
                               f"LIVE deploy ({'DRY-RUN' if dry_run() else 'REAL ORDERS'})",
                               record.id)
@@ -533,6 +753,16 @@ class LiveRunner:
     def enforce_risk(self) -> None:
         """Live risk: pause strategies over their cap; on a PORTFOLIO breach, arm
         the broker kill switch and square everything."""
+        # Piggybacks the every-bar risk pass rather than adding a task: an
+        # order still unconfirmed means the ledger risk is being evaluated
+        # against may not be what the broker holds, so the sweep belongs
+        # immediately BEFORE the evaluation, and its own try keeps a
+        # reconciler fault from ever blocking a risk breach.
+        try:
+            self.reconciler.sweep()
+        except Exception as e:
+            registry.record_event("error", "live",
+                                  f"fill reconciliation sweep failed: {e!r}")
         ev = R.evaluate(self.contexts)
         for b in ev["strategy_breaches"]:
             ctx = self.contexts.get(b["sid"])

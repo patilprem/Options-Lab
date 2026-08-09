@@ -37,6 +37,10 @@ LONG_RUNNING = [
     ("app/engines/paper.py", "_heartbeat"),
     ("app/engines/paper.py", "_loop"),
     ("app/core/token_manager.py", "daily_refresh_loop"),
+    # A dead order-update driver stops correcting the LIVE ledger while every
+    # other indicator stays green — an unreconciled book that still looks
+    # healthy is exactly the shape of failure listed above.
+    ("app/engines/order_updates.py", "_driver"),
 ]
 
 # Statements that are safe outside the try: `await asyncio.sleep(...)` (only

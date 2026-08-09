@@ -282,3 +282,119 @@ def test_empty_failure_with_no_response_does_not_crash_the_logger(monkeypatch):
     result = asyncio.run(run())
     assert result is None
     assert any("empty-failure-detail" in a[2] for a in events)
+
+
+# ---------------------------------------------------------------------------
+# Expiry KIND is derived from the expiry list, not assumed
+# ---------------------------------------------------------------------------
+# CHAIN_TARGETS asks every configured underlying for ("WEEKLY", 0/1). NSE
+# discontinued BANKNIFTY's weeklies and MCX options are monthly-only, so
+# resolve_expiry answered ("WEEKLY", 0) with their nearest MONTHLY contract —
+# which we then cached, recorded and persisted under expiry_kind="WEEKLY",
+# while ("WEEKLY", 1) landed ~2 months out and was skipped. One expiry, wrongly
+# labelled, and never a second.
+
+WEEKLIES = ["2026-08-06", "2026-08-13", "2026-08-20", "2026-08-27"]
+MONTHLIES = ["2026-08-25", "2026-09-29", "2026-10-27"]
+
+
+def test_a_seven_day_cadence_is_a_weekly_cycle():
+    assert chainmod.has_weekly_cycle(WEEKLIES) is True
+
+
+def test_a_monthly_only_list_is_not_a_weekly_cycle():
+    assert chainmod.has_weekly_cycle(MONTHLIES) is False
+
+
+def test_a_holiday_skipped_week_is_still_weekly():
+    """An exchange holiday can push the next weekly to ~14 days out. That is
+    still a weekly market and must not be demoted to MONTHLY."""
+    assert chainmod.has_weekly_cycle(["2026-08-05", "2026-08-19"]) is True
+
+
+def test_one_expiry_proves_nothing_so_it_is_not_weekly():
+    """Can't tell from a single contract. MONTHLY 0 resolves to the same
+    expiry either way, so the conservative label is the one that doesn't
+    invent a weekly cycle."""
+    assert chainmod.has_weekly_cycle(["2026-08-25"]) is False
+    assert chainmod.has_weekly_cycle([]) is False
+
+
+def test_unparseable_expiries_are_ignored_not_fatal():
+    assert chainmod.has_weekly_cycle(["not-a-date", "2026-08-06",
+                                      "2026-08-13"]) is True
+
+
+def test_weekly_targets_are_remapped_for_a_monthly_only_underlying():
+    assert chainmod.effective_targets(
+        (("WEEKLY", 0), ("WEEKLY", 1)), MONTHLIES) == (("MONTHLY", 0),
+                                                       ("MONTHLY", 1))
+
+
+def test_weekly_targets_survive_a_real_weekly_underlying():
+    t = (("WEEKLY", 0), ("WEEKLY", 1))
+    assert chainmod.effective_targets(t, WEEKLIES) == t
+
+
+def test_explicit_monthly_targets_pass_through():
+    """The Tier-2 scanner already asks stocks for ("MONTHLY", 0)."""
+    t = (("MONTHLY", 0),)
+    assert chainmod.effective_targets(t, MONTHLIES) == t
+    assert chainmod.effective_targets(t, WEEKLIES) == t
+
+
+def test_remapping_cannot_produce_a_duplicate_target():
+    """A target set holding both kinds at one offset must collapse to one
+    fetch, not spend two slots of the 3s rate gate on the same expiry."""
+    assert chainmod.effective_targets(
+        (("WEEKLY", 0), ("MONTHLY", 0)), MONTHLIES) == (("MONTHLY", 0),)
+
+
+def test_relabelling_does_not_repoint_the_front_contract():
+    """MONTHLY 0 must resolve to the very expiry WEEKLY 0 did — the fix
+    changes the LABEL of what we record, never which contract it is."""
+    assert (chainmod.resolve_expiry(MONTHLIES, "MONTHLY", 0)
+            == chainmod.resolve_expiry(MONTHLIES, "WEEKLY", 0)
+            == "2026-08-25")
+
+
+# --- lookups still work for strategies written against the old label -------
+
+def _leg(kind):
+    return LegSpec(action=Action.BUY, option_type=OptionType.CALL,
+                   strike_offset=0, expiry_kind=kind, expiry_offset=0, lots=1)
+
+
+def _hub_with_monthly_cache(underlying="BANKNIFTY"):
+    hub = MarketHub.__new__(MarketHub)
+    hub._chain_cache = {underlying: {
+        ("MONTHLY", 0, 0, "CALL"): OptionQuote(
+            ts=TS, underlying=underlying, expiry=date(2026, 8, 25),
+            strike=54000.0, option_type=OptionType.CALL, ltp=120.0)}}
+    hub._chain_no_weekly = {underlying}
+    hub.store = None
+    return hub
+
+
+def test_a_weekly_legspec_still_prices_on_a_monthly_only_underlying():
+    """Strategies written while the cache was mislabelled still declare
+    WEEKLY. Returning None would mean no fills at all — translate instead, so
+    they price exactly the contract they priced before."""
+    hub = _hub_with_monthly_cache()
+    q = hub.quote("BANKNIFTY", TS, _leg(ExpiryKind.WEEKLY))
+    assert q is not None and q.ltp == 120.0
+
+
+def test_a_monthly_legspec_prices_directly():
+    hub = _hub_with_monthly_cache()
+    q = hub.quote("BANKNIFTY", TS, _leg(ExpiryKind.MONTHLY))
+    assert q is not None and q.ltp == 120.0
+
+
+def test_the_remap_does_not_apply_to_underlyings_with_weeklies():
+    """NIFTY genuinely has weeklies — a WEEKLY leg must NOT be silently
+    re-pointed at its monthly chain."""
+    hub = _hub_with_monthly_cache("NIFTY")
+    hub._chain_no_weekly = set()          # NIFTY's list showed a weekly cycle
+    assert hub._effective_leg("NIFTY", _leg(ExpiryKind.WEEKLY)).expiry_kind \
+        is ExpiryKind.WEEKLY

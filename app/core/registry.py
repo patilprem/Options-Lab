@@ -617,6 +617,37 @@ def record_trade(strategy_id: str, mode: str, payload: dict, run_id: str = "") -
                   (str(uuid.uuid4()), strategy_id, mode, run_id, json.dumps(payload)))
 
 
+def amend_trade(strategy_id: str, mode: str, order_id: str,
+                updates: dict) -> int:
+    """Correct an already-written blotter row IN PLACE. Returns rows changed.
+
+    Fill reconciliation (engines/order_updates) learns the real price/quantity
+    after the row is written — sometimes that the fill never happened at all.
+    The blotter is one row per fill, so a correction must amend that row rather
+    than append a second one that would double-count in every downstream sum.
+    Matching is by the order id stamped into the payload at write time; an
+    order id we never wrote (dry run, blocked order) simply matches nothing.
+    """
+    if not order_id:
+        return 0
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, payload_json FROM trades WHERE strategy_id=? AND mode=? "
+            "AND json_extract(payload_json, '$.order_id') = ?",
+            (strategy_id, mode, str(order_id))).fetchall()
+        n = 0
+        for rid, payload in rows:
+            try:
+                d = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            d.update(updates)
+            c.execute("UPDATE trades SET payload_json=? WHERE id=?",
+                      (json.dumps(d), rid))
+            n += 1
+    return n
+
+
 def record_journal(symbol: str, kind: str, data: dict, ts: str = "") -> None:
     """One rich journal row per scanner-trader entry/exit. Unlike the thin
     blotter (`trades`), `data` carries the full decision context — score
