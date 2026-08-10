@@ -122,8 +122,30 @@ class DataStore:
 
     A single DuckDB connection is NOT safe for concurrent use — FastAPI runs
     sync endpoints in a threadpool, so a backtest and a dashboard poll can hit
-    it at once (that returned None from a COUNT and 500'd). All reads go through
-    `_q` / `_q1` under a lock so access is serialised."""
+    it at once (that returned None from a COUNT and 500'd).
+
+    WRITES are serialised on `_lock`. READS are NOT: each thread gets its own
+    cursor (`_read_con`) and never waits for a writer.
+
+    Sharing one lock between both stalled everything for as long as the biggest
+    write took. The recorder upserts ~4,500 chain rows every ~6 minutes, and on
+    the ARM VPS that INSERT OR REPLACE (primary-key maintenance over a
+    multi-million-row table) holds for 18-30 SECONDS. Measured 2026-08-11:
+    /data/health flat at 0.117s, then one 18-30s stall every 5m56s, exactly on
+    the recorder's cadence — which is why scripts/diag.py kept reporting RED on
+    a perfectly healthy recorder. The dashboard was the visible casualty; the
+    one that mattered is that hub.quote()/quote_position() fall back to the
+    store on a chain-cache miss, so a stop-loss check could queue behind the
+    recorder for half a minute.
+
+    A DuckDB cursor is a separate connection over the same database and reads
+    an MVCC snapshot, so it is unaffected by a write in flight. Verified before
+    building this: during a 198s write, 3,558 cursor reads completed (median
+    4ms, max 116ms, zero errors), and cursors created mid-write are equally
+    safe. Statements auto-commit, so a read issued after a write RETURNS sees
+    that write — only an in-flight one is invisible, which is the point.
+    (Same trick the nightly gap-repair in main.py and the API's read views
+    already use via `.con.cursor()` — just never applied to the read path.)"""
 
     def __init__(self, path: Path = DB_PATH):
         import duckdb
@@ -143,15 +165,35 @@ class DataStore:
         self.con.execute("SET preserve_insertion_order=false")
         self.con.execute(f"SET max_temp_directory_size='{temp_cap_gb}GiB'")
         self.con.execute(SCHEMA)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # WRITES only — see the class docstring
+        self._reads = threading.local()        # one read cursor per thread
+
+    def _read_con(self):
+        """This thread's read cursor, created on first use.
+
+        Per-thread because a DuckDB connection is not safe to use from two
+        threads at once; a cursor per thread costs a ClientContext and dies
+        with the thread. Deliberately NOT created under `_lock` — taking it
+        here would reintroduce exactly the stall this exists to remove, for
+        every thread's first query.
+
+        Both lookups are getattr-guarded: several tests drive the real store
+        methods through a DataStore.__new__ stand-in that sets only `con` and
+        `_lock`, so __init__ never ran."""
+        tl = getattr(self, "_reads", None)
+        if tl is None:
+            import threading
+            tl = self._reads = threading.local()
+        con = getattr(tl, "con", None)
+        if con is None:
+            con = tl.con = self.con.cursor()
+        return con
 
     def _q(self, sql: str, params=None):
-        with self._lock:
-            return self.con.execute(sql, params or []).fetchall()
+        return self._read_con().execute(sql, params or []).fetchall()
 
     def _q1(self, sql: str, params=None):
-        with self._lock:
-            return self.con.execute(sql, params or []).fetchone()
+        return self._read_con().execute(sql, params or []).fetchone()
 
     def underlying_bars(self, underlying: str, start: datetime, end: datetime,
                         interval_min: int) -> list[Bar]:
@@ -328,6 +370,18 @@ class DataStore:
         return rows, opt
 
     # -- live recording (edge-research dataset) ------------------------------
+    def bulk_write(self, sql: str, rows: list) -> int:
+        """One parameterised bulk INSERT under the WRITE lock.
+
+        Exists so writers living outside this class (dhan_client's row
+        upserts) can't reach past `_lock` straight at `self.con` — they did,
+        and were therefore never synchronised against the writers in here."""
+        if not rows:
+            return 0
+        with self._lock:
+            self.con.executemany(sql, rows)
+        return len(rows)
+
     def upsert_chain_rows(self, rows: list[tuple]) -> int:
         """Full-fidelity chain snapshot rows (see chain_snapshots schema)."""
         if not rows:

@@ -614,17 +614,33 @@ def upsert_underlying_rows(store, rows: list[tuple]) -> int:
         _log.warning("dropped %d out-of-session underlying rows (e.g. %s %s)",
                      dropped, rows[0][0],
                      next(r[1] for r in rows if not in_session(r[1], r[0])))
-    if kept:
-        store.con.executemany(
-            "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)", kept)
+    _bulk_upsert(
+        store, "INSERT OR REPLACE INTO underlying_bars VALUES (?,?,?,?,?,?,?,?)",
+        kept)
     return len(kept)
 
 
-def upsert_option_rows(store, rows: list[tuple]) -> int:
-    if rows:
-        store.con.executemany(
-            "INSERT OR REPLACE INTO option_bars VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+def _bulk_upsert(store, sql: str, rows: list) -> int:
+    """Bulk INSERT through the store's WRITE LOCK when it has one.
+
+    These two upserts used to go straight at `store.con`, so they were never
+    synchronised against the writers inside DataStore — two writers on one
+    DuckDB connection. Stand-in stores in tests carry only a bare connection;
+    write directly for those."""
+    if not rows:
+        return 0
+    write = getattr(store, "bulk_write", None)
+    if write is not None:
+        return write(sql, rows)
+    store.con.executemany(sql, rows)
     return len(rows)
+
+
+def upsert_option_rows(store, rows: list[tuple]) -> int:
+    return _bulk_upsert(
+        store,
+        "INSERT OR REPLACE INTO option_bars VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows)
 
 
 # ---------------------------------------------------------------------------

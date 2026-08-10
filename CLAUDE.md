@@ -241,6 +241,24 @@ off-hours window; genuinely urgent fixes get the marker.
   Unknown underlyings get the stricter NSE window.
 - `app/data/store.py` — DuckDB schema (underlying_bars, option_bars with
   ATM-relative keys) + SyntheticStore fallback.
+  READS DO NOT TAKE THE WRITE LOCK. `_lock` guards writes only; `_q`/`_q1` use
+  a per-thread cursor (`_read_con`) — a separate connection over the same DB
+  reading an MVCC snapshot. One shared lock used to stall every reader for as
+  long as the biggest write took: measured 2026-08-11, /data/health flat at
+  0.117s then an 18–30s stall every 5m56s, exactly the chain recorder's
+  cadence (~4,500-row INSERT OR REPLACE with PK maintenance on the ARM VPS).
+  `scripts/diag.py` (10s HTTP timeout) reported RED against a healthy
+  recorder. The dashboard was the visible casualty; the one that mattered is
+  that `hub.quote`/`quote_position` fall back to the store on a chain-cache
+  miss, so a stop-loss check could queue behind the recorder for half a
+  minute. Verified before building: during a 198s write, 3,558 cursor reads
+  completed (median 4ms, max 116ms, 0 errors); cursors created mid-write are
+  equally safe. Statements auto-commit, so only an IN-FLIGHT write is
+  invisible to a reader. tests/test_store_read_concurrency.py pins it by
+  holding `_lock` explicitly (no wall-clock race) and fails — never hangs —
+  if `_q`/`_q1` take the lock again. dhan_client's row upserts went straight
+  at `store.con`, unsynchronised against the writers inside DataStore; they
+  route through `bulk_write` now.
 - `app/data/dhan_client.py` — dhanhq SDK wrappers + backfill CLI.
   Live-verified 2026-07-09. Real-response quirks: intraday arrays under
   `data`, but expired options double-nest at `data['data']['ce'|'pe']` (only
