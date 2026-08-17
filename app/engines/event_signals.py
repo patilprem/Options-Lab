@@ -16,16 +16,42 @@ from datetime import datetime, timedelta
 
 from app.engines import scanner
 
-WEEKLY0 = ("WEEKLY", 0)
+_KIND_RANK = {"WEEKLY": 0, "MONTHLY": 1}
+
+
+def _front_expiry(raw: dict):
+    """The front (expiry_kind, expiry_offset) group present in a recorded cache.
+
+    Derived FROM THE DATA, never hardcoded. This used to filter on a literal
+    ("WEEKLY", 0), which silently discarded EVERY row for any underlying whose
+    chains are recorded as MONTHLY — NSE discontinued BANKNIFTY's weeklies and
+    MCX options are monthly-only, so chain.effective_targets remaps those names
+    WEEKLY->MONTHLY on the live recording path. The report then declared "no
+    chain_snapshots recorded near this window" for BANKNIFTY/CRUDEOIL/GOLD on
+    every window ever run, while their data sat in the table untouched. The
+    same helper backs confluence.build_context, which returned chain=None for
+    those names for the same reason.
+
+    Lowest offset wins (offset 0 is the front contract); a tie between kinds at
+    the same offset prefers WEEKLY, which is the nearer expiry when a name
+    genuinely records both.
+    """
+    groups = {(k[0], k[1]) for k in raw}
+    if not groups:
+        return None
+    return min(groups, key=lambda g: (g[1], _KIND_RANK.get(g[0], 9)))
 
 
 def _cache_at(store, underlying: str, ts: datetime, max_age_min: int):
-    """Point-in-time chain cache restricted to the current weekly expiry —
-    the most liquid, most-watched contract for a same-day move."""
+    """Point-in-time chain cache restricted to the front expiry — the most
+    liquid, most-watched contract for a same-day move. Returns a cache that is
+    homogeneous in (kind, offset), so callers can recover which expiry they got
+    from any key."""
     raw = store.chain_cache_asof(underlying, ts, max_age_min=max_age_min)
     if not raw:
         return None
-    cache = {k: q for k, q in raw.items() if (k[0], k[1]) == WEEKLY0}
+    group = _front_expiry(raw)
+    cache = {k: q for k, q in raw.items() if (k[0], k[1]) == group}
     return cache or None
 
 
@@ -109,6 +135,15 @@ def build_report(store, underlying: str, event: datetime, before: int = 20,
     if not any_data:
         lines.append("\n(no chain_snapshots recorded near this window — nothing to read)")
     else:
+        # Name the contract the numbers above came from. A silently-wrong
+        # expiry filter is what made this report claim BANKNIFTY had no data,
+        # so which expiry it read is never left implicit again.
+        groups = sorted({next(iter(c))[:2] for c in caches_by_offset.values() if c},
+                        key=lambda g: (g[1], _KIND_RANK.get(g[0], 9)))
+        shown = ", ".join(f"{kind}+{off}" for kind, off in groups)
+        lines.append(f"\nExpiry read: {shown}"
+                     f"{'  (MIXED across the window)' if len(groups) > 1 else ''}")
+
         before_cache = caches_by_offset.get(-before) or next(
             (c for o, c in sorted(caches_by_offset.items()) if c is not None), None)
         at_cache = caches_by_offset.get(0) or next(

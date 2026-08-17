@@ -173,6 +173,16 @@ off-hours window; genuinely urgent fixes get the marker.
   corrupt them; dry-run default, Parquet backup + readback, PK-collision check).
   AFTER RUNNING IT: strategies/backtests declaring WEEKLY on those underlyings
   read an EMPTY series from the store — change the declaration to MONTHLY.
+  ANY READER THAT HARDCODES ("WEEKLY", 0) HAS THIS BUG. Found 2026-08-17 in
+  `event_signals._cache_at`: it filtered the chain cache to a literal WEEKLY 0,
+  so every BANKNIFTY/CRUDEOIL/GOLD window ever run printed "no chain_snapshots
+  recorded near this window" while the rows sat in the table — a silent
+  wrong-answer, not an error, and `confluence.build_context` returned
+  chain=None for the same reason (it shares the helper). It now derives the
+  front expiry FROM THE RECORDED KEYS (`_front_expiry`, lowest offset, WEEKLY
+  breaking an offset tie) and the report PRINTS which expiry it read, so a
+  wrong contract can never again be invisible. Grep for hardcoded expiry kinds
+  before trusting any new chain reader.
 - `app/engines/risk.py` — M7 risk panel: pure `evaluate()` (portfolio max daily
   loss + per-strategy caps from settings), `exposure()` by underlying/expiry,
   `snapshot()` (margin utilization, day P&L vs max-loss). PaperRunner.enforce_risk
