@@ -247,6 +247,27 @@ def event_window_signals(date: str, underlying: str = "NIFTY,BANKNIFTY",
     return PlainTextResponse("\n".join(parts))
 
 
+@data_router.get("/data/move_anatomy")
+def move_anatomy(start: str, end: str, underlying: str = "NIFTY,BANKNIFTY",
+                 lookback: int = 9, window_min: int = 30,
+                 min_atr_mult: float = 2.0, min_pct: float = 0.35,
+                 sample: int = 5, max_age_min: int = 10):
+    """Find every move big enough to be worth trading across the recorded
+    history, then rank which measurable features preceded them — by effect
+    size AND by precision/recall against every non-move window. Discovery,
+    not confirmation: no condition is specified up front.
+
+    HEAVY — human- or schedule-triggered only, never in the trading loop."""
+    from fastapi.responses import PlainTextResponse
+    from app.engines.move_anatomy import build_report
+    d0 = datetime.strptime(start, "%Y-%m-%d").date()
+    d1 = datetime.strptime(end, "%Y-%m-%d").date()
+    parts = [build_report(_store, u.strip(), d0, d1, lookback, window_min,
+                          min_atr_mult, min_pct, sample, max_age_min)
+             for u in underlying.split(",") if u.strip()]
+    return PlainTextResponse("\n".join(parts))
+
+
 @data_router.get("/data/signal_study")
 def signal_study(start: str, end: str, underlying: str = "NIFTY,BANKNIFTY",
                  lookback_bars: int = 9, min_shift: float = 0.5,
