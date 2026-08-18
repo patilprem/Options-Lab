@@ -116,12 +116,29 @@ def build_report(store, underlying: str, event: datetime, before: int = 20,
 
     lines.append(f"\n{'time':>6}  {'PCR(oi)':>8}  {'ATM IV':>7}  {'IV skew':>8}  "
                  f"{'max pain':>9}  {'call OI':>10}  {'put OI':>10}")
-    caches_by_offset = {}
+    caches_by_offset = {off: _cache_at(store, underlying, event + timedelta(minutes=off),
+                                       max_age_min)
+                        for off in offsets}
+
+    # PIN ONE EXPIRY for the whole window. A poll writes its targets seconds
+    # apart, so a sample whose batch caught only the NEXT expiry would other-
+    # wise be read as if it were the front one — and _top_oi_moves would then
+    # difference two DIFFERENT contracts and report the result as OI flow.
+    # Observed 2026-08-17 on BANKNIFTY: MONTHLY+1 samples interleaved with
+    # MONTHLY+0 ones. Off-expiry samples are dropped to '—' (honestly missing)
+    # rather than silently switching contracts mid-timeline.
+    groups = {next(iter(c))[:2] for c in caches_by_offset.values() if c}
+    pinned = (min(groups, key=lambda g: (g[1], _KIND_RANK.get(g[0], 9)))
+              if groups else None)
+    dropped = 0
+    for off, c in caches_by_offset.items():
+        if c and next(iter(c))[:2] != pinned:
+            caches_by_offset[off] = None
+            dropped += 1
+
     any_data = False
     for off in offsets:
-        ts = event + timedelta(minutes=off)
-        cache = _cache_at(store, underlying, ts, max_age_min)
-        caches_by_offset[off] = cache
+        cache = caches_by_offset[off]
         if cache is None:
             lines.append(f"{off:+5d}m  {'—':>8}  {'—':>7}  {'—':>8}  {'—':>9}  {'—':>10}  {'—':>10}")
             continue
@@ -138,11 +155,9 @@ def build_report(store, underlying: str, event: datetime, before: int = 20,
         # Name the contract the numbers above came from. A silently-wrong
         # expiry filter is what made this report claim BANKNIFTY had no data,
         # so which expiry it read is never left implicit again.
-        groups = sorted({next(iter(c))[:2] for c in caches_by_offset.values() if c},
-                        key=lambda g: (g[1], _KIND_RANK.get(g[0], 9)))
-        shown = ", ".join(f"{kind}+{off}" for kind, off in groups)
-        lines.append(f"\nExpiry read: {shown}"
-                     f"{'  (MIXED across the window)' if len(groups) > 1 else ''}")
+        lines.append(f"\nExpiry read: {pinned[0]}+{pinned[1]}"
+                     + (f"  ({dropped} sample(s) dropped: a different expiry "
+                        f"was the freshest one recorded there)" if dropped else ""))
 
         before_cache = caches_by_offset.get(-before) or next(
             (c for o, c in sorted(caches_by_offset.items()) if c is not None), None)

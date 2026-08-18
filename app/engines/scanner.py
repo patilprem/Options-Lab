@@ -421,6 +421,13 @@ def max_pain(cache: dict) -> Optional[float]:
         return None
     calls = [(q.strike, q.oi or 0) for k, q in cache.items() if k[3] == "CALL"]
     puts = [(q.strike, q.oi or 0) for k, q in cache.items() if k[3] == "PUT"]
+    # A chain with strikes but ZERO open interest everywhere makes every strike
+    # tie at pain 0, and the loop below would return the LOWEST strike as if it
+    # were a real level. Observed 2026-08-17: a next-month BANKNIFTY chain with
+    # no OI yet printed "max pain 31000" against a 57180 spot. Absent OI means
+    # no OI gravity to find, so say so instead of inventing a number.
+    if not any(oi for _, oi in calls) and not any(oi for _, oi in puts):
+        return None
     best = best_pain = None
     for P in strikes:
         pain = (sum(oi * max(P - s, 0) for s, oi in calls)
