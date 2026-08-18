@@ -42,12 +42,21 @@ def _front_expiry(raw: dict):
     return min(groups, key=lambda g: (g[1], _KIND_RANK.get(g[0], 9)))
 
 
-def _cache_at(store, underlying: str, ts: datetime, max_age_min: int):
+def _cache_at(store, underlying: str, ts: datetime, max_age_min: int,
+              source: str = "chain"):
     """Point-in-time chain cache restricted to the front expiry — the most
     liquid, most-watched contract for a same-day move. Returns a cache that is
     homogeneous in (kind, offset), so callers can recover which expiry they got
-    from any key."""
-    raw = store.chain_cache_asof(underlying, ts, max_age_min=max_age_min)
+    from any key.
+
+    `source` selects the table: "chain" = live-recorded chain_snapshots (full
+    strike breadth, ~27 sessions), "option_bars" = backfilled history (ATM+-5
+    only, hundreds of sessions). Near-ATM metrics (atm_iv, iv_skew) agree
+    across both; PCR and the OI totals DO NOT — option_bars sees only ATM+-5.
+    """
+    reader = (store.option_bar_cache_asof if source == "option_bars"
+              else store.chain_cache_asof)
+    raw = reader(underlying, ts, max_age_min=max_age_min)
     if not raw:
         return None
     group = _front_expiry(raw)
