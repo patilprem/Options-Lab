@@ -247,6 +247,29 @@ def event_window_signals(date: str, underlying: str = "NIFTY,BANKNIFTY",
     return PlainTextResponse("\n".join(parts))
 
 
+@data_router.get("/data/signal_study")
+def signal_study(start: str, end: str, underlying: str = "NIFTY,BANKNIFTY",
+                 lookback_bars: int = 9, min_shift: float = 0.5,
+                 bias_gate: float = 0.3, sample: int = 5,
+                 max_age_min: int = 10, sweep: bool = True):
+    """Does the skew/bias divergence actually predict anything, across ALL
+    recorded history? Reports conditional forward returns against the
+    UNCONDITIONAL baseline over the same bars (edge), plus a threshold sweep
+    so a lucky cell can be told apart from a real plateau.
+
+    HEAVY — loads every session in the range and re-runs the grid. Human- or
+    schedule-triggered only, never in the trading loop."""
+    from fastapi.responses import PlainTextResponse
+    from app.engines.signal_study import build_report
+    d0 = datetime.strptime(start, "%Y-%m-%d").date()
+    d1 = datetime.strptime(end, "%Y-%m-%d").date()
+    parts = [build_report(_store, u.strip(), d0, d1, lookback_bars, min_shift,
+                          bias_gate, sample=sample, max_age_min=max_age_min,
+                          do_sweep=sweep)
+             for u in underlying.split(",") if u.strip()]
+    return PlainTextResponse("\n".join(parts))
+
+
 @data_router.get("/data/premove_clues")
 def premove_clues(date: str, underlying: str = "NIFTY,BANKNIFTY",
                   window_min: int = 30, lookback_min: int = 45,

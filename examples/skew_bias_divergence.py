@@ -12,6 +12,17 @@
 # So the trigger is a DISAGREEMENT, and the trade sides with the option
 # surface against the breadth read.
 #
+# STATUS: UNVALIDATED. The thesis above came from ONE session. Before this
+# deserves capital, run the historical study over every recorded day:
+#     GET /data/signal_study?start=...&end=...&underlying=NIFTY
+#     (or venv/bin/python -m scripts.signal_study --start ... --end ...)
+# It reports the condition's forward returns against the UNCONDITIONAL
+# baseline over the same bars — the EDGE column — and sweeps the thresholds
+# so a real plateau can be told apart from one lucky cell. If edge shows up in
+# only a few grid cells, that is what noise looks like and this file should be
+# deleted rather than tuned. The defaults below are the ONE-DAY observation
+# written down, NOT a fitted result; set them from the study's plateau.
+#
 # HONESTY: this strategy CANNOT degrade gracefully. Its entire thesis is the
 # two signals disagreeing, so with either unavailable it simply does not
 # trade — no chain, no bias, no entry. In backtest that means it only trades
