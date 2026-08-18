@@ -247,6 +247,25 @@ def event_window_signals(date: str, underlying: str = "NIFTY,BANKNIFTY",
     return PlainTextResponse("\n".join(parts))
 
 
+@data_router.get("/data/premove_clues")
+def premove_clues(date: str, underlying: str = "NIFTY,BANKNIFTY",
+                  window_min: int = 30, lookback_min: int = 45,
+                  sample: int = 5, top_n: int = 3, max_age_min: int = 10):
+    """"Was there a tell?" — finds the day's sharpest moves itself and reports
+    what the chain / index-bias / spot behaviour were doing in the run-up,
+    scored against the rest of the SAME session. Unlike
+    /data/event_window_signals you do not have to know when the move was.
+    Reuses the app's already-open store connection, so it works while the app
+    is live (the CLI twin cannot — DuckDB's file lock is exclusive)."""
+    from fastapi.responses import PlainTextResponse
+    from app.engines.premove import build_report
+    day = datetime.strptime(date, "%Y-%m-%d").date()
+    parts = [build_report(_store, u.strip(), day, window_min, lookback_min,
+                          sample, top_n, max_age_min)
+             for u in underlying.split(",") if u.strip()]
+    return PlainTextResponse("\n".join(parts))
+
+
 @data_router.get("/data/pivot_confluence")
 def pivot_confluence(at: str = "", underlying: str = "NIFTY,BANKNIFTY",
                      tolerance_pct: float = 0.15, lookback_days: int = 5,
