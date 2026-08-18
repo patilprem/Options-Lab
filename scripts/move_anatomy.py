@@ -50,6 +50,13 @@ def main() -> int:
                          "promoting noise via collapsed ATR)")
     ap.add_argument("--sample", type=int, default=5)
     ap.add_argument("--max-age-min", type=int, default=10)
+    ap.add_argument("--source", choices=("option_bars", "chain"),
+                    default="option_bars",
+                    help="option_bars = backfilled history, hundreds of "
+                         "sessions (default). chain = live chain_snapshots, "
+                         "full strike breadth but only ~27 sessions.")
+    ap.add_argument("--holdout", type=float, default=0.4,
+                    help="fraction of days held out to confirm findings on")
     args = ap.parse_args()
 
     store = get_store()
@@ -60,7 +67,8 @@ def main() -> int:
     for u in args.underlying:
         print(build_report(store, u, args.start, args.end, args.lookback,
                            args.window, args.min_atr, args.min_pct,
-                           args.sample, args.max_age_min))
+                           args.sample, args.max_age_min, args.source,
+                           args.holdout))
     return 0
 
 

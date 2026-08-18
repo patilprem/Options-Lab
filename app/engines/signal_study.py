@@ -44,7 +44,7 @@ DEFAULT_HORIZONS = (15, 30, 60)
 # --------------------------------------------------------------------------
 
 def day_series(store, underlying: str, day, sample: int = 5,
-               max_age_min: int = 10):
+               max_age_min: int = 10, source: str = "chain"):
     """Aligned [{ts, skew, bias, spot}] for one session, or [] if unusable."""
     base = datetime.combine(day, datetime.min.time())
     bars = store.underlying_bars(underlying, base.replace(hour=9, minute=0),
@@ -54,7 +54,7 @@ def day_series(store, underlying: str, day, sample: int = 5,
     spot_at = {b.ts: b.close for b in bars}
 
     tl = session_timeline(store, underlying, day, sample=sample,
-                          max_age_min=max_age_min)
+                          max_age_min=max_age_min, source=source)
     out = []
     for r in tl["rows"]:
         ts = r["ts"]
@@ -173,7 +173,7 @@ def summarize(all_firings, base, horizons=DEFAULT_HORIZONS):
 # --------------------------------------------------------------------------
 
 def load_days(store, underlying: str, start, end, sample: int = 5,
-              max_age_min: int = 10, progress=None):
+              max_age_min: int = 10, progress=None, source: str = "chain"):
     """Series for every weekday in the range that has usable data.
 
     Loaded ONCE and reused across the whole threshold sweep — re-reading the
@@ -182,7 +182,7 @@ def load_days(store, underlying: str, start, end, sample: int = 5,
     days, d = [], start
     while d <= end:
         if d.weekday() < 5:
-            s = day_series(store, underlying, d, sample, max_age_min)
+            s = day_series(store, underlying, d, sample, max_age_min, source)
             if any(r["skew"] is not None for r in s):
                 days.append((d, s))
             if progress:

@@ -11,7 +11,7 @@ discriminating feature IS found.
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from app.engines import move_anatomy as M
 
@@ -112,3 +112,46 @@ def test_too_few_moves_refuses_a_verdict():
     days = [(0, _series(40, [-1.0] * 40, [100.0] * 40))]
     samples = M.collect(days, 9, 6, 2.0, 0.35)
     assert M.separation(samples, "d_skew", "up")["verdict"] == "insufficient"
+
+
+# --- independent events + holdout (the overlap correction) ------------------
+
+def test_consecutive_bars_collapse_to_one_event():
+    """Six consecutive 5-min samples share almost all of their window — one
+    event observed six times, not six observations."""
+    t0 = datetime(2026, 8, 17, 10, 0)
+    items = [("d1", t0 + timedelta(minutes=5 * i)) for i in range(6)]
+    assert M.count_events(items, gap_bars=6, sample=5) == 1
+
+
+def test_separated_bars_are_separate_events():
+    t0 = datetime(2026, 8, 17, 10, 0)
+    items = [("d1", t0), ("d1", t0 + timedelta(minutes=120))]
+    assert M.count_events(items, gap_bars=6, sample=5) == 2
+
+
+def test_same_time_different_days_are_separate_events():
+    t0 = datetime(2026, 8, 17, 10, 0)
+    assert M.count_events([("d1", t0), ("d2", t0)], gap_bars=6, sample=5) == 2
+
+
+def test_verdict_gates_on_events_not_bars():
+    """THE correction: a run of overlapping bars must not buy a verdict.
+    One long continuous firing is one event however many bars it spans."""
+    n = 200
+    # skew falls continuously; price rises continuously -> every bar is 'up'
+    days = [("d1", _series(n, [-1.0 - 0.05 * i for i in range(n)],
+                           [100.0 + 2.0 * i for i in range(n)]))]
+    samples = M.collect(days, 9, 6, 2.0, 0.35)
+    sep = M.separation(samples, "d_skew", "up")
+    assert sep["verdict"] == "insufficient", sep
+    assert sep["n_events"] < M.MIN_CLASS
+
+
+def test_split_days_is_chronological_never_shuffled():
+    """Shuffling would leak tomorrow into today."""
+    days = [(date(2026, 8, d), []) for d in range(1, 11)]
+    disc, hold = M.split_days(days, 0.4)
+    assert [d for d, _ in disc] == [date(2026, 8, d) for d in range(1, 7)]
+    assert [d for d, _ in hold] == [date(2026, 8, d) for d in range(7, 11)]
+    assert max(d for d, _ in disc) < min(d for d, _ in hold)

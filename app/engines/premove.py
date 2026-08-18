@@ -95,8 +95,27 @@ def spot_stats(bars):
 # Session-wide chain timeline
 # --------------------------------------------------------------------------
 
+def _asof(day_caches, ts, max_age_min: int):
+    """Latest pre-loaded cache at or before `ts`, pinned to the front expiry.
+
+    Same staleness rule as the per-sample readers: a reading older than
+    max_age_min is not carried forward, it is absent."""
+    import bisect
+    from app.engines.event_signals import _front_expiry
+    i = bisect.bisect_right([t for t, _ in day_caches], ts) - 1
+    if i < 0:
+        return None
+    t, raw = day_caches[i]
+    if (ts - t).total_seconds() > max_age_min * 60 or not raw:
+        return None
+    group = _front_expiry(raw)
+    cache = {k: q for k, q in raw.items() if (k[0], k[1]) == group}
+    return cache or None
+
+
 def session_timeline(store, underlying: str, day, start_hm=(9, 15),
-                     end_hm=(15, 30), sample: int = 5, max_age_min: int = 10):
+                     end_hm=(15, 30), sample: int = 5, max_age_min: int = 10,
+                     source: str = "chain"):
     """Chain metrics sampled across the whole session.
 
     Expiry is PINNED to the front contract for the day (same discipline as
@@ -107,9 +126,20 @@ def session_timeline(store, underlying: str, day, start_hm=(9, 15),
     base = datetime.combine(day, datetime.min.time())
     t = base.replace(hour=start_hm[0], minute=start_hm[1])
     end = base.replace(hour=end_hm[0], minute=end_hm[1])
+
+    # option_bars is read a DAY AT A TIME. Per-sample as-of lookups cost two
+    # queries each, which is ~95k queries across a 600-session study and simply
+    # does not finish. chain stays per-sample: only ~27 sessions exist, and its
+    # polls land at irregular times a day-bucket would not line up with.
+    day_caches = (store.option_bar_day(underlying, day)
+                  if source == "option_bars" else None)
+
     raw = []
     while t <= end:
-        raw.append((t, _cache_at(store, underlying, t, max_age_min)))
+        if day_caches is None:
+            raw.append((t, _cache_at(store, underlying, t, max_age_min, source)))
+        else:
+            raw.append((t, _asof(day_caches, t, max_age_min)))
         t += timedelta(minutes=sample)
 
     groups = {next(iter(c))[:2] for _, c in raw if c}

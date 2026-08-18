@@ -52,7 +52,7 @@ _LABEL = {
 # --------------------------------------------------------------------------
 
 def rich_series(store, underlying: str, day, sample: int = 5,
-                max_age_min: int = 10):
+                max_age_min: int = 10, source: str = "chain"):
     """Every chain metric + spot + bias, aligned on one session's bars."""
     base = datetime.combine(day, datetime.min.time())
     bars = store.underlying_bars(underlying, base.replace(hour=9, minute=0),
@@ -61,15 +61,29 @@ def rich_series(store, underlying: str, day, sample: int = 5,
         return []
     by_ts = {b.ts: b for b in bars}
     tl = session_timeline(store, underlying, day, sample=sample,
-                          max_age_min=max_age_min)
+                          max_age_min=max_age_min, source=source)
+    # index_bias exists for only ~23 sessions while option_bars spans hundreds.
+    # Loaded per DAY (not per sample) and resolved in memory; absent on most
+    # days, which is fine because bias is an OPTIONAL feature (see features_at).
+    bias_rows = store.index_bias_day(underlying, day)
+    bias_ts = [t for t, _ in bias_rows]
+
+    def _bias_at(ts):
+        if not bias_rows:
+            return None
+        import bisect
+        i = bisect.bisect_right(bias_ts, ts) - 1
+        if i < 0 or (ts - bias_ts[i]).total_seconds() > 30 * 60:
+            return None
+        return bias_rows[i][1]
+
     out = []
     for r in tl["rows"]:
         b = by_ts.get(r["ts"])
         if b is None:
             continue
-        ib = store.index_bias_asof(underlying, r["ts"], max_age_min=30)
         out.append({"ts": r["ts"], "spot": b.close, "high": b.high, "low": b.low,
-                    "bias": (ib or {}).get("score"), **{k: r[k] for k in
+                    "bias": _bias_at(r["ts"]), **{k: r[k] for k in
                     ("pcr_oi", "atm_iv", "iv_skew", "call_oi", "put_oi", "max_pain")}})
     return out
 
@@ -109,8 +123,10 @@ def features_at(series, i: int, lookback: int):
     for k in range(i - lookback, i + 1):
         if series[k]["iv_skew"] is None:
             return None
-    if cur["bias"] is None:
-        return None
+    # bias is OPTIONAL. It exists for ~23 sessions while option_bars spans
+    # hundreds, so requiring it would silently collapse a 600-session study
+    # back to 23 and quietly discard the very history this source exists for.
+    # A missing bias nulls THAT feature only; scoring skips None per feature.
 
     day_hi = max(s["high"] for s in series[:i + 1])
     day_lo = min(s["low"] for s in series[:i + 1])
@@ -175,6 +191,48 @@ def collect(days, lookback: int, window_bars: int, min_atr_mult: float,
 
 
 # --------------------------------------------------------------------------
+# Independent events
+# --------------------------------------------------------------------------
+
+def count_events(items, gap_bars: int = 6, sample: int = 5):
+    """Collapse consecutive samples into INDEPENDENT events.
+
+    At 5-min bars with a 30-min forward window, six consecutive samples share
+    5/6 of that window and almost all of their lookback — they are one event
+    observed six times, not six observations. Counting bars instead of events
+    inflates every sample gate and every confidence estimate by roughly the
+    overlap factor, which is exactly how a 20-"firing" result turns out to rest
+    on three actual occurrences.
+
+    `items` is [(day, ts)]. Two samples on the same day within `gap_bars` of
+    each other belong to the same event; a different day is always a new one.
+    """
+    if not items:
+        return 0
+    events, last = 0, None
+    for day, ts in sorted(items, key=lambda x: (str(x[0]), x[1])):
+        if (last is None or last[0] != day
+                or (ts - last[1]).total_seconds() > gap_bars * sample * 60):
+            events += 1
+        last = (day, ts)
+    return events
+
+
+def split_days(days, holdout_frac: float = 0.4):
+    """Chronological discover/confirm split.
+
+    Eight features x two directions x four thresholds is ~64 comparisons, and
+    the best of 64 looks good by luck alone. Anything found on the discovery
+    half has to survive the held-out half, which is the same discipline
+    walkforward.py already applies to strategy params. The split is by DATE,
+    never shuffled — shuffling would leak tomorrow into today.
+    """
+    ordered = sorted(days, key=lambda x: x[0])
+    cut = int(len(ordered) * (1 - holdout_frac))
+    return ordered[:cut], ordered[cut:]
+
+
+# --------------------------------------------------------------------------
 # Separation, precision / recall
 # --------------------------------------------------------------------------
 
@@ -197,15 +255,18 @@ def separation(samples, feature: str, target: str):
     """
     t = [f[feature] for lab, f, _ in samples if lab == target and f[feature] is not None]
     c = [f[feature] for lab, f, _ in samples if lab != target and f[feature] is not None]
-    if len(t) < MIN_CLASS or len(c) < MIN_CLASS:
+    # gate on INDEPENDENT events, not overlapping bars
+    ev = count_events([(m["day"], m["ts"]) for lab, f, m in samples
+                       if lab == target and f[feature] is not None])
+    if ev < MIN_CLASS or len(c) < MIN_CLASS:
         return {"feature": feature, "verdict": "insufficient",
-                "n_target": len(t), "n_other": len(c)}
+                "n_target": len(t), "n_events": ev, "n_other": len(c)}
     mt, st = _mean_sd(t)
     mc, sc = _mean_sd(c)
     pooled = (((st or 0) ** 2 + (sc or 0) ** 2) / 2) ** 0.5
     return {"feature": feature, "verdict": "ok", "n_target": len(t),
-            "n_other": len(c), "mean_target": mt, "mean_other": mc,
-            "d": ((mt - mc) / pooled) if pooled else None}
+            "n_events": ev, "n_other": len(c), "mean_target": mt,
+            "mean_other": mc, "d": ((mt - mc) / pooled) if pooled else None}
 
 
 def precision_recall(samples, feature: str, target: str, direction: int,
@@ -275,7 +336,8 @@ def _f(v, nd=2):
 def build_report(store, underlying: str, start, end, lookback: int = 9,
                  window_min: int = 30, min_atr_mult: float = 2.0,
                  min_pct: float = 0.35, sample: int = 5,
-                 max_age_min: int = 10) -> str:
+                 max_age_min: int = 10, source: str = "chain",
+                 holdout_frac: float = 0.4) -> str:
     from app.engines.signal_study import load_days  # same day loader
 
     L = [f"\n{'=' * 78}",
@@ -285,7 +347,7 @@ def build_report(store, underlying: str, start, end, lookback: int = 9,
     d = start
     while d <= end:
         if d.weekday() < 5:
-            s = rich_series(store, underlying, d, sample, max_age_min)
+            s = rich_series(store, underlying, d, sample, max_age_min, source)
             if any(r["iv_skew"] is not None for r in s):
                 days.append((d, s))
         d += timedelta(days=1)
@@ -294,10 +356,14 @@ def build_report(store, underlying: str, start, end, lookback: int = 9,
         return "\n".join(L)
 
     window_bars = max(1, window_min // sample)
-    samples = collect(days, lookback, window_bars, min_atr_mult, min_pct)
+    disc_days, hold_days = split_days(days, holdout_frac)
+    samples = collect(disc_days, lookback, window_bars, min_atr_mult, min_pct)
+    hold_samples = collect(hold_days, lookback, window_bars, min_atr_mult, min_pct)
     counts = {k: sum(1 for lab, _, _ in samples if lab == k)
               for k in ("up", "down", "quiet")}
-    L.append(f"Days with chain data: {len(days)}   usable windows: {len(samples)}")
+    L.append(f"Source: {source}   days: {len(days)} "
+             f"(discover {len(disc_days)} / holdout {len(hold_days)})")
+    L.append(f"Usable windows: {len(samples)} discover, {len(hold_samples)} holdout")
     L.append(f"Move definition: >= {min_atr_mult}x ATR AND >= {min_pct}% "
              f"over {window_min}m   (run-up measured over {lookback * sample}m)")
     L.append(f"Moves found:  UP {counts['up']}   DOWN {counts['down']}   "
@@ -315,31 +381,44 @@ def build_report(store, underlying: str, start, end, lookback: int = 9,
                      f"of {MIN_CLASS}. No verdict.\n  Widen the date range or "
                      f"loosen the move definition.")
             continue
-        L.append(f"  {'feature':<20} {'before':>9} {'other':>9} {'d':>6} "
-                 f"{'prec':>7} {'base':>7} {'lift':>6} {'recall':>7}")
+        L.append(f"  {'feature':<20} {'ev':>4} {'d':>6} {'lift':>6} "
+                 f"{'recall':>7}   {'HOLDOUT lift':>12}")
         for row in analyse(samples, target):
             sep, pr = row["sep"], row["pr"]
             if sep["verdict"] != "ok":
-                L.append(f"  {_LABEL[sep['feature']]:<20} insufficient sample")
+                L.append(f"  {_LABEL[sep['feature']]:<20} "
+                         f"{sep.get('n_events', 0):>4}  insufficient independent events")
                 continue
-            line = (f"  {_LABEL[sep['feature']]:<20} {_f(sep['mean_target']):>9} "
-                    f"{_f(sep['mean_other']):>9} {_f(sep['d'], 2):>6}")
+            line = (f"  {_LABEL[sep['feature']]:<20} {sep['n_events']:>4} "
+                    f"{_f(sep['d'], 2):>6}")
             if pr and pr.get("verdict") == "ok" and pr.get("best"):
                 b = pr["best"]
-                line += (f" {b['precision'] * 100:>6.1f}% "
-                         f"{pr['base_rate'] * 100:>6.1f}% "
-                         f"{b['lift']:>5.2f}x {b['recall'] * 100:>6.1f}%")
+                line += f" {b['lift']:>5.2f}x {b['recall'] * 100:>6.1f}%"
+                # Does it survive on days the ranking never saw?
+                hp = precision_recall(hold_samples, sep["feature"], target,
+                                      -1 if sep["d"] < 0 else 1)
+                if hp.get("verdict") == "ok" and hp.get("best"):
+                    hl = hp["best"]["lift"]
+                    line += (f"   {hl:>10.2f}x"
+                             + ("" if hl >= 1.3 else "  <- FAILS"))
+                else:
+                    line += "        no holdout sample"
+            else:
+                line += "      —"
             L.append(line)
 
     L.append(f"\n{'=' * 78}")
     L.append("HOW TO READ THIS\n"
+             "  ev     — INDEPENDENT events, not bars. Overlapping windows are\n"
+             "           collapsed, so this is the number that gates a verdict.\n"
              "  d      — effect size. |d|<0.2 is negligible no matter how many\n"
              "           samples back it; that feature does not separate.\n"
-             "  prec   — of the windows where the feature fired, how many were\n"
-             "           followed by the move. MUST beat 'base'.\n"
              "  lift   — precision / base rate. 1.0x means the feature added\n"
              "           nothing at all. Below ~1.5x is not worth trading.\n"
              "  recall — of all such moves, how many the feature caught.\n"
+             "  HOLDOUT— the same lift on days the ranking never saw. THIS is\n"
+             "           the number to believe. ~64 comparisons are run here, so\n"
+             "           the best discovery-half cell looks good by luck alone.\n"
              "High recall with 1.0x lift is the classic trap: it fires before\n"
              "every move AND before everything else.")
     return "\n".join(L)

@@ -858,6 +858,100 @@ class DataStore:
                 delta=r[13], theta=r[14], vega=r[15], gamma=r[16])
         return cache or None
 
+    def option_bar_cache_asof(self, underlying: str, ts, max_age_min: int = 10):
+        """chain_cache_asof's twin, reading option_bars instead.
+
+        Same {(kind, offset, strike_offset, option_type): OptionQuote} shape, so
+        scanner.chain_metrics() and max_pain() consume it unchanged — the SAME
+        pure functions the live scanner uses, which is the whole point: a
+        historical study and a live read must not compute their metrics two
+        different ways.
+
+        WHY THIS EXISTS: chain_snapshots is live-recorded and only 27 sessions
+        deep, far too thin to validate anything. option_bars is BACKFILLED from
+        Dhan's expired-options API across hundreds of sessions and carries iv +
+        oi at ATM-relative offsets (backfill covers ATM+-5), which is everything
+        atm_iv and iv_skew need — skew uses OTM strikes within 3 of ATM, atm_iv
+        uses offset 0.
+
+        NOT comparable to chain_snapshots for PCR / call_oi / put_oi: those sum
+        over EVERY strike in the live chain (244 for NIFTY) whereas this sees
+        only ATM+-5. Near-ATM measures transfer; breadth measures do not. Callers
+        studying PCR across both sources would be comparing two different
+        quantities.
+
+        No bid/ask (option_bars holds OHLC, not quotes), so liquidity_screen
+        cannot run off this — chain_metrics and max_pain can.
+        """
+        tsrow = self._q1(
+            """SELECT max(ts) FROM option_bars
+               WHERE underlying=? AND ts <= ?""", [underlying, ts])
+        if not tsrow or tsrow[0] is None:
+            return None
+        latest = tsrow[0]
+        if (ts - latest).total_seconds() > max_age_min * 60:
+            return None
+        rows = self._q(
+            """SELECT ts, expiry, expiry_kind, expiry_offset, strike,
+                      strike_offset, option_type, close, iv, oi, volume
+               FROM option_bars
+               WHERE underlying=? AND ts=?""", [underlying, latest])
+        cache: dict = {}
+        for r in rows:
+            key = (r[2], r[3], r[5], r[6])   # kind, offset, strike_offset, otype
+            cache[key] = OptionQuote(
+                r[0], underlying, r[1], r[4], OptionType(r[6]), ltp=r[7],
+                iv=r[8], oi=r[9], volume=r[10])
+        return cache or None
+
+    def option_bar_day(self, underlying: str, day):
+        """Every option_bars cache for one session, in ONE query.
+
+        option_bar_cache_asof costs 2 queries per sample. A study over 600
+        sessions x ~76 samples is ~95,000 queries and does not finish — measured
+        during development, 30 synthetic sessions alone exceeded two minutes.
+        Loading a day at a time turns that into one query per day and makes the
+        whole history tractable.
+
+        Returns [(ts, {(kind, offset, strike_offset, option_type): OptionQuote})]
+        sorted by ts, so a caller can resolve any sample as-of by bisect."""
+        start = datetime.combine(day, time(0, 0))
+        end = start + timedelta(days=1)
+        rows = self._q(
+            """SELECT ts, expiry, expiry_kind, expiry_offset, strike,
+                      strike_offset, option_type, close, iv, oi, volume
+               FROM option_bars
+               WHERE underlying=? AND ts >= ? AND ts < ?
+               ORDER BY ts""", [underlying, start, end])
+        by_ts: dict = {}
+        for r in rows:
+            by_ts.setdefault(r[0], {})[(r[2], r[3], r[5], r[6])] = OptionQuote(
+                r[0], underlying, r[1], r[4], OptionType(r[6]), ltp=r[7],
+                iv=r[8], oi=r[9], volume=r[10])
+        return sorted(by_ts.items())
+
+    def index_bias_day(self, index_name: str, day):
+        """Every index_bias reading for one session, in ONE query. Same reason
+        as option_bar_day: per-sample as-of lookups do not scale to a study."""
+        start = datetime.combine(day, time(0, 0))
+        end = start + timedelta(days=1)
+        rows = self._q(
+            """SELECT ts, score FROM index_bias_history
+               WHERE index_name=? AND ts >= ? AND ts < ?
+               ORDER BY ts""", [index_name, start, end])
+        return [(r[0], r[1]) for r in rows]
+
+    def option_bars_range(self):
+        """(underlying, first_ts, last_ts, sessions) per underlying.
+
+        /data/coverage reported option_bars as a BARE COUNT, which cannot
+        distinguish a table that stopped writing months ago from one that never
+        had data (CLAUDE.md flags exactly this). A study's statistical power
+        depends on this range, so it has to be visible."""
+        return self._q(
+            """SELECT underlying, min(ts), max(ts), count(DISTINCT CAST(ts AS DATE))
+               FROM option_bars GROUP BY underlying ORDER BY underlying""")
+
     def upsert_index_bias_accuracy(self, day, index_name: str, horizon_min: int,
                                    n: int, hits: int, avg_move: float) -> None:
         hit_rate = (hits / n) if n else None

@@ -251,7 +251,8 @@ def event_window_signals(date: str, underlying: str = "NIFTY,BANKNIFTY",
 def move_anatomy(start: str, end: str, underlying: str = "NIFTY,BANKNIFTY",
                  lookback: int = 9, window_min: int = 30,
                  min_atr_mult: float = 2.0, min_pct: float = 0.35,
-                 sample: int = 5, max_age_min: int = 10):
+                 sample: int = 5, max_age_min: int = 10,
+                 source: str = "option_bars", holdout_frac: float = 0.4):
     """Find every move big enough to be worth trading across the recorded
     history, then rank which measurable features preceded them — by effect
     size AND by precision/recall against every non-move window. Discovery,
@@ -263,7 +264,8 @@ def move_anatomy(start: str, end: str, underlying: str = "NIFTY,BANKNIFTY",
     d0 = datetime.strptime(start, "%Y-%m-%d").date()
     d1 = datetime.strptime(end, "%Y-%m-%d").date()
     parts = [build_report(_store, u.strip(), d0, d1, lookback, window_min,
-                          min_atr_mult, min_pct, sample, max_age_min)
+                          min_atr_mult, min_pct, sample, max_age_min,
+                          source, holdout_frac)
              for u in underlying.split(",") if u.strip()]
     return PlainTextResponse("\n".join(parts))
 
@@ -337,6 +339,13 @@ def data_coverage():
         for u, lo, hi, n in rows:
             out.append({"underlying": u, "from": str(lo)[:10], "to": str(hi)[:10],
                         "underlying_bars": n, "option_bars": opt.get(u, 0)})
+    opt_range = []
+    if store_kind == "DataStore":
+        # a bare option_bars COUNT cannot tell a table that stopped writing
+        # from one that never had data — a study's power depends on the range
+        opt_range = [{"underlying": r[0], "from": str(r[1])[:10],
+                      "to": str(r[2])[:10], "sessions": r[3]}
+                     for r in _store.option_bars_range()]
     rec_names = sorted(set(
         u.strip() for u in (registry.setting("record_underlyings", "NIFTY,BANKNIFTY")
                             + "," + registry.setting("mcx_underlyings", "CRUDEOIL,GOLD")
@@ -344,6 +353,7 @@ def data_coverage():
     return {"store": store_kind,
             "synthetic": store_kind == "SyntheticStore",
             "coverage": out,
+            "option_bars_range": opt_range,
             "recording_on": registry.setting("recording", "on") == "on",
             "recording_underlyings": rec_names,
             "recording_fields": ["ltp", "bid", "ask", "iv", "oi", "volume",
