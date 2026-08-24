@@ -57,6 +57,20 @@ OPEN = datetime(2026, 8, 3, 12, 5)
 CLOSED = datetime(2026, 8, 3, 3, 0)
 
 
+@pytest.fixture(autouse=True)
+def _healthy_credential(monkeypatch):
+    """Give every test in this module a working Dhan credential by default.
+
+    _chain_dead_event now checks the credential FIRST, and a test process has
+    no managed token at all — which is a genuinely dead credential, so without
+    this every ladder test would exercise the token branch instead of the
+    chain one it was written for. An env token reports `unknown` (nothing
+    local can validate it) and is never blamed. The token branch gets its own
+    tests below, which opt out of this fixture explicitly."""
+    monkeypatch.setenv("DHAN_CLIENT_ID", "test-client")
+    monkeypatch.setenv("DHAN_ACCESS_TOKEN", "test-token")
+
+
 def _hub(tick_age=None):
     """tick_age: seconds since the last feed tick, as feed_status() reports it.
     None = no feed / no tick, which is what a holiday looks like from here."""

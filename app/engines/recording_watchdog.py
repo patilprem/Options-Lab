@@ -34,7 +34,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable, Optional
 
-from app.engines.watchdog import GRACE_MIN, REALERT_MIN, session_open_for
+from app.engines.watchdog import (GRACE_MIN, REALERT_MIN, session_elapsed_s,
+                                  session_open_for)
 
 # A periodic recorder that has written nothing for this long, while a session
 # feeding it is open, is broken. Generous on purpose: the chain poller is rate
@@ -59,6 +60,41 @@ def _age_s(last_ts: Optional[str], now: datetime) -> Optional[float]:
     one."""
     ts = _parse_ts(last_ts)
     return None if ts is None else (now - ts).total_seconds()
+
+
+def session_open_s(segments, now: datetime) -> float:
+    """How long the longest-open feeding session has been open at `now`.
+
+    Pure. The MAX across a table's segments, not the min: chain_snapshots is
+    fed by both NSE and MCX, and MCX opening at 09:00 genuinely does mean rows
+    should be landing by 09:15 even though NSE has barely opened."""
+    return max([session_elapsed_s(seg, now) for seg in segments] or [0.0])
+
+
+def overdue_s(last_ts: Optional[str], segments, now: datetime) -> float:
+    """How long a recorder has been overdue, MEASURED INSIDE THE SESSION.
+
+    Pure, and the whole point is the clamp. `last_ts` is an all-time max, so
+    at every session open it points at the PREVIOUS session's final row —
+    Friday 15:30 when it is Monday 09:20. A raw age therefore reads as hours
+    the instant the post-open grace expires, and the watchdog pushed
+    "NOT RECORDING for >15min during market hours" when market hours were
+    five minutes old (observed 2026-08-24 09:16 and 09:20: chain_snapshots at
+    the MCX grace, then index_bias_history and stock_snapshots joining the
+    set at exactly 09:20 as the NSE grace expired — a growing stale set,
+    which is also what a real cascading outage looks like).
+
+    A recorder cannot be later than the session is old. Clamping to the
+    session's own elapsed time makes the claim true, silences the daily
+    open-of-session false alarm, and still fires on the outage this watchdog
+    exists for: a table that records NOTHING all day trips 15 minutes after
+    the open instead of at the open, every day, forever.
+
+    A table never written at all is judged on the session clock alone — the
+    07-23..27 signature, which must stay detectable."""
+    open_s = session_open_s(segments, now)
+    age = _age_s(last_ts, now)
+    return open_s if age is None else min(age, open_s)
 
 
 def recorded_underlyings() -> list:
@@ -145,8 +181,10 @@ def stale_underlyings(rows: list, now: datetime, segments: dict,
     while the specific names we care about are dead (2026-07-31: chain_snapshots
     fresh from stock deep-dives, all four core underlyings frozen 90 minutes).
 
-    A name that has NEVER been written (last_ts=None) is stale as soon as its
-    session is open past the grace period.
+    A name that has NEVER been written (last_ts=None) is stale once its
+    session has been open longer than the threshold — see overdue_s: staleness
+    is measured inside the session, so the previous session's last row can no
+    longer make a recorder look hours late one minute after the open.
 
     THRESHOLDS ADAPT TO THE INSTRUMENT. A flat 15 minutes assumes every name
     writes on a regular beat, and underlying_bars does not: a row only lands
@@ -171,8 +209,8 @@ def stale_underlyings(rows: list, now: datetime, segments: dict,
         seg = segments.get(u) or "NSE"
         if not session_open_for((seg,), now, grace_min):
             continue
-        age = _age_s(row.get("last_ts"), now)
-        if age is None or age > _limit_s(row, seg, stale_after_s):
+        if overdue_s(row.get("last_ts"), (seg,), now) > \
+                _limit_s(row, seg, stale_after_s):
             out.append(f"{table}[{u}]")
     return sorted(out)
 
@@ -193,10 +231,29 @@ def stale_tables(health: list, now: datetime,
             continue
         if not session_open_for(row.get("segments") or (), now, grace_min):
             continue
-        age = _age_s(row.get("last_ts"), now)
-        if age is None or age > stale_after_s:
+        if overdue_s(row.get("last_ts"), row.get("segments") or (),
+                     now) > stale_after_s:
             out.append(row["table"])
     return sorted(out)
+
+
+def credential_hint() -> str:
+    """Name the Dhan token in the push when it is PROVABLY dead.
+
+    A dead 24h token stops every recorder at once, so this alert's list of
+    stale tables looks exactly like a broad recorder outage — and it is the
+    only cause of it whose fix needs no VPS access at all. Silent unless the
+    managed token is provably expired or absent (an env/config token cannot be
+    checked locally and is never blamed), and never raises: a hint that can
+    throw would take down the alert it was decorating."""
+    try:
+        from app.data import dhan_client
+        if dhan_client.credential_is_dead():
+            return (f" — CAUSE: {dhan_client.credential_summary()}; "
+                    f"tap the login link to refresh, no SSH needed")
+    except Exception:                       # pragma: no cover - guard only
+        pass
+    return ""
 
 
 class RecordingWatchdog:
@@ -249,6 +306,6 @@ class RecordingWatchdog:
             mins = int(self.stale_after_s // 60)
             self.notify(
                 f"NOT RECORDING for >{mins}min during market hours: "
-                f"{', '.join(cur)}", "stale")
+                f"{', '.join(cur)}{credential_hint()}", "stale")
             return "stale"
         return None

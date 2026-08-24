@@ -116,6 +116,19 @@ off-hours window; genuinely urgent fixes get the marker.
   because the 07-23..27 outage never touched the socket. Segment-aware and
   event-table-aware so idle-but-correct tables never cry wolf; one push on
   state change, re-push every 15 min, one all-clear.
+  STALENESS IS MEASURED INSIDE THE SESSION (`recording_watchdog.overdue_s`).
+  `recording_health().last_ts` is an ALL-TIME max, so at every open it points
+  at the PREVIOUS session's final row — Friday 15:30 when it is Monday 09:20 —
+  and a raw age crossed 15 min the instant the 5-min post-open grace expired.
+  The watchdog therefore pushed "NOT RECORDING for >15min during market hours"
+  every morning, and on 2026-08-24 it did it twice (09:16, then 09:20 as the
+  NSE grace expired and index_bias_history + stock_snapshots joined the set) —
+  a GROWING stale set, which is also exactly what a real cascading outage looks
+  like. Clamping to `session_elapsed_s` makes the claim true and still fires on
+  the outage this exists for: a table dark all day trips 15 min after the open,
+  every day. The push also NAMES THE DHAN TOKEN when it is provably dead
+  (`credential_hint`) — a dead token stops every recorder at once and is the
+  only cause of this alert fixable from a phone.
   The chain poller also SELF-HEALS now (`MarketHub._chain_stall_step`, pure
   ladder in `chain_stall_stage`, driven by that same once-a-minute loop). It
   had frozen SIX times (07-23..27, 07-28, 07-29, 07-30, 07-31, 08-03) and every
@@ -152,6 +165,25 @@ off-hours window; genuinely urgent fixes get the marker.
   exception, and `_fetch_chain_ratelimited` swallows DhanEmptyFailure by
   design — so the one failure mode that actually kills a session was the one
   that never triggered a rebuild. That is exactly what stage 1 now fixes.
+  THE CREDENTIAL IS CHECKED BEFORE THE CHAIN IS BLAMED. An expired 24h token
+  looks identical to a dead chain from here and FOOLS the live-market
+  discriminator rather than tripping it: every REST call fails while the
+  MarketFeed socket — authenticated when it connected — keeps streaming ticks,
+  so "ticks are still arriving" is true and the alert concluded "a real fault"
+  for something whose fix is a 20-second phone tap (2026-08-24). The 08:30
+  login-link push fires ONCE a day, so a weekend-expired token gets one
+  notification and nothing after it. `dhan_client.credential_is_dead()` is
+  deliberately narrow — provably expired/absent MANAGED token only, never an
+  env/config token whose validity cannot be checked locally, because a false
+  "your token expired" sends someone to fix the one thing that works — and
+  `token_manager.repush_login_link` (30-min throttle) hands over something
+  tappable. Every chain alert also carries `token=<source>:<state>` now.
+  `_chain_detail` prints the EFFECTIVE targets, not `CHAIN_TARGETS`: the GOLD
+  alert read `targets=(('WEEKLY', 0), ('WEEKLY', 1))` on a monthly-only name
+  the poller had already remapped — the same hardcoded-expiry-kind bug the
+  relabel fix removed everywhere else — and it distinguishes "expiry_list keeps
+  answering EMPTY" (the failure is UPSTREAM of option_chain, and stage 2 had no
+  cached list to drop) from "no poll has reached this name yet".
   Corollary: the holiday discriminator must NOT be "is another chain moving?"
   (that would have silenced this outage). A holiday still SERVES a frozen
   chain — fetches succeed, the cache just stops changing — so what a holiday

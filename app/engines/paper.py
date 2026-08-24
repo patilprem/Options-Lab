@@ -874,8 +874,19 @@ class MarketHub:
         worth the fetch. MONTHLY 0 resolves to the same contract WEEKLY 0
         did, so nothing re-points; only the label changes."""
         expiries = await self._get_expiries(client, u, cfg, loop)
-        weekly = chainmod.has_weekly_cycle(expiries)
-        self._note_weekly_cycle(u, weekly)
+        # NO EVIDENCE, NO VERDICT. has_weekly_cycle answers False for an EMPTY
+        # list, which is the right conservative choice for remapping targets
+        # (MONTHLY 0 and WEEKLY 0 resolve to the same contract, and with no
+        # expiries nothing is fetched either way) but the WRONG thing to
+        # remember: the verdict is a durable fact _effective_leg uses to
+        # re-label a RUNNING strategy's legs. During an expiry_list outage —
+        # the 2026-08-24 shape, where the list came back empty for minutes on
+        # end — every underlying would be recorded as having no weekly cycle,
+        # and a live NIFTY strategy's WEEKLY legs would start looking up
+        # MONTHLY keys against a WEEKLY-keyed cache and miss every fill. Only
+        # a list that actually arrived gets to decide.
+        if expiries:
+            self._note_weekly_cycle(u, chainmod.has_weekly_cycle(expiries))
         targets = chainmod.effective_targets(targets, expiries)
         for kind, off in targets:
             exp = chainmod.resolve_expiry(expiries, kind, off)
@@ -1274,6 +1285,25 @@ class MarketHub:
             registry.record_event("warn", "feed",
                                   f"chain alert push failed: {e!r}")
 
+    def _credential_dead(self) -> bool:
+        """Can we PROVE the Dhan credential is unusable? Never raises."""
+        try:
+            from app.data import dhan_client
+            return dhan_client.credential_is_dead()
+        except Exception:                     # pragma: no cover - guard only
+            return False
+
+    def _push_token_link(self, u: str) -> None:
+        """Push a fresh login link, throttled inside token_manager. The chain
+        alert says what is wrong; this one is the thing you can tap."""
+        try:
+            from app.core import token_manager
+            token_manager.repush_login_link(
+                f"chain dead [{u}] — every Dhan REST call is failing")
+        except Exception as e:
+            registry.record_event("warn", "feed",
+                                  f"token link re-push failed: {e!r}")
+
     def _chain_detail(self, u: str) -> str:
         """What a human needs to diagnose one dead chain, in one line.
 
@@ -1284,19 +1314,103 @@ class MarketHub:
         if not cfg:
             return ("no entry in UNDERLYINGS — nothing was ever polled for "
                     "it (an MCX contract that never resolved?)")
-        cached = self._expiries_cache.get(u)
         return (f"sid={cfg.get('security_id')} seg={cfg.get('segment')} "
-                f"targets={self.CHAIN_TARGETS} "
-                f"expiries={(cached[1] if cached else None)!r} "
-                f"cached_quotes={len(self._chain_cache.get(u) or {})}")
+                f"targets={self._targets_detail(u)} "
+                f"{self._expiry_detail(u)} "
+                f"cached_quotes={len(self._chain_cache.get(u) or {})} "
+                f"{self._credential_detail()}")
+
+    def _targets_detail(self, u: str) -> str:
+        """The targets the poller ACTUALLY asks for, not the raw CHAIN_TARGETS.
+
+        This line used to print `self.CHAIN_TARGETS` verbatim, so a GOLD alert
+        read `targets=(('WEEKLY', 0), ('WEEKLY', 1))` (observed 2026-08-24) —
+        on an underlying whose options are monthly-only and which the poller
+        has remapped to MONTHLY since the relabel fix. CLAUDE.md's rule is
+        blunt about this class of bug: any reader that hardcodes ("WEEKLY", 0)
+        has it. A diagnostic that confidently names the wrong contract sends
+        the reader hunting a regression that is not there, which is worse than
+        printing nothing.
+
+        With no evidence either way — no cached expiry list and no live verdict
+        yet — say so rather than guessing, because "unresolved" is itself the
+        finding: the poller never got far enough to choose."""
+        cached = self._expiries_cache.get(u)
+        if cached:
+            return str(chainmod.effective_targets(self.CHAIN_TARGETS, cached[1]))
+        if self.no_weekly_cycle(u):
+            return str(chainmod.effective_targets(self.CHAIN_TARGETS, []))
+        return f"{tuple(self.CHAIN_TARGETS)}(unresolved)"
+
+    def _expiry_detail(self, u: str) -> str:
+        """`expiries=` — and, when there are none, WHY there are none.
+
+        A bare `expiries=None` (the 2026-08-24 GOLD alert) conflates two
+        different faults with different fixes: the poller never reached this
+        name, or expiry_list keeps answering EMPTY. Only the second tells you
+        the failure is UPSTREAM of option_chain — the chain fetch is not
+        failing, it is never attempted, because `for kind, off in targets` runs
+        over an empty list. It also explains why stage 2 changed nothing:
+        _get_expiries never caches an empty result, so there was no cached
+        expiry list for the remedy to drop."""
+        cached = self._expiries_cache.get(u)
+        if cached:
+            return f"expiries={cached[1]!r}"
+        fail = self._expiries_fail.get(u)
+        if fail is None:
+            return ("expiries=None (never fetched — no poll has reached this "
+                    "name yet)")
+        return (f"expiries=None (expiry_list has answered EMPTY for "
+                f"{int(time.monotonic() - fail)}s — no chain fetch is even "
+                f"attempted, and stage 2 had no cached list to drop)")
+
+    def _credential_detail(self) -> str:
+        """Which Dhan credential is in play and whether it is usable."""
+        try:
+            from app.data import dhan_client
+            return dhan_client.credential_summary()
+        except Exception as e:                # pragma: no cover - guard only
+            return f"token=unknown:unknown (check failed: {e!r})"
 
     def _chain_dead_event(self, u: str, mins: int, now: datetime) -> tuple:
         """(level, source, message) for a chain that survived both remedies.
 
         The level is the whole judgement: this is what decides whether a phone
         alert goes out, so it must separate a real selective fault from a
-        holiday without a holiday calendar."""
+        holiday without a holiday calendar — and, before either, a dead
+        credential from a dead chain.
+
+        NOT side-effect free: the credential branch re-pushes the login link,
+        because the verdict and the remedy are the same decision and splitting
+        them across the caller is how a remedy gets forgotten."""
         detail = self._chain_detail(u)
+        # IS IT EVEN THE CHAIN? Check the credential BEFORE blaming the poller.
+        #
+        # An expired 24h token looks EXACTLY like a dead chain from here, and
+        # it fools the live-market discriminator below rather than tripping it:
+        # get_client() raises or every REST call fails, the expiry list comes
+        # back empty and the cache stops moving — while the MarketFeed socket,
+        # authenticated when it connected, keeps streaming ticks. So "ticks are
+        # still arriving" is TRUE, and the alert concluded "the market is live
+        # and this is a real fault" for a problem whose fix is a 20-second
+        # phone tap (2026-08-24, a Monday: the token expired over the weekend
+        # and the single 08:30 login-link push had already scrolled past).
+        #
+        # This branch is deliberately narrow — credential_is_dead() is only
+        # true when the managed token is provably expired or absent, never for
+        # an env/config token whose validity cannot be checked locally. A false
+        # "your token expired" would send someone to fix the one thing that was
+        # not broken, and the ladder's own remedies would go unread.
+        if self._credential_dead():
+            self._push_token_link(u)
+            return ("error", "token",
+                    f"chain DEAD [{u}] {mins}min — THE DHAN TOKEN IS DEAD, "
+                    f"not the chain: every REST call fails while the feed "
+                    f"socket keeps streaming ticks it authenticated before the "
+                    f"token expired. Tap the login link (re-pushed) or hit "
+                    f"Refresh on the dashboard — no VPS access needed. Client "
+                    f"rebuilds cannot help: a fresh client is built from the "
+                    f"same dead token; {detail}")
         # IS THE MARKET ACTUALLY LIVE? Two independent proofs, and the FEED is
         # the one that matters.
         #
@@ -1327,7 +1441,9 @@ class MarketHub:
             return ("error", "feed",
                     f"chain DEAD [{u}] {mins}min — client rebuild AND expiry "
                     f"refetch both failed while {why}, so the market is live "
-                    f"and this is a real fault; {detail}")
+                    f"and this is a real fault; {detail}; "
+                    f"next: venv/bin/python -m scripts.chain_probe --probe "
+                    f"--names {u}")
         return ("warn", "feed",
                 f"chain DEAD [{u}] {mins}min — client rebuild AND expiry "
                 f"refetch both failed, and the feed is silent too "

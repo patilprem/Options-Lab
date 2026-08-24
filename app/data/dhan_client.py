@@ -429,6 +429,75 @@ def get_client():
     return dhanhq(get_dhan_context())
 
 
+def credential_health() -> dict:
+    """Which credential the live path is actually using, and whether it works.
+
+    Returns {"source", "state", "detail"} where source is
+    env|config|managed|none and state is ok|expired|missing|unknown.
+    Best-effort and NEVER raises: this exists to be called from alerting, and
+    a diagnostic that can throw is a diagnostic that removes the diagnosis.
+
+    Why alerting needs this at all: an expired 24h token is INDISTINGUISHABLE
+    from a dead option chain at the call site. get_client() raises, every REST
+    call fails, chain_snapshots stops, the expiry list comes back empty and
+    the chain self-heal walks its whole ladder — while the MarketFeed socket,
+    authenticated when it connected, keeps streaming ticks, so the "is the
+    market live?" discriminator correctly says yes and the alert reads "this
+    is a real fault". The remedy is a 20-second phone tap, and the alert never
+    mentioned it. Observed 2026-08-24, a Monday: the daily 08:30 login-link
+    push is fired ONCE, and a weekend-expired token that nobody tapped leaves
+    every Dhan REST call dead from the open.
+
+    Note the ORDER matches resolve_credentials(): an env/config token wins, so
+    the managed token's state is irrelevant (and would read "missing") on a
+    box that sets DHAN_ACCESS_TOKEN. Reporting it anyway would be a confident
+    wrong answer, which is worse than none."""
+    try:
+        if os.environ.get("DHAN_ACCESS_TOKEN"):
+            # Static credential: nothing here can tell whether Dhan still
+            # accepts it, so say where it came from and claim nothing more.
+            return {"source": "env", "state": "unknown",
+                    "detail": "DHAN_ACCESS_TOKEN env var (validity unknown "
+                              "until a call is made)"}
+        cfg_path = os.environ.get("DHAN_CONFIG_PATH")
+        if cfg_path and os.path.exists(cfg_path):
+            import json
+            with open(cfg_path, encoding="utf-8") as fh:
+                if (json.load(fh) or {}).get("access_token"):
+                    return {"source": "config", "state": "unknown",
+                            "detail": f"{cfg_path} (validity unknown)"}
+        from app.core import token_manager
+        st = token_manager.token_status()
+        state = st.get("state")
+        detail = (f"managed token {state}, {st.get('hours_left')}h left, "
+                  f"expires {st.get('expires_at')}")
+        if state == "missing":
+            return {"source": "none", "state": "missing",
+                    "detail": "no managed token stored"}
+        # "expiring" means valid NOW but not to the close — real, but not a
+        # reason to blame it for a failure happening right now.
+        return {"source": "managed",
+                "state": "expired" if state == "expired" else "ok",
+                "detail": detail}
+    except Exception as e:                  # pragma: no cover - guard only
+        return {"source": "unknown", "state": "unknown",
+                "detail": f"credential check failed: {e!r}"}
+
+
+def credential_summary() -> str:
+    """One alert-sized field: `token=managed:expired (...)`."""
+    h = credential_health()
+    return f"token={h['source']}:{h['state']} ({h['detail']})"
+
+
+def credential_is_dead() -> bool:
+    """True only when we can PROVE the credential is unusable — an expired or
+    absent managed token. An env/config token reports `unknown` and is never
+    blamed, because a false 'your token expired' sends someone to fix the one
+    thing that wasn't broken."""
+    return credential_health()["state"] in ("expired", "missing")
+
+
 class DhanEmptyFailure(RuntimeError):
     """Dhan returned status != success with NO error detail — its `remarks`
     is absent or an all-None {error_code, error_type, error_message} dict.

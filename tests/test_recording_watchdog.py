@@ -176,3 +176,98 @@ def test_never_alerted_means_no_spurious_recovery():
 def test_empty_health_is_silent():
     wd = RecordingWatchdog(notify=lambda m, k: None)
     assert wd.step([], NSE_MID) is None
+
+
+# --- the session-open false alarm (2026-08-24) -----------------------------
+#
+# The phone got three pushes inside six minutes on a Monday morning:
+#
+#   09:16  NOT RECORDING for >15min: chain_snapshots, option_bars[CRUDEOIL],
+#          option_bars[GOLD]
+#   09:20  ... the same, plus index_bias_history and stock_snapshots
+#
+# NSE had been open for one minute at 09:16 and five at 09:20, so ">15min
+# during market hours" was not merely alarmist, it was arithmetically false.
+# recording_health()'s last_ts is an ALL-TIME max, so at every open it points
+# at the previous session's final row — Friday 15:30 when it is Monday 09:20 —
+# and the age crosses 15 minutes the instant the post-open grace expires.
+#
+# The 09:20 alert is the tell: the stale set GREW at exactly the minute NSE's
+# 5-minute grace ran out, which is also precisely what a real cascading outage
+# looks like. An alarm that cries wolf every morning is how five days of lost
+# chain data went unnoticed in the first place.
+
+MON_OPEN = datetime(2026, 8, 24, 9, 20)      # Monday, NSE open 5 minutes
+FRI_NSE = datetime(2026, 8, 21, 15, 30)      # last NSE row of last week
+FRI_MCX = datetime(2026, 8, 21, 23, 30)      # last MCX row of last week
+
+
+def test_the_previous_session_does_not_make_a_recorder_look_late():
+    """Five minutes after the NSE open, an NSE table cannot be 15 min late."""
+    health = [_t("index_bias_history", FRI_NSE, ("NSE",)),
+              _t("stock_snapshots", FRI_NSE, ("NSE",))]
+    assert stale_tables(health, MON_OPEN) == []
+
+
+def test_a_table_still_dark_15min_into_its_session_is_flagged():
+    """The clamp delays the verdict, it must not remove it — the 07-23..27
+    outage (nothing recorded all day) still has to fire, every day."""
+    health = [_t("index_bias_history", FRI_NSE, ("NSE",))]
+    late = datetime(2026, 8, 24, 9, 31)      # NSE open 16 minutes
+    assert stale_tables(health, late) == ["index_bias_history"]
+
+
+def test_an_mcx_fed_table_is_judged_on_the_mcx_open():
+    """chain_snapshots is fed by both segments, and MCX opens at 09:00 — so it
+    IS overdue by 09:16 even though NSE has barely opened. The max across
+    feeding segments, not the min: this alert was the real one that morning."""
+    health = [_t("chain_snapshots", FRI_MCX, ("NSE", "MCX"))]
+    assert stale_tables(health, datetime(2026, 8, 24, 9, 10)) == []
+    assert stale_tables(health, datetime(2026, 8, 24, 9, 16)) == \
+        ["chain_snapshots"]
+
+
+def test_a_never_written_table_is_judged_on_the_session_clock():
+    """last_ts=None is the 07-23..27 signature and must still trip — just on
+    the session's clock rather than instantly at the open."""
+    health = [_t("stock_snapshots", None, ("NSE",))]
+    assert stale_tables(health, MON_OPEN) == []
+    assert stale_tables(health, datetime(2026, 8, 24, 9, 31)) == \
+        ["stock_snapshots"]
+
+
+def test_the_open_of_session_pushes_nothing():
+    """End to end: the 09:16/09:20 cascade must not reach the phone."""
+    health = [_t("index_bias_history", FRI_NSE, ("NSE",)),
+              _t("stock_snapshots", FRI_NSE, ("NSE",))]
+    wd = RecordingWatchdog(notify=lambda m, k: (_ for _ in ()).throw(
+        AssertionError(f"must not push: {m}")))
+    for minute in (16, 17, 18, 19, 20, 21):
+        assert wd.step(health, datetime(2026, 8, 24, 9, minute)) is None
+
+
+# --- name the token when the token is the cause ----------------------------
+
+def test_a_dead_token_is_named_in_the_push(monkeypatch):
+    """Every recorder stops at once when the 24h token dies, so this alert is
+    what a dead token looks like. It is also the only cause of it that is
+    fixable from a phone."""
+    from app.data import dhan_client
+    monkeypatch.setattr(dhan_client, "credential_is_dead", lambda: True)
+    monkeypatch.setattr(dhan_client, "credential_summary",
+                        lambda: "token=managed:expired (0h left)")
+    pushed = []
+    wd = RecordingWatchdog(notify=lambda m, k: pushed.append(m))
+    wd.step([_t("chain_snapshots", _stale(NSE_MID), ("NSE", "MCX"))], NSE_MID)
+    assert "CAUSE: token=managed:expired" in pushed[0]
+
+
+def test_a_healthy_token_adds_nothing_to_the_push(monkeypatch):
+    """Silence when it isn't the cause — every extra clause in an alert is one
+    more thing to read past at 09:16."""
+    from app.data import dhan_client
+    monkeypatch.setattr(dhan_client, "credential_is_dead", lambda: False)
+    pushed = []
+    wd = RecordingWatchdog(notify=lambda m, k: pushed.append(m))
+    wd.step([_t("chain_snapshots", _stale(NSE_MID), ("NSE", "MCX"))], NSE_MID)
+    assert pushed[0].endswith("chain_snapshots")

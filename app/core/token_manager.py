@@ -159,6 +159,59 @@ def notify_phone(url: str) -> bool:
         return False
 
 
+# The 08:30 push is fired ONCE a day. That is fine on a weekday you are awake
+# for and useless otherwise: a token that expired over the weekend gets exactly
+# one notification at 08:30 Monday, and if it scrolls past, every Dhan REST
+# call is dead from the open with no further prompt — the chain poller walks
+# its whole self-heal ladder and reports a "real fault" for a problem whose fix
+# is a 20-second tap (2026-08-24). So anything that PROVES the token is dead
+# can ask for a fresh link here, throttled so a per-underlying alert loop
+# cannot turn into a push storm.
+REPUSH_MIN_S = 1800.0
+_last_repush: float = 0.0
+
+
+def repush_login_link(reason: str = "") -> bool:
+    """Re-send the Dhan login link because something downstream proved the
+    token is unusable. Throttled to one push per REPUSH_MIN_S; returns True
+    only when a push actually went out.
+
+    Never raises — every caller is itself an alerting path, and a failed
+    notification must not take down the thing that noticed the failure."""
+    global _last_repush
+    import time as _time
+    now = _time.monotonic()
+    if _last_repush and (now - _last_repush) < REPUSH_MIN_S:
+        return False
+    # Stamp the ATTEMPT, not the success. build_login_url() talks to Dhan, so
+    # on a box with no API key (or with Dhan itself unreachable) it fails every
+    # time — and the callers are per-underlying alert paths that come back
+    # every few minutes. Backing off on failure too costs at most one delayed
+    # link; not backing off costs a retry storm against the same broken call.
+    # The alert that triggered this carries the diagnosis either way.
+    _last_repush = now
+    try:
+        url = build_login_url()
+    except Exception as e:
+        print(f"[token] cannot build login link ({e}) — reason: {reason}")
+        return False
+    if NTFY_TOPIC:
+        try:
+            requests.post(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=f"OptionsLab: Dhan token is DEAD — tap to refresh\n"
+                     f"{reason}\n{url}",
+                headers={"Title": "Dhan token refresh",
+                         "Priority": "urgent", "Click": url},
+                timeout=10)
+            return True
+        except Exception as e:
+            print(f"[token] ntfy re-push failed: {e}")
+            return False
+    print(f"[token] login link (set NTFY_TOPIC for phone push): {url}")
+    return False
+
+
 async def daily_refresh_loop():
     """Background task: at 08:30 IST every day, if the token won't survive
     until market close, generate a login link and push it to your phone."""
