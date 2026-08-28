@@ -102,6 +102,21 @@ def _surge_band(t: dict) -> str:
     return f"{SURGE_CONFIRM:g}+" if s >= SURGE_CONFIRM else f"<{SURGE_CONFIRM:g}"
 
 
+RR_FLOOR = 1.5          # structural R:R level the low_rr_entries rule tests
+                        # (== TradeConfig.min_rr's default, so one adaptation
+                        # step arms the gate at the measured level)
+
+
+def _rr_band(t: dict) -> str:
+    """Structural reward:risk recorded at entry (entry_ctx.tech.rr_ce/rr_pe,
+    from 2026-08-28; older rows -> 'unknown')."""
+    tech = (t.get("entry_ctx") or {}).get("tech") or {}
+    rr = tech.get("rr_ce" if t.get("bias") == "CE" else "rr_pe")
+    if rr is None:
+        return "unknown"
+    return f"{RR_FLOOR:g}+" if rr >= RR_FLOOR else f"<{RR_FLOOR:g}"
+
+
 def _market_align_band(t: dict) -> str:
     """Was the trade WITH or AGAINST the index bias recorded at entry?
     entry_ctx.market_bias is the NIFTY bias score in [-1, 1] (recorded from
@@ -321,6 +336,22 @@ def suggestions_from(stats: dict, exits: list[dict]) -> list[dict]:
             "evidence": f"counter: avg ₹{counter['avg']} over {counter['n']} "
                         f"trades; aligned: avg ₹{aligned['avg']} over "
                         f"{aligned['n']}."})
+
+    # 11) thin-R:R entries losing while structurally-paid entries win
+    # -> arm/tighten the min_rr gate at the measured floor
+    rr = stats.get("by_rr") or {}
+    lo_rr, hi_rr = rr.get(f"<{RR_FLOOR:g}"), rr.get(f"{RR_FLOOR:g}+")
+    if lo_rr and hi_rr and lo_rr["n"] >= MIN_BUCKET \
+            and hi_rr["n"] >= MIN_BUCKET \
+            and (lo_rr["avg"] or 0) < 0 < (hi_rr["avg"] or 0):
+        out.append({
+            "rule": "low_rr_entries",
+            "suggestion": f"Entries with structural R:R below {RR_FLOOR} "
+                          "lose while well-paid setups win — consider "
+                          f"requiring min_rr {RR_FLOOR} at entry.",
+            "evidence": f"<{RR_FLOOR:g}: avg ₹{lo_rr['avg']} over "
+                        f"{lo_rr['n']} trades; {RR_FLOOR:g}+: avg "
+                        f"₹{hi_rr['avg']} over {hi_rr['n']}."})
     return out
 
 
@@ -340,6 +371,7 @@ def analyze(exits: list[dict], config: dict | None = None) -> dict:
     by_buildup: dict[str, list] = {}
     by_surge: dict[str, list] = {}
     by_align: dict[str, list] = {}
+    by_rr: dict[str, list] = {}
     for t in exits:
         by_reason.setdefault(t.get("reason") or "unknown", []).append(t)
         by_band.setdefault(_score_band(t.get("entry_score")), []).append(t)
@@ -348,6 +380,7 @@ def analyze(exits: list[dict], config: dict | None = None) -> dict:
         by_buildup.setdefault(bu, []).append(t)
         by_surge.setdefault(_surge_band(t), []).append(t)
         by_align.setdefault(_market_align_band(t), []).append(t)
+        by_rr.setdefault(_rr_band(t), []).append(t)
 
     profit_factor = None
     if losses and sum(losses) != 0:
@@ -373,6 +406,7 @@ def analyze(exits: list[dict], config: dict | None = None) -> dict:
         "by_buildup": {k: _bucket_stats(v) for k, v in by_buildup.items()},
         "by_volume_surge": {k: _bucket_stats(v) for k, v in by_surge.items()},
         "by_market_align": {k: _bucket_stats(v) for k, v in by_align.items()},
+        "by_rr": {k: _bucket_stats(v) for k, v in by_rr.items()},
         "config": config or {},
     }
     if len(exits) < MIN_TRADES:

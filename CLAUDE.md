@@ -475,3 +475,27 @@ dark ones.
   counter_trend_entries (both ADAPTABLE). setup_score() carries
   range_pos/liquidity_ok for the gates — ranked_scores() dicts are the ONLY
   data path into entry decisions, keep it that way.
+- Scanner auto-trader TECHNICAL-READ gates (2026-08-28, same pass): the
+  "experienced trader" checklist. engines/tech_read.py (pure) computes, per
+  shortlisted/held stock, VWAP side + distance, EMA9/21 trend, RSI(14),
+  opening range, prev-day pivots, break-AND-HOLD of OR/prev-day levels
+  (last 3 closes beyond, not a touch), and structural R:R (next pivot target
+  vs the VWAP/level stop). Data source: `stock_snapshots` pseudo-bars —
+  FNO stocks have NO underlying_bars, so bars are close-only (close=fut_ltp,
+  volume=Δcumulative, clamped ≥0); ADX/ATR are deliberately NOT computed
+  (degenerate on flat bars). Store readers `stock_day_series_bulk` /
+  `stock_prev_day_levels_bulk` are BULK-ONLY over the bounded shortlist+held
+  set, called off-loop in tier2_once (per-symbol store loops froze the
+  process once — see store.py's stall note); prev-day H/L come from the
+  prior session's LAST snapshot row (running extremes), close ≈ last ltp,
+  not official settlement. The read lands on ranked_scores() dicts as
+  sc["tech"] — ATTACH-ONLY dict lookup, no store I/O in ranked_scores().
+  Gates (entry_quality): require_vwap_side / require_trend_align /
+  require_structure_break / max_rsi_extreme 75 / max_vwap_dist_pct 2.5 /
+  min_rr 1.5 — all scanner_trade_* settings, 0=off, challenger-trialable,
+  and FAIL CLOSED on missing data: no entries the first ~20 min of a session
+  (EMA/RSI warm-up), on a symbol's first recorded day (no pivots), or during
+  a recording outage. That is DESIGNED, visible via 'entry gated' events —
+  a zero-trade day under the strict profile is not a scanner failure.
+  entry_ctx journals the whole tech blob; insight rule low_rr_entries
+  (ADAPTABLE → min_rr) feeds the shadow-trial pipeline.

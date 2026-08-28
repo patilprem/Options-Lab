@@ -637,6 +637,8 @@ class StockScanner:
         self._last_sweep_ts = None
         self.shortlist: list[dict] = []        # latest Tier-2 shortlist (ranked)
         self.tier2: dict[str, dict] = {}       # symbol -> Tier-2 chain analytics
+        self.tech: dict[str, dict] = {}        # symbol -> technical_read()
+                                               # (shortlist + held, per Tier-2 cycle)
         self.scores: dict[str, dict] = {}      # symbol -> latest setup_score()
         self._prev_chain: dict[str, dict] = {} # symbol -> last chain cache (OI shift)
         self._alerted: dict[str, str] = {}     # symbol -> day already alerted
@@ -733,6 +735,22 @@ class StockScanner:
         return (self.store.stock_day_open_oi_bulk(day),
                 self.store.stock_volume_baseline_bulk(ref_tod, day))
 
+    def _compute_tech_reads(self, symbols: list, day) -> dict:
+        """{symbol: technical_read dict} for a BOUNDED symbol set (shortlist
+        + held — never the whole universe). Sync by design — run via
+        run_in_executor. Exactly two store queries for the whole set."""
+        from app.engines import tech_read as TR
+        if not symbols or not hasattr(self.store, "con"):
+            return {}
+        series = self.store.stock_day_series_bulk(symbols, day)
+        prev = self.store.stock_prev_day_levels_bulk(symbols, day)
+        out = {}
+        for sym in symbols:
+            rows = series.get(sym) or []
+            out[sym] = TR.technical_read(
+                TR.snapshot_rows_to_bars(rows), prev.get(sym))
+        return out
+
     def _record_index_bias(self, ts) -> None:
         """Aggregate the fresh Tier-1 metrics into NIFTY/BANKNIFTY bias and
         persist a reading (with the index spot for later accuracy scoring)."""
@@ -814,6 +832,19 @@ class StockScanner:
         # stay live for MTM/exit even after they drop off the shortlist).
         held = self.trader.held_symbols() if self.trader else []
         want = list(dict.fromkeys([d["symbol"] for d in self.shortlist] + held))
+        # Technical read (engines/tech_read.py) for the same bounded set the
+        # cycle will score/trade: two BULK store queries + pure compute, off
+        # the loop (per-symbol store loops froze the process once — see
+        # store.stock_day_open_oi_bulk's note). Wholesale replace: a name off
+        # the shortlist loses its stale read, same freshness doctrine as
+        # tier2; held names stay in `want`, so they keep theirs.
+        try:
+            self.tech = await loop.run_in_executor(
+                None, self._compute_tech_reads, want,
+                datetime.now(IST).date())
+        except Exception as e:
+            self.tech = {}
+            registry.record_event("warn", "scanner", f"tech read: {e!r}")
         symbols = self._register_chain_cfgs(want)
         if not symbols:
             # Nothing to deep-dive. Say WHY so an all-Tier-1 board isn't a silent
@@ -966,10 +997,19 @@ class StockScanner:
         deliberately NOT used — its chain bonus (up to +15, or the liquidity
         cap) describes a market several cycles gone."""
         current = {d["symbol"] for d in self.shortlist}
+        # `tech` rides along as a separate key (attach-only: dict lookup, no
+        # store I/O — this method also backs the API) so entry_quality can
+        # gate on the technical read without setup_score growing impurities.
+        # getattr: tests build StockScanner via __new__ without __init__.
+        tech = getattr(self, "tech", None) or {}
         out = []
         for sym, m in self.metrics.items():
-            out.append(setup_score(m, self.tier2.get(sym)
-                                   if sym in current else None))
+            sc = setup_score(m, self.tier2.get(sym)
+                             if sym in current else None)
+            t = tech.get(sym)
+            if t is not None:
+                sc["tech"] = t
+            out.append(sc)
         out.sort(key=lambda s: s.get("score") or 0, reverse=True)
         return out
 
@@ -981,6 +1021,7 @@ class StockScanner:
             "score": self.scores.get(symbol),
             "tier1": self.metrics.get(symbol),
             "tier2": self.tier2.get(symbol),
+            "tech": (getattr(self, "tech", None) or {}).get(symbol),
             "universe": self._universe.get(symbol),
         }
 

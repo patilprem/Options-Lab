@@ -700,6 +700,63 @@ class DataStore:
                 "day_low", "prev_close", "volume", "oi")
         return [dict(zip(cols, r)) for r in rows]
 
+    def stock_day_series_bulk(self, symbols: list, day) -> dict:
+        """{symbol: [(ts, fut_ltp, cum_volume), ...] ascending} — the day's
+        1-min snapshot series for a BOUNDED symbol set (shortlist + held),
+        feeding the trader's technical read (engines/tech_read.py).
+
+        One IN(...) query for the whole set, never a per-symbol loop (see the
+        30s-stall note above stock_day_open_oi_bulk). Symbols with no rows
+        for `day` are absent."""
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return {}
+        ph = ",".join("?" for _ in symbols)
+        rows = self._q(
+            f"""SELECT symbol, ts, fut_ltp, volume FROM stock_snapshots
+                WHERE symbol IN ({ph}) AND CAST(ts AS DATE)=CAST(? AS DATE)
+                ORDER BY symbol, ts""",
+            [*symbols, str(day)])
+        out: dict = {}
+        for sym, ts, ltp, vol in rows:
+            out.setdefault(sym, []).append((ts, ltp, vol))
+        return out
+
+    def stock_prev_day_levels_bulk(self, symbols: list, before_day) -> dict:
+        """{symbol: {"high","low","close","date"}} — the previous SESSION's
+        full-day levels per symbol, for pivots / prev-day breakout checks.
+
+        stock_snapshots carries the RUNNING day high/low on every row, so the
+        last row of a session holds the whole day's extremes and its fut_ltp
+        is (approximately) the close. One windowed query over a 7-day
+        lookback (holidays + weekends never leave a 7-day gap between NSE
+        sessions, and the bound keeps this off the full table). Symbols with
+        no prior session in the window are absent — the entry gate treats
+        that as no-data and fails closed."""
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return {}
+        ph = ",".join("?" for _ in symbols)
+        rows = self._q(
+            f"""WITH prior AS (
+                    SELECT symbol, ts, day_high, day_low, fut_ltp,
+                           row_number() OVER (
+                               PARTITION BY symbol ORDER BY ts DESC) AS rn
+                    FROM stock_snapshots
+                    WHERE symbol IN ({ph})
+                      AND CAST(ts AS DATE) < CAST(? AS DATE)
+                      AND CAST(ts AS DATE) >= CAST(? AS DATE) - INTERVAL 7 DAY)
+                SELECT symbol, ts, day_high, day_low, fut_ltp
+                FROM prior WHERE rn=1""",
+            [*symbols, str(before_day), str(before_day)])
+        out: dict = {}
+        for sym, ts, hi, lo, close in rows:
+            if hi is None or lo is None or close is None:
+                continue
+            out[sym] = {"high": hi, "low": lo, "close": close,
+                        "date": str(ts)[:10]}
+        return out
+
     # -- Index bias (F5) -----------------------------------------------------
     def upsert_index_bias(self, ts, index_name: str, bias: dict) -> None:
         """Record one bias reading. `bias` is scanner.index_bias() output."""
@@ -1139,6 +1196,8 @@ SyntheticStore.upsert_stock_snapshots = lambda self, rows: 0
 SyntheticStore.stock_day_open_oi = lambda self, symbol, day: (None, None)
 SyntheticStore.stock_volume_baseline = lambda self, s, r, b, days=10: None
 SyntheticStore.latest_stock_snapshots = lambda self, day=None: []
+SyntheticStore.stock_day_series_bulk = lambda self, symbols, day: {}
+SyntheticStore.stock_prev_day_levels_bulk = lambda self, symbols, before_day: {}
 SyntheticStore.upsert_index_bias = lambda self, ts, name, bias: None
 SyntheticStore.recent_index_bias = lambda self, name, limit=60: []
 SyntheticStore.index_bias_accuracy = lambda self, name, limit=30: []

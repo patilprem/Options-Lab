@@ -235,6 +235,12 @@ export default function ScannerView({ showToast, onDecision }) {
               {book.config.min_range_align > 0 ? ` · range-aligned ≥ ${book.config.min_range_align}` : ''}
               {book.config.index_align ? ' · not against market bias' : ''}
               {book.config.max_entry_spread_pct > 0 ? ` · spread ≤ ${book.config.max_entry_spread_pct}%` : ''}
+              {book.config.require_vwap_side ? ' · right side of VWAP' : ''}
+              {book.config.require_trend_align ? ' · EMA9/21 trend' : ''}
+              {book.config.require_structure_break ? ' · break-and-hold OR/prev-day' : ''}
+              {book.config.max_rsi_extreme > 0 ? ` · RSI ≤ ${book.config.max_rsi_extreme}` : ''}
+              {book.config.max_vwap_dist_pct > 0 ? ` · ≤ ${book.config.max_vwap_dist_pct}% from VWAP` : ''}
+              {book.config.min_rr > 0 ? ` · R:R ≥ ${book.config.min_rr}` : ''}
               {book.config.max_trades_per_day > 0 ? ` · ≤ ${book.config.max_trades_per_day} trades/day` : ''}
               {book.config.daily_loss_stop_pct > 0 ? ` · halt at −${(book.config.daily_loss_stop_pct * 100).toFixed(1)}% day loss` : ''}
             </div>
@@ -366,6 +372,24 @@ function FragmentRow({ s, expanded, detail, onToggle }) {
                   <div>Liquidity: {detail.tier2.liquidity?.ok ? 'ok' : (detail.tier2.liquidity?.reason || 'n/a')}</div>
                 </div>
               )}
+              {(detail?.tech || s.tech) && (() => {
+                const t = detail?.tech || s.tech
+                const rr = s.bias === 'PE' ? t.rr_pe : t.rr_ce
+                return (
+                  <div style={{ fontSize: 12 }}>
+                    <div style={{ color: 'var(--muted)', marginBottom: 4 }}>Technical read</div>
+                    <div>
+                      VWAP {t.vwap_dist_pct == null ? '—' : (t.vwap_dist_pct >= 0 ? '+' : '') + t.vwap_dist_pct.toFixed(2) + '%'} ·
+                      trend {t.trend || '—'} · RSI {t.rsi == null ? '—' : t.rsi.toFixed(0)}
+                    </div>
+                    <div>
+                      OR {t.or_low == null ? '—' : `${t.or_low}–${t.or_high}`} ·
+                      break {t.structure_break ? `${t.structure_break} @ ${t.break_level}` : '—'} ·
+                      R:R {rr == null ? '—' : rr.toFixed(1)}
+                    </div>
+                  </div>
+                )
+              })()}
               {detail?.universe && (
                 <div style={{ fontSize: 12 }}>
                   <div style={{ color: 'var(--muted)', marginBottom: 4 }}>Contract</div>

@@ -101,6 +101,11 @@ ADAPTABLE: dict[str, dict] = {
     "counter_trend_entries": {"param": "index_align", "step": 1,
                               "lo": 0, "hi": 1,
                               "label": "block entries against the market bias"},
+    # low_rr_entries: thin structural R:R losing -> one step arms the gate
+    # at the measured floor (1.5); a later step can tighten to 3.0
+    "low_rr_entries":    {"param": "min_rr",        "step": 1.5,
+                          "lo": 0.0, "hi": 3.0,
+                          "label": "require a structural R:R at entry"},
 }
 
 

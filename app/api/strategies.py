@@ -1870,6 +1870,12 @@ class TraderSettingsReq(BaseModel):
     max_trades_per_day: int | None = None
     daily_loss_stop_pct: float | None = None
     max_entry_spread_pct: float | None = None
+    require_vwap_side: int | None = None
+    require_trend_align: int | None = None
+    require_structure_break: int | None = None
+    max_rsi_extreme: float | None = None
+    max_vwap_dist_pct: float | None = None
+    min_rr: float | None = None
 
 
 @scanner_router.post("/scanner/trade-settings")
@@ -1895,6 +1901,12 @@ def set_trader(req: TraderSettingsReq):
         ("scanner_trade_max_trades_per_day", req.max_trades_per_day, 0, 50),
         ("scanner_trade_daily_loss_stop_pct", req.daily_loss_stop_pct, 0.0, 0.5),
         ("scanner_trade_max_entry_spread_pct", req.max_entry_spread_pct, 0.0, 10.0),
+        ("scanner_trade_require_vwap_side", req.require_vwap_side, 0, 1),
+        ("scanner_trade_require_trend_align", req.require_trend_align, 0, 1),
+        ("scanner_trade_require_structure_break", req.require_structure_break, 0, 1),
+        ("scanner_trade_max_rsi_extreme", req.max_rsi_extreme, 0.0, 100.0),
+        ("scanner_trade_max_vwap_dist_pct", req.max_vwap_dist_pct, 0.0, 20.0),
+        ("scanner_trade_min_rr", req.min_rr, 0.0, 5.0),
     ]:
         if val is not None:
             registry.set_setting(key, str(max(lo, min(hi, val))))

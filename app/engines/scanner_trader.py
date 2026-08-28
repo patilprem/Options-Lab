@@ -116,6 +116,28 @@ class TradeConfig:
                                      # spread exceeds this % of mid at fill
                                      # time — or has no two-sided quote at all
                                      # (0 = off)
+    # -- technical-read confirmation gates (2026-08-28, the "experienced
+    # trader" checklist). Computed per shortlisted/held stock from its own
+    # 1-min snapshot series (engines/tech_read.py) and attached to
+    # ranked_scores() dicts as sc["tech"]. Same contract as the confluence
+    # gates above: defaults ON, each 0/off-able, missing data fails CLOSED
+    # (which also embargoes the first ~20 min of a session while EMA/RSI
+    # warm up, and a symbol's first recorded day for the pivot R:R). -------
+    require_vwap_side: int = 1       # 1 = CE only above session VWAP,
+                                     # PE only below (the institutional line)
+    require_trend_align: int = 1     # 1 = EMA9 vs EMA21 of the 1-min series
+                                     # must agree with the bias
+    require_structure_break: int = 1  # 1 = need a confirmed break-AND-HOLD
+                                     # of the opening range / prev-day
+                                     # high-low in the bias direction
+    max_rsi_extreme: float = 75.0    # don't chase: skip CE when RSI(14) >
+                                     # this, PE when RSI < (100 - this)
+                                     # (0 = off)
+    max_vwap_dist_pct: float = 2.5   # don't chase: skip when price sits more
+                                     # than this % away from VWAP (0 = off)
+    min_rr: float = 1.5              # structural reward:risk floor — next
+                                     # pivot target vs the VWAP/level stop
+                                     # (0 = off)
 
 
 @dataclass
@@ -221,7 +243,9 @@ def entry_quality(sc: dict, cfg: TradeConfig,
     gate must pass on its own — a huge score cannot buy back a missing volume
     surge. `sc` is a setup_score() dict off ranked_scores(); `market_bias` is
     the NIFTY index-bias score in [-1, 1] (or None when unread). Confirmation
-    gates (surge, liquidity, range) treat missing data as a FAIL when armed —
+    gates (surge, liquidity, range, and the whole technical-read block:
+    VWAP side, EMA trend, structure break-and-hold, RSI/VWAP-distance
+    overextension, structural R:R) treat missing data as a FAIL when armed —
     "unknown" is not confirmation — while the regime gate only blocks on a
     positively contradicting reading. The returned reason is short and
     log-ready so a skipped qualifier is never invisible (the 07-28 lesson)."""
@@ -262,6 +286,60 @@ def entry_quality(sc: dict, cfg: TradeConfig,
         if (bias == "CE" and market_bias < -0.3) or \
                 (bias == "PE" and market_bias > 0.3):
             return False, f"{bias} against market bias {market_bias:+.2f}"
+    # -- technical-read gates (the experienced-trader checklist). sc["tech"]
+    # is technical_read() off the symbol's own 1-min snapshot series; when
+    # any of these knobs is armed and the read is missing, fail closed —
+    # a trade you can't locate on the chart is not a high-probability trade.
+    tech_gates_armed = (cfg.require_vwap_side or cfg.require_trend_align
+                        or cfg.require_structure_break or cfg.max_rsi_extreme
+                        or cfg.max_vwap_dist_pct or cfg.min_rr)
+    if tech_gates_armed:
+        tech = sc.get("tech")
+        if not tech or not tech.get("n_bars"):
+            return False, "no technical read (no snapshot series)"
+        if cfg.require_vwap_side:
+            vd = tech.get("vwap_dist_pct")
+            if vd is None:
+                return False, "session VWAP unknown"
+            if (bias == "CE" and vd <= 0) or (bias == "PE" and vd >= 0):
+                return False, (f"{bias} on the wrong side of VWAP "
+                               f"({vd:+.2f}%)")
+        if cfg.require_trend_align:
+            trend = tech.get("trend")
+            if trend is None:
+                return False, "EMA trend not established (warming up)"
+            if trend != ("up" if bias == "CE" else "down"):
+                return False, f"EMA trend {trend} against {bias}"
+        if cfg.require_structure_break:
+            want_dir = "up" if bias == "CE" else "down"
+            if tech.get("structure_break") != want_dir:
+                return False, ("no confirmed break-and-hold of OR/prev-day "
+                               + ("high" if bias == "CE" else "low"))
+        if cfg.max_rsi_extreme:
+            rsi = tech.get("rsi")
+            if rsi is None:
+                return False, "RSI not established (warming up)"
+            if bias == "CE" and rsi > cfg.max_rsi_extreme:
+                return False, (f"RSI {rsi:.0f} overextended "
+                               f"(> {cfg.max_rsi_extreme:g})")
+            if bias == "PE" and rsi < (100 - cfg.max_rsi_extreme):
+                return False, (f"RSI {rsi:.0f} overextended "
+                               f"(< {100 - cfg.max_rsi_extreme:g})")
+        if cfg.max_vwap_dist_pct:
+            vd = tech.get("vwap_dist_pct")
+            if vd is None:
+                return False, "session VWAP unknown"
+            if abs(vd) > cfg.max_vwap_dist_pct:
+                return False, (f"{abs(vd):.1f}% from VWAP — chasing "
+                               f"(cap {cfg.max_vwap_dist_pct:g}%)")
+        if cfg.min_rr:
+            if tech.get("prev_close") is None:
+                return False, "no prev-day data for pivots (first recorded day)"
+            rr = tech.get("rr_ce" if bias == "CE" else "rr_pe")
+            if rr is None:
+                return False, "no structural target/stop to measure R:R"
+            if rr < cfg.min_rr:
+                return False, f"R:R {rr:.1f} < {cfg.min_rr:g}"
     return True, None
 
 
@@ -371,6 +449,14 @@ class ScannerTrader:
             max_trades_per_day=int(_f("scanner_trade_max_trades_per_day", 4)),
             daily_loss_stop_pct=_f("scanner_trade_daily_loss_stop_pct", 0.02),
             max_entry_spread_pct=_f("scanner_trade_max_entry_spread_pct", 2.0),
+            require_vwap_side=int(_f("scanner_trade_require_vwap_side", 1)),
+            require_trend_align=int(
+                _f("scanner_trade_require_trend_align", 1)),
+            require_structure_break=int(
+                _f("scanner_trade_require_structure_break", 1)),
+            max_rsi_extreme=_f("scanner_trade_max_rsi_extreme", 75.0),
+            max_vwap_dist_pct=_f("scanner_trade_max_vwap_dist_pct", 2.5),
+            min_rr=_f("scanner_trade_min_rr", 1.5),
         )
 
     def _persist(self) -> None:
@@ -798,6 +884,10 @@ class ScannerTrader:
             # market regime at entry — lets the journal prove/disprove the
             # counter-trend hypothesis (rule: counter_trend_entries)
             "market_bias": self._market_bias(scanner),
+            # the full technical read the entry was judged on (VWAP/EMA/RSI/
+            # structure/R:R) — self-contained evidence for future insight
+            # rules (e.g. low_rr_entries)
+            "tech": sc.get("tech"),
             "worst_spread_pct": (t2.get("liquidity") or {}).get("worst_spread_pct"),
             "opt_bid": q.bid, "opt_ask": q.ask, "opt_ltp": q.ltp,
             "opt_iv": getattr(q, "iv", None), "opt_oi": q.oi,
@@ -818,7 +908,13 @@ class ScannerTrader:
                        "index_align": cfg.index_align,
                        "max_trades_per_day": cfg.max_trades_per_day,
                        "daily_loss_stop_pct": cfg.daily_loss_stop_pct,
-                       "max_entry_spread_pct": cfg.max_entry_spread_pct},
+                       "max_entry_spread_pct": cfg.max_entry_spread_pct,
+                       "require_vwap_side": cfg.require_vwap_side,
+                       "require_trend_align": cfg.require_trend_align,
+                       "require_structure_break": cfg.require_structure_break,
+                       "max_rsi_extreme": cfg.max_rsi_extreme,
+                       "max_vwap_dist_pct": cfg.max_vwap_dist_pct,
+                       "min_rr": cfg.min_rr},
         }
 
     def _journal_entry(self, sym: str, pos: SPosition, q, now) -> None:
@@ -1250,5 +1346,11 @@ class ScannerTrader:
                        "index_align": cfg.index_align,
                        "max_trades_per_day": cfg.max_trades_per_day,
                        "daily_loss_stop_pct": cfg.daily_loss_stop_pct,
-                       "max_entry_spread_pct": cfg.max_entry_spread_pct},
+                       "max_entry_spread_pct": cfg.max_entry_spread_pct,
+                       "require_vwap_side": cfg.require_vwap_side,
+                       "require_trend_align": cfg.require_trend_align,
+                       "require_structure_break": cfg.require_structure_break,
+                       "max_rsi_extreme": cfg.max_rsi_extreme,
+                       "max_vwap_dist_pct": cfg.max_vwap_dist_pct,
+                       "min_rr": cfg.min_rr},
         }

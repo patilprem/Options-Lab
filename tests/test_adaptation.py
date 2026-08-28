@@ -128,11 +128,15 @@ def test_challenger_trades_virtually_only(tmp_path, monkeypatch):
          "started": "2026-07-01", "book": {}, "closed": []}))
     hub, sc = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
-    # passes every high-probability gate, so only entry_score separates the
-    # champion (90) from the challenger (65)
+    # passes every high-probability gate (incl. the technical read), so only
+    # entry_score separates the champion (90) from the challenger (65)
+    tech = {"n_bars": 60, "vwap_dist_pct": 1.0, "trend": "up", "rsi": 60.0,
+            "structure_break": "up", "break_level": 99.5, "prev_close": 98.0,
+            "rr_ce": 2.0, "rr_pe": 2.0}
     sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE",
                               "buildup": "long_buildup", "volume_surge": 2.0,
-                              "liquidity_ok": True, "range_pos": 0.9}}
+                              "liquidity_ok": True, "range_pos": 0.9,
+                              "tech": tech}}
 
     trader.step(hub, sc)
     assert trader.book == {}                     # champion stayed out
@@ -247,7 +251,8 @@ def test_every_scalar_insight_rule_is_adaptable():
     all_rules = {"trail_giveback", "mfe_take_profit", "fast_hard_stops",
                  "raise_entry_score", "late_entries", "churn",
                  "tighten_hard_stop", "fresh_buildup_only", "fee_drag",
-                 "low_surge_entries", "counter_trend_entries"}
+                 "low_surge_entries", "counter_trend_entries",
+                 "low_rr_entries"}
     assert set(A.ADAPTABLE) == all_rules - {"fast_hard_stops"}
 
 
@@ -280,6 +285,9 @@ def test_behavioural_rule_overrides_step_and_clamp():
                                   "counter_trend_entries") == {"index_align": 1}
     assert A.challenger_overrides({"index_align": 1},
                                   "counter_trend_entries") is None
+    # low_rr_entries: gate off -> one step arms it at the measured 1.5 floor
+    assert A.challenger_overrides({"min_rr": 0.0},
+                                  "low_rr_entries") == {"min_rr": 1.5}
     # fresh filter: 0 -> 1
     assert A.challenger_overrides(cfg, "fresh_buildup_only") == {"fresh_buildup_only": 1}
     # fee_drag shares the entry_score lever (default is 70 now)

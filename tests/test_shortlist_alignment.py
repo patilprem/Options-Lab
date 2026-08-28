@@ -52,7 +52,9 @@ def test_every_name_pick_entries_returns_is_in_the_shortlist():
     ranked = sorted((setup_score(m, None) for m in metrics.values()),
                     key=lambda s: s.get("score") or 0, reverse=True)
     cfg = TradeConfig(min_volume_surge=0, require_liquid_chain=0,
-                      min_range_align=0)
+                      min_range_align=0, require_vwap_side=0,
+                      require_trend_align=0, require_structure_break=0,
+                      max_rsi_extreme=0, max_vwap_dist_pct=0, min_rr=0)
     picked = pick_entries(ranked, set(), cfg)
     assert picked, "test needs at least one entry"
     assert all(p in shortlist for p in picked), (

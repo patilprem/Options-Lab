@@ -14,14 +14,15 @@ def _exit(sym="AAA", realized=1000.0, reason="trail_stop", entry_score=80.0,
           entry_ts="2026-07-16T10:00:00", ts="2026-07-16T14:00:00",
           mfe=20.0, mae=20.0, ret=10.0, held_min=300,
           buildup="long_buildup", entry_fees=40.0, exit_fees=40.0,
-          bias="CE", surge=None, market_bias=None):
+          bias="CE", surge=None, market_bias=None, rr=None):
     return {"kind": "exit", "symbol": sym, "ts": ts, "entry_ts": entry_ts,
             "realized": realized, "reason": reason, "entry_score": entry_score,
             "mfe_pct": mfe, "mae_pct": mae, "ret_pct": ret,
             "held_minutes": held_min, "entry_fees": entry_fees,
             "exit_fees": exit_fees, "bias": bias,
             "entry_ctx": {"buildup": buildup, "volume_surge": surge,
-                          "market_bias": market_bias}}
+                          "market_bias": market_bias,
+                          "tech": {"rr_ce": rr, "rr_pe": rr}}}
 
 
 def _rules(res):
@@ -160,6 +161,24 @@ def test_counter_trend_needs_a_strong_reading():
     res = ji.analyze(rows)
     assert "counter_trend_entries" not in _rules(res)
     assert res["by_market_align"]["neutral"]["n"] == 10
+
+
+def test_low_rr_entries_rule():
+    rows = ([_exit(realized=700, rr=2.2) for _ in range(5)]
+            + [_exit(realized=-500, rr=0.8) for _ in range(5)])
+    res = ji.analyze(rows)
+    assert "low_rr_entries" in _rules(res)
+    assert res["by_rr"]["1.5+"]["n"] == 5
+    assert res["by_rr"]["<1.5"]["avg"] == -500.0
+
+
+def test_low_rr_rule_treats_missing_rr_as_unknown():
+    # legacy rows (no tech blob) must be 'unknown', never evidence
+    rows = ([_exit(realized=700, rr=2.2) for _ in range(5)]
+            + [_exit(realized=-500) for _ in range(5)])
+    res = ji.analyze(rows)
+    assert "low_rr_entries" not in _rules(res)
+    assert res["by_rr"]["unknown"]["n"] == 5
 
 
 def test_clean_profitable_book_suggests_nothing():

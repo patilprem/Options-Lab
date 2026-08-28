@@ -88,15 +88,46 @@ def test_exit_max_hold_and_hold_otherwise():
 
 # --- pure: behavioural gates (the holistic-adaptation knobs) ----------------
 
+def _tech(bias="CE", **kw):
+    """A technical read that passes every confirmation gate for `bias`:
+    right side of VWAP, EMA trend aligned, structure broken-and-held,
+    RSI mid-range, R:R comfortably above the floor."""
+    up = bias == "CE"
+    d = {"n_bars": 60, "ltp": 100.0,
+         "vwap": 99.0 if up else 101.0,
+         "vwap_dist_pct": 1.0 if up else -1.0,
+         "ema_fast": 100.0, "ema_slow": 99.5 if up else 100.5,
+         "trend": "up" if up else "down",
+         "rsi": 60.0 if up else 40.0,
+         "or_high": 99.5, "or_low": 98.5,
+         "prev_high": 99.0, "prev_low": 96.0, "prev_close": 98.0,
+         "structure_break": "up" if up else "down",
+         "break_level": 99.5 if up else 100.5,
+         "target_ce": 104.0, "stop_ce": 98.0, "rr_ce": 2.0,
+         "target_pe": 96.0, "stop_pe": 102.0, "rr_pe": 2.0}
+    d.update(kw)
+    return d
+
+
 def _score(sym="AAA", score=80, bias="CE", buildup="long_buildup", **kw):
     """A setup that passes the default high-probability profile: surge
     confirmed, chain vetted liquid, pressing the day's range in the trade's
-    direction. Individual tests override fields to fail a specific gate."""
+    direction, technical read confirming. Individual tests override fields
+    to fail a specific gate."""
     d = {"symbol": sym, "score": score, "bias": bias, "buildup": buildup,
          "volume_surge": 2.0, "liquidity_ok": True,
-         "range_pos": 0.9 if bias == "CE" else 0.1}
+         "range_pos": 0.9 if bias == "CE" else 0.1,
+         "tech": _tech(bias)}
     d.update(kw)
     return d
+
+
+# every per-candidate quality/confirmation gate off — for tests that pin the
+# score/bias/slot mechanics rather than the gates themselves
+_GATES_OFF = dict(min_volume_surge=0, require_liquid_chain=0,
+                  min_range_align=0, require_vwap_side=0,
+                  require_trend_align=0, require_structure_break=0,
+                  max_rsi_extreme=0, max_vwap_dist_pct=0, min_rr=0)
 
 
 def test_no_time_cutoff_or_cooldown_by_default():
@@ -243,13 +274,102 @@ def test_quote_spread_pct():
     assert st.quote_spread_pct(_OneSided) is None
 
 
+# --- pure: technical-read confirmation gates --------------------------------
+
+def test_missing_technical_read_fails_closed():
+    cfg = TradeConfig()
+    sc = _score()
+    del sc["tech"]
+    ok, why = st.entry_quality(sc, cfg)
+    assert not ok and "technical read" in why
+    # with every technical knob off, the same dict passes again
+    assert st.entry_quality(sc, replace(cfg, require_vwap_side=0,
+                                        require_trend_align=0,
+                                        require_structure_break=0,
+                                        max_rsi_extreme=0,
+                                        max_vwap_dist_pct=0, min_rr=0))[0]
+
+
+def test_vwap_side_gate():
+    cfg = TradeConfig()
+    ok, why = st.entry_quality(_score(tech=_tech(vwap_dist_pct=-0.5)), cfg)
+    assert not ok and "VWAP" in why              # CE below VWAP
+    ok, why = st.entry_quality(_score(tech=_tech(vwap_dist_pct=None)), cfg)
+    assert not ok and "unknown" in why           # fail closed
+    # PE mirrors: below VWAP is the RIGHT side
+    pe = _score(bias="PE", buildup="short_buildup")
+    assert st.entry_quality(pe, cfg)[0]
+    assert st.entry_quality(_score(tech=_tech(vwap_dist_pct=-0.5)),
+                            replace(cfg, require_vwap_side=0))[0]
+
+
+def test_trend_align_gate():
+    cfg = TradeConfig()
+    ok, why = st.entry_quality(_score(tech=_tech(trend="down")), cfg)
+    assert not ok and "trend" in why
+    ok, why = st.entry_quality(_score(tech=_tech(trend=None)), cfg)
+    assert not ok and "warming up" in why
+    assert st.entry_quality(_score(tech=_tech(trend=None)),
+                            replace(cfg, require_trend_align=0))[0]
+
+
+def test_structure_break_gate_requires_confirmation():
+    cfg = TradeConfig()
+    ok, why = st.entry_quality(_score(tech=_tech(structure_break=None)), cfg)
+    assert not ok and "break-and-hold" in why
+    ok, _ = st.entry_quality(_score(tech=_tech(structure_break="down")), cfg)
+    assert not ok                                # broke the WRONG way for a CE
+    assert st.entry_quality(_score(tech=_tech(structure_break=None)),
+                            replace(cfg, require_structure_break=0))[0]
+
+
+def test_rsi_overextension_gate_is_directional():
+    cfg = TradeConfig()                          # max_rsi_extreme=75
+    ok, why = st.entry_quality(_score(tech=_tech(rsi=82.0)), cfg)
+    assert not ok and "overextended" in why
+    # a HIGH RSI is fine for a PE (it blocks on the low side instead)
+    assert st.entry_quality(
+        _score(bias="PE", buildup="short_buildup",
+               tech=_tech("PE", rsi=60.0)), cfg)[0]
+    ok, why = st.entry_quality(
+        _score(bias="PE", buildup="short_buildup",
+               tech=_tech("PE", rsi=18.0)), cfg)
+    assert not ok and "overextended" in why
+    assert st.entry_quality(_score(tech=_tech(rsi=82.0)),
+                            replace(cfg, max_rsi_extreme=0))[0]
+
+
+def test_vwap_distance_gate_blocks_chasing():
+    cfg = TradeConfig()                          # max_vwap_dist_pct=2.5
+    ok, why = st.entry_quality(_score(tech=_tech(vwap_dist_pct=3.1)), cfg)
+    assert not ok and "chasing" in why
+    assert st.entry_quality(_score(tech=_tech(vwap_dist_pct=3.1)),
+                            replace(cfg, max_vwap_dist_pct=0))[0]
+
+
+def test_min_rr_gate():
+    cfg = TradeConfig()                          # min_rr=1.5
+    ok, why = st.entry_quality(_score(tech=_tech(rr_ce=1.2)), cfg)
+    assert not ok and "R:R" in why
+    ok, why = st.entry_quality(_score(tech=_tech(rr_ce=None)), cfg)
+    assert not ok and "target/stop" in why
+    ok, why = st.entry_quality(
+        _score(tech=_tech(prev_close=None, rr_ce=None)), cfg)
+    assert not ok and "prev-day" in why
+    # the PE side reads rr_pe, not rr_ce
+    assert st.entry_quality(
+        _score(bias="PE", buildup="short_buildup",
+               tech=_tech("PE", rr_ce=0.1)), cfg)[0]
+    assert st.entry_quality(_score(tech=_tech(rr_ce=1.2)),
+                            replace(cfg, min_rr=0))[0]
+
+
 # --- pure: entry pick -------------------------------------------------------
 
 def test_pick_entries_respects_score_bias_and_slots():
     # quality gates off here — this test pins the score/bias/slot mechanics
-    cfg = TradeConfig(entry_score=65, max_positions=2, min_volume_surge=0,
-                      require_liquid_chain=0, min_range_align=0,
-                      max_trades_per_day=0)
+    cfg = TradeConfig(entry_score=65, max_positions=2, max_trades_per_day=0,
+                      **_GATES_OFF)
     ranked = [
         {"symbol": "AAA", "score": 80, "bias": "CE"},
         {"symbol": "BBB", "score": 60, "bias": "PE"},   # below entry_score
@@ -702,3 +822,23 @@ def test_max_trades_per_day_holds_across_cycles(tmp_path, monkeypatch):
     assert trader.book == {}
     today = datetime.now(st.IST).date().isoformat()
     assert any("trade cap" in e["message"] for e in reg.events_for(today))
+
+
+def test_step_blocks_overextended_entry_until_tech_is_healthy(tmp_path, monkeypatch):
+    """Technical gates end to end through step(): an RSI-overextended
+    qualifier is skipped with a visible reason, then enters once the read
+    turns healthy."""
+    reg, trader = _mk(tmp_path, monkeypatch)
+    hub, sc = _FakeHub(), _FakeScanner()
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    sc.scores = {"RELIANCE": _score("RELIANCE", tech=_tech(rsi=85.0))}
+
+    trader.step(hub, sc)
+    assert trader.book == {}
+    today = datetime.now(st.IST).date().isoformat()
+    assert any("entry gated [RELIANCE]" in e["message"] and "overextended" in e["message"]
+               for e in reg.events_for(today))
+
+    sc.scores = {"RELIANCE": _score("RELIANCE")}     # RSI back in range
+    trader.step(hub, sc)
+    assert "RELIANCE" in trader.book

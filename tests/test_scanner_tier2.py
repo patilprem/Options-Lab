@@ -237,3 +237,63 @@ def test_oi_shift_ranks_biggest_moves():
     assert shifts[0]["strike_offset"] == 1
     assert shifts[0]["option_type"] == "CALL"
     assert shifts[0]["oi_change"] == 500000
+
+
+# --- technical read wiring ---------------------------------------------------
+
+class _TechStore:
+    """Fake store serving one symbol's day series + prev-day levels."""
+    con = object()          # hasattr(store, "con") gate
+
+    def __init__(self, series=None, prev=None):
+        self._series, self._prev = series or {}, prev or {}
+
+    def stock_day_series_bulk(self, symbols, day):
+        return {s: self._series[s] for s in symbols if s in self._series}
+
+    def stock_prev_day_levels_bulk(self, symbols, before_day):
+        return {s: self._prev[s] for s in symbols if s in self._prev}
+
+
+def _scanner_with_store(store):
+    s = scanner.StockScanner.__new__(scanner.StockScanner)
+    s.store = store
+    s.metrics = {"AAA": {"symbol": "AAA", "price_change_pct": 2.0,
+                         "volume_surge": 2.0, "buildup": "long_buildup",
+                         "range_pos": 0.9}}
+    s.shortlist = [{"symbol": "AAA"}]
+    s.tier2 = {}
+    s.scores = {}
+    return s
+
+
+def test_compute_tech_reads_populates_and_ranked_scores_attaches():
+    from datetime import timedelta
+    day = date(2026, 8, 27)
+    open_ts = datetime(2026, 8, 27, 9, 15)
+    rows = [(open_ts + timedelta(minutes=i), 100.0 + i * 0.2, 1000 * (i + 1))
+            for i in range(40)]
+    store = _TechStore(
+        series={"AAA": rows},
+        prev={"AAA": {"high": 110.0, "low": 100.0, "close": 108.0,
+                      "date": "2026-08-26"}})
+    s = _scanner_with_store(store)
+    s.tech = s._compute_tech_reads(["AAA", "MISSING"], day)
+    assert s.tech["AAA"]["n_bars"] == 40
+    assert s.tech["AAA"]["trend"] == "up"
+    # a wanted symbol with no series still gets a (all-None) read, so the
+    # entry gate fails it closed rather than KeyError-ing anywhere
+    assert s.tech["MISSING"]["n_bars"] == 0
+
+    ranked = s.ranked_scores()
+    aaa = next(r for r in ranked if r["symbol"] == "AAA")
+    assert aaa["tech"]["trend"] == "up"          # attached to the trading surface
+
+
+def test_ranked_scores_survives_scanner_without_tech_attr():
+    """Scanners built via __new__ in older tests have no self.tech — the
+    attach must getattr-guard, not assume __init__ ran."""
+    s = _scanner_with_store(_TechStore())
+    assert not hasattr(s, "tech")
+    ranked = s.ranked_scores()
+    assert ranked and "tech" not in ranked[0]
