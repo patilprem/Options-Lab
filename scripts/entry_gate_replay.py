@@ -28,6 +28,13 @@ METHOD, and what makes it honest:
   shows both treatments, so the headline is never an instrumentation
   artifact.
 
+Also breaks down the biggest first-failing-gate bucket (usually entry_score,
+since it's checked first): of the trades it blocked, how many would ALSO
+have failed the newer checklist independently (real, additional work) vs
+how many the score bar alone would have caught (see gates_failed_independently
+/ score_gate_overlap — each candidate is re-run through entry_quality with
+ONE gate armed at a time, so no gate's condition is ever restated).
+
 WHAT IT CANNOT DO (also printed): price trades the new system would have
 taken that the old one didn't (premiums are only recorded for names
 actually held), or escape the in-sample caveat — these gates were designed
@@ -188,8 +195,105 @@ def judge_trades(exits: list[dict], tech_by_key: dict, cfg) -> list[dict]:
             "passed": ok, "why": why,
             "gate": None if ok else gate_label(why),
             "data_missing": (not ok) and is_data_missing(why),
+            "candidate": sc, "market_bias": ctx.get("market_bias"),
         })
     return verdicts
+
+
+# Every optional gate entry_quality can check, as (label, TradeConfig field,
+# the value to arm it at if the live config currently has it off) — shared
+# by gates_failed_independently so isolating one gate never restates what
+# "armed" means for it.
+_TECH_GATES = (
+    ("vwap_side", "require_vwap_side", 1),
+    ("trend_align", "require_trend_align", 1),
+    ("structure_break", "require_structure_break", 1),
+    ("rsi", "max_rsi_extreme", 75.0),
+    ("vwap_dist", "max_vwap_dist_pct", 2.5),
+    ("risk_reward", "min_rr", 1.5),
+)
+_NON_TECH_GATES = (
+    ("fresh_buildup", "fresh_buildup_only", 1),
+    ("volume_surge", "min_volume_surge", 1.5),
+    ("liquid_chain", "require_liquid_chain", 1),
+    ("range_align", "min_range_align", 0.6),
+    ("index_align", "index_align", 1),
+)
+_ALL_TOGGLE_FIELDS = dict(
+    entry_score=0, fresh_buildup_only=0, min_volume_surge=0,
+    require_liquid_chain=0, min_range_align=0, index_align=0,
+    require_vwap_side=0, require_trend_align=0, require_structure_break=0,
+    max_rsi_extreme=0, max_vwap_dist_pct=0, min_rr=0)
+
+
+def gates_failed_independently(sc: dict, cfg, market_bias=None) -> set:
+    """Every gate this candidate fails ON ITS OWN, tested one knob at a
+    time — unlike entry_quality's short-circuit (which stops at the FIRST
+    failure and hides whether the trade would also have failed anything
+    else). Each check re-runs the REAL entry_quality with every other knob
+    switched off, so no gate's logic is restated here.
+
+    entry_score is judged directly (it isn't a 0/off-able knob — raising it
+    is the only way to disable it, which isn't a meaningful 'off' for this
+    isolation test). Missing technical data collapses to one 'tech_missing'
+    entry rather than six: without a read, VWAP/trend/structure/RSI/R:R
+    can't be separately judged, so listing all six would double-count one
+    problem as if it were six independent ones."""
+    from dataclasses import replace as _replace
+
+    from app.engines.scanner_trader import entry_quality
+    if not sc.get("bias"):
+        return {"no_bias"}
+    failed: set = set()
+    if (sc.get("score") or 0) < cfg.entry_score:
+        failed.add("entry_score")
+
+    def _armed(field, fallback):
+        cur = getattr(cfg, field)
+        return cur if cur else fallback
+
+    def _check(label, field, fallback):
+        c = _replace(cfg, **{**_ALL_TOGGLE_FIELDS, field: _armed(field, fallback)})
+        ok, _why = entry_quality(sc, c, market_bias)
+        if not ok:
+            failed.add(label)
+
+    for label, field, fallback in _NON_TECH_GATES:
+        _check(label, field, fallback)
+
+    tech = sc.get("tech")
+    if not tech or not tech.get("n_bars"):
+        failed.add("tech_missing")
+    else:
+        for label, field, fallback in _TECH_GATES:
+            _check(label, field, fallback)
+
+    return failed
+
+
+def score_gate_overlap(verdicts: list, cfg) -> dict:
+    """For every trade whose FIRST failing gate was entry_score: would it
+    ALSO independently fail something else, or was the raised score bar the
+    ONLY thing standing between it and the ledger? Answers the natural
+    follow-up to a big entry_score count in the attribution table — how
+    much of that number is really 'the score' vs 'everything else, too'."""
+    scored_out = [v for v in verdicts if v["gate"] == "entry_score"]
+    only_score, also_other = [], []
+    other_counts: dict = {}
+    for v in scored_out:
+        failed = gates_failed_independently(
+            v.get("candidate") or {}, cfg, market_bias=v.get("market_bias"))
+        others = failed - {"entry_score"}
+        if others:
+            also_other.append(v)
+            for g in others:
+                other_counts[g] = other_counts.get(g, 0) + 1
+        else:
+            only_score.append(v)
+    return {"n": len(scored_out), "only_score": _stats(only_score),
+            "also_other": _stats(also_other),
+            "other_gate_counts": dict(sorted(other_counts.items(),
+                                             key=lambda kv: -kv[1]))}
 
 
 def apply_breakers(verdicts: list[dict], cfg, keep_missing: bool = False) -> set:
@@ -319,7 +423,7 @@ def _pct(x):
 
 
 def print_report(summary: dict, verdicts: list[dict], cfg,
-                 verbose: bool = False) -> None:
+                 overlap: dict | None = None, verbose: bool = False) -> None:
     def section(title):
         print(f"\n=== {title} ===")
 
@@ -353,6 +457,24 @@ def print_report(summary: dict, verdicts: list[dict], cfg,
               f"(field not recorded yet / series absent), net ₹{m['net']:,.0f}"
               " — see the 'missing data forgiven' policy row for the "
               "signal-only effect.")
+
+    if overlap and overlap["n"]:
+        os_, ao = overlap["only_score"], overlap["also_other"]
+        section(f"entry_score overlap — of the {overlap['n']} trades blocked "
+               "first by score, would the rest ALSO have blocked them?")
+        print(f"  score was the ONLY problem: {os_['n']} trades · "
+              f"net ₹{os_['net']:,.0f} · win {_pct(os_['win_rate'])}  "
+              "(a bare score bump alone would have let these in)")
+        print(f"  would ALSO fail >=1 other gate independently: "
+              f"{ao['n']} trades · net ₹{ao['net']:,.0f} · "
+              f"win {_pct(ao['win_rate'])}  "
+              "(the newer checklist is doing real work here, not just the "
+              "higher bar)")
+        if overlap["other_gate_counts"]:
+            print("  which other gate(s), among those "
+                  f"{ao['n']} (a trade can fail more than one):")
+            for g, n in overlap["other_gate_counts"].items():
+                print(f"    {g:<18}{n:>5}")
 
     if verbose:
         section("Per-trade verdicts")
@@ -419,7 +541,9 @@ def main(argv=None) -> int:
         tech = reconstruct_tech(store, exits)
         verdicts = judge_trades(exits, tech, cfg)
         summary = summarize(verdicts, cfg)
-        print_report(summary, verdicts, cfg, verbose=args.verbose)
+        overlap = score_gate_overlap(verdicts, cfg)
+        print_report(summary, verdicts, cfg, overlap=overlap,
+                    verbose=args.verbose)
         return 0
     finally:
         try:

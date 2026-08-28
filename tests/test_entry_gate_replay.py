@@ -14,8 +14,9 @@ import pytest
 from app.data.store import DataStore
 from app.engines.scanner_trader import TradeConfig
 from scripts.entry_gate_replay import (apply_breakers, build_candidate,
-                                       gate_label, is_data_missing,
-                                       judge_trades, reconstruct_tech,
+                                       gate_label, gates_failed_independently,
+                                       is_data_missing, judge_trades,
+                                       reconstruct_tech, score_gate_overlap,
                                        summarize)
 
 ENTRY_DAY = "2026-08-20"
@@ -162,6 +163,71 @@ def test_summary_conserves_pnl_and_attributes_gates():
     names = {name: st for name, st in s["policies"]}
     assert names["Signal gates only (missing data forgiven)"]["n"] == 2
     assert names["Full checklist (missing data = blocked, as live)"]["n"] == 1
+
+
+# --- independent gate overlap (the entry_score drill-down) -----------------
+
+def test_gates_failed_independently_isolates_a_single_problem():
+    cfg = TradeConfig()
+    sc = build_candidate(_row(score=60), _tech())    # everything else clean
+    assert gates_failed_independently(sc, cfg) == {"entry_score"}
+
+
+def test_gates_failed_independently_finds_every_independent_failure():
+    cfg = TradeConfig()
+    sc = build_candidate(
+        _row(score=60, ctx={"volume_surge": 1.0}), _tech(rsi=85.0))
+    failed = gates_failed_independently(sc, cfg)
+    assert failed == {"entry_score", "volume_surge", "rsi"}
+
+
+def test_missing_tech_collapses_to_one_bucket_not_six():
+    cfg = TradeConfig()
+    sc = build_candidate(_row(score=60), None)       # no snapshot series
+    failed = gates_failed_independently(sc, cfg)
+    assert "tech_missing" in failed
+    # none of the six individual technical labels appear alongside it
+    assert not failed & {"vwap_side", "trend_align", "structure_break",
+                         "rsi", "vwap_dist", "risk_reward"}
+
+
+def test_no_bias_short_circuits():
+    cfg = TradeConfig()
+    sc = build_candidate(_row(score=60), _tech())
+    sc["bias"] = None
+    assert gates_failed_independently(sc, cfg) == {"no_bias"}
+
+
+def test_score_gate_overlap_splits_score_only_from_also_other():
+    cfg = TradeConfig()
+    rows = [
+        # blocked by score alone — everything else would pass
+        _row("AAA", score=60, realized=-1000,
+             entry_ts=f"{ENTRY_DAY}T09:40:00"),
+        # blocked by score, and independently fails volume_surge too
+        _row("BBB", score=60, realized=-2000,
+             entry_ts=f"{ENTRY_DAY}T09:45:00",
+             ctx={"volume_surge": 1.0}),
+        # not blocked by score at all — must not appear in the overlap
+        _row("CCC", score=90, realized=500,
+             entry_ts=f"{ENTRY_DAY}T09:50:00"),
+    ]
+    verdicts = _judge(rows, [_tech(), _tech(), _tech()], cfg)
+    overlap = score_gate_overlap(verdicts, cfg)
+    assert overlap["n"] == 2
+    assert overlap["only_score"]["n"] == 1
+    assert overlap["only_score"]["net"] == -1000
+    assert overlap["also_other"]["n"] == 1
+    assert overlap["also_other"]["net"] == -2000
+    assert overlap["other_gate_counts"] == {"volume_surge": 1}
+
+
+def test_score_gate_overlap_empty_when_nothing_blocked_by_score():
+    cfg = TradeConfig()
+    verdicts = _judge([_row("AAA")], [_tech()], cfg)   # passes everything
+    overlap = score_gate_overlap(verdicts, cfg)
+    assert overlap["n"] == 0
+    assert overlap["only_score"]["n"] == 0 and overlap["also_other"]["n"] == 0
 
 
 # --- point-in-time tech reconstruction ---------------------------------------
