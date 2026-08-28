@@ -13,12 +13,15 @@ from app.engines import journal_insights as ji
 def _exit(sym="AAA", realized=1000.0, reason="trail_stop", entry_score=80.0,
           entry_ts="2026-07-16T10:00:00", ts="2026-07-16T14:00:00",
           mfe=20.0, mae=20.0, ret=10.0, held_min=300,
-          buildup="long_buildup", entry_fees=40.0, exit_fees=40.0):
+          buildup="long_buildup", entry_fees=40.0, exit_fees=40.0,
+          bias="CE", surge=None, market_bias=None):
     return {"kind": "exit", "symbol": sym, "ts": ts, "entry_ts": entry_ts,
             "realized": realized, "reason": reason, "entry_score": entry_score,
             "mfe_pct": mfe, "mae_pct": mae, "ret_pct": ret,
             "held_minutes": held_min, "entry_fees": entry_fees,
-            "exit_fees": exit_fees, "entry_ctx": {"buildup": buildup}}
+            "exit_fees": exit_fees, "bias": bias,
+            "entry_ctx": {"buildup": buildup, "volume_surge": surge,
+                          "market_bias": market_bias}}
 
 
 def _rules(res):
@@ -119,6 +122,44 @@ def test_late_entries_rule():
     assert "late_entries" in _rules(res)
     assert res["by_entry_hour"]["09-11"]["n"] == 5
     assert res["by_entry_hour"]["13+"]["avg"] == -400.0
+
+
+def test_low_surge_entries_rule():
+    rows = ([_exit(realized=700, surge=2.2) for _ in range(5)]
+            + [_exit(realized=-500, surge=1.1) for _ in range(5)])
+    res = ji.analyze(rows)
+    assert "low_surge_entries" in _rules(res)
+    assert res["by_volume_surge"]["1.5+"]["n"] == 5
+    assert res["by_volume_surge"]["<1.5"]["avg"] == -500.0
+
+
+def test_low_surge_rule_treats_missing_surge_as_unknown():
+    # losses with NO surge reading are 'unknown', not evidence for the gate
+    rows = ([_exit(realized=700, surge=2.2) for _ in range(5)]
+            + [_exit(realized=-500) for _ in range(5)])
+    res = ji.analyze(rows)
+    assert "low_surge_entries" not in _rules(res)
+    assert res["by_volume_surge"]["unknown"]["n"] == 5
+
+
+def test_counter_trend_entries_rule():
+    # CE trades: winning with the market, losing against it
+    rows = ([_exit(realized=700, market_bias=0.6) for _ in range(5)]
+            + [_exit(realized=-500, market_bias=-0.6) for _ in range(5)])
+    res = ji.analyze(rows)
+    assert "counter_trend_entries" in _rules(res)
+    assert res["by_market_align"]["counter"]["n"] == 5
+    assert res["by_market_align"]["aligned"]["avg"] == 700.0
+
+
+def test_counter_trend_needs_a_strong_reading():
+    # |bias| <= 0.3 is the neutral band — losses there are not counter-trend
+    # evidence (and legacy rows with no market_bias at all stay 'unknown')
+    rows = ([_exit(realized=700, market_bias=0.2) for _ in range(5)]
+            + [_exit(realized=-500, market_bias=-0.2) for _ in range(5)])
+    res = ji.analyze(rows)
+    assert "counter_trend_entries" not in _rules(res)
+    assert res["by_market_align"]["neutral"]["n"] == 10
 
 
 def test_clean_profitable_book_suggests_nothing():

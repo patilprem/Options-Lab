@@ -7,6 +7,7 @@ registry, verifying entry -> hold -> trailing-exit and ledger booking.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime
 
 import pytest
@@ -87,14 +88,20 @@ def test_exit_max_hold_and_hold_otherwise():
 
 # --- pure: behavioural gates (the holistic-adaptation knobs) ----------------
 
-def _score(sym="AAA", score=80, bias="CE", buildup="long_buildup"):
-    return {"symbol": sym, "score": score, "bias": bias, "buildup": buildup}
+def _score(sym="AAA", score=80, bias="CE", buildup="long_buildup", **kw):
+    """A setup that passes the default high-probability profile: surge
+    confirmed, chain vetted liquid, pressing the day's range in the trade's
+    direction. Individual tests override fields to fail a specific gate."""
+    d = {"symbol": sym, "score": score, "bias": bias, "buildup": buildup,
+         "volume_surge": 2.0, "liquidity_ok": True,
+         "range_pos": 0.9 if bias == "CE" else 0.1}
+    d.update(kw)
+    return d
 
 
-def test_defaults_leave_behaviour_unchanged():
-    """All three gates default to off/no-op — pre-existing callers that pass
-    no now/last_exits must see identical picks (adaptation PROPOSES change;
-    shipping the knobs must not BE a change).
+def test_no_time_cutoff_or_cooldown_by_default():
+    """entry_cutoff/cooldown/fresh-buildup still default to off/no-op — a
+    fully CONFIRMED setup enters at any session time.
 
     Deliberately probes times BEYOND the 935 default, incl. MCX hours: the
     first version of this test used 15:34 and passed by one minute, hiding a
@@ -107,6 +114,14 @@ def test_defaults_leave_behaviour_unchanged():
             now=datetime(2026, 7, 27, hh, mm),
             last_exits={"AAA": datetime(2026, 7, 27, 9, 30)})
         assert picks == ["AAA"], f"default gates blocked an entry at {hh}:{mm:02d}"
+
+
+def test_default_profile_blocks_unconfirmed_setups():
+    """THE 2026-08-28 change: a bare high score no longer buys anything — a
+    setup with no confirming data (no surge read, unvetted chain, unknown
+    range position) is skipped under the default config."""
+    bare = {"symbol": "AAA", "score": 90, "bias": "CE"}
+    assert st.pick_entries([bare], set(), TradeConfig()) == []
 
 
 def test_reentry_cooldown_blocks_then_releases():
@@ -145,10 +160,96 @@ def test_fresh_buildup_only_skips_covering_and_unwinding():
     assert st.pick_entries(ranked, set(), cfg) == ["CCC", "DDD"]
 
 
+# --- pure: high-probability entry gates -------------------------------------
+
+def test_volume_surge_gate_requires_positive_confirmation():
+    cfg = TradeConfig()                            # min_volume_surge=1.5
+    ok, _ = st.entry_quality(_score(), cfg)
+    assert ok
+    ok, why = st.entry_quality(_score(volume_surge=1.2), cfg)
+    assert not ok and "volume" in why
+    # unknown is NOT confirmation — a confirmation gate fails closed
+    ok, why = st.entry_quality(_score(volume_surge=None), cfg)
+    assert not ok and "unknown" in why
+    # 0 = off: unknown surge passes again
+    cfg_off = replace(cfg, min_volume_surge=0.0)
+    assert st.entry_quality(_score(volume_surge=None), cfg_off)[0]
+
+
+def test_liquid_chain_gate_blocks_unvetted_and_illiquid():
+    cfg = TradeConfig()                            # require_liquid_chain=1
+    ok, why = st.entry_quality(_score(liquidity_ok=None), cfg)
+    assert not ok and "deep-dived" in why          # never chain-checked
+    ok, why = st.entry_quality(_score(liquidity_ok=False), cfg)
+    assert not ok and "liquidity" in why
+    assert st.entry_quality(_score(liquidity_ok=None),
+                            replace(cfg, require_liquid_chain=0))[0]
+
+
+def test_range_alignment_gate_is_directional():
+    cfg = TradeConfig()                            # min_range_align=0.6
+    # a CE at the LOW of the day is a fade, not momentum -> blocked
+    ok, why = st.entry_quality(_score(range_pos=0.2), cfg)
+    assert not ok and "range" in why
+    # the SAME range position is fine for a PE (aligned = 1 - 0.2 = 0.8)
+    assert st.entry_quality(_score(bias="PE", buildup="short_buildup",
+                                   range_pos=0.2), cfg)[0]
+    ok, why = st.entry_quality(_score(range_pos=None), cfg)
+    assert not ok and "unknown" in why
+    assert st.entry_quality(_score(range_pos=None),
+                            replace(cfg, min_range_align=0.0))[0]
+
+
+def test_index_align_gate_blocks_only_a_contradicting_regime():
+    cfg = TradeConfig()                            # index_align=1
+    ce, pe = _score(), _score(bias="PE", buildup="short_buildup")
+    # strong opposite bias blocks
+    assert not st.entry_quality(ce, cfg, market_bias=-0.5)[0]
+    assert not st.entry_quality(pe, cfg, market_bias=0.5)[0]
+    # aligned / neutral / unread all pass (only contradiction is evidence)
+    assert st.entry_quality(ce, cfg, market_bias=0.5)[0]
+    assert st.entry_quality(ce, cfg, market_bias=-0.2)[0]
+    assert st.entry_quality(ce, cfg, market_bias=None)[0]
+    assert st.entry_quality(ce, replace(cfg, index_align=0),
+                            market_bias=-0.9)[0]
+
+
+def test_max_trades_per_day_caps_new_entries():
+    cfg = TradeConfig(max_trades_per_day=2)
+    ranked = [_score("AAA"), _score("BBB"), _score("CCC")]
+    assert st.pick_entries(ranked, set(), cfg) == ["AAA", "BBB"]
+    assert st.pick_entries(ranked, set(), cfg, entries_today=2) == []
+    # 0 = off
+    off = TradeConfig(max_trades_per_day=0)
+    assert len(st.pick_entries(ranked, set(), off, entries_today=99)) == 3
+
+
+def test_daily_loss_stop_halts_new_entries():
+    cfg = TradeConfig(capital=500_000, daily_loss_stop_pct=0.02)  # -10k halt
+    ranked = [_score()]
+    assert st.pick_entries(ranked, set(), cfg, day_realized=-10_000.0) == []
+    assert st.pick_entries(ranked, set(), cfg, day_realized=-9_000.0) == ["AAA"]
+    assert st.pick_entries(ranked, set(), cfg, day_realized=5_000.0) == ["AAA"]
+    off = TradeConfig(daily_loss_stop_pct=0.0)
+    assert st.pick_entries(ranked, set(), off, day_realized=-50_000.0) == ["AAA"]
+
+
+def test_quote_spread_pct():
+    class _Q:
+        bid, ask = 99.0, 101.0
+    assert st.quote_spread_pct(_Q) == 2.0
+    class _OneSided:
+        bid, ask = None, 101.0
+    assert st.quote_spread_pct(_OneSided) is None
+
+
 # --- pure: entry pick -------------------------------------------------------
 
 def test_pick_entries_respects_score_bias_and_slots():
-    cfg = TradeConfig(entry_score=65, max_positions=2)
+    # quality gates off here — this test pins the score/bias/slot mechanics
+    cfg = TradeConfig(entry_score=65, max_positions=2, min_volume_surge=0,
+                      require_liquid_chain=0, min_range_align=0,
+                      max_trades_per_day=0)
     ranked = [
         {"symbol": "AAA", "score": 80, "bias": "CE"},
         {"symbol": "BBB", "score": 60, "bias": "PE"},   # below entry_score
@@ -217,7 +318,7 @@ def test_step_enters_then_trailing_exits(tmp_path, monkeypatch):
 
     hub, sc = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
-    sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    sc.scores = {"RELIANCE": _score("RELIANCE")}
 
     trader.step(hub, sc)
     assert "RELIANCE" in trader.book                # opened a CE position
@@ -281,7 +382,7 @@ def test_daily_pnl_accumulates_across_cycles_same_day(tmp_path, monkeypatch):
     trader.book = {}
 
     hub, scanner = _FakeHub(), _FakeScanner()
-    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    scanner.scores = {"RELIANCE": _score("RELIANCE")}
 
     # round trip 1: enter, run up, trailing-exit in profit
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
@@ -327,7 +428,7 @@ def test_manage_marks_and_exits_without_opening_new_positions(tmp_path, monkeypa
 
     hub, scanner = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
-    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    scanner.scores = {"RELIANCE": _score("RELIANCE")}
 
     exited = trader.manage(hub, scanner)
     assert exited == set()
@@ -367,7 +468,7 @@ def test_cooldown_blocks_immediate_rebuy_after_exit(tmp_path, monkeypatch):
     trader.book = {}
 
     hub, scanner = _FakeHub(), _FakeScanner()
-    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    scanner.scores = {"RELIANCE": _score("RELIANCE")}
 
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
     trader.step(hub, scanner)
@@ -403,7 +504,7 @@ def test_entry_ctx_thin_window_reports_null_not_zero(tmp_path, monkeypatch):
 
     hub, scanner = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
-    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    scanner.scores = {"RELIANCE": _score("RELIANCE")}
 
     trader.step(hub, scanner)
     ctx = trader.book["RELIANCE"].entry_ctx
@@ -426,7 +527,7 @@ def test_candidates_are_sampled_even_when_not_traded(tmp_path, monkeypatch):
     trader.book = {}
 
     hub, scanner = _FakeHub(), _FakeScanner()
-    scanner.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    scanner.scores = {"RELIANCE": _score("RELIANCE")}
 
     for ltp in (20.0, 21.0, 22.0, 23.0, 24.0, 25.0):
         hub.set_atm("RELIANCE", "CALL", ltp=ltp)
@@ -461,7 +562,7 @@ def test_analyze_over_real_journal_rows(tmp_path, monkeypatch):
 
     hub, sc = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
-    sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    sc.scores = {"RELIANCE": _score("RELIANCE")}
     trader.step(hub, sc)                            # enter
     hub.set_atm("RELIANCE", "CALL", ltp=10.0)       # -50% -> hard stop
     trader.step(hub, sc)
@@ -484,6 +585,120 @@ def test_step_noop_when_disabled(tmp_path, monkeypatch):
     trader.book = {}
     hub, sc = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", 20.0)
-    sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 90, "bias": "CE"}}
+    sc.scores = {"RELIANCE": _score("RELIANCE", score=90)}
     trader.step(hub, sc)
     assert trader.book == {}
+
+
+# --- integration: the high-probability gates end to end ----------------------
+
+def _mk(tmp_path, monkeypatch, **settings):
+    reg = _iso_registry(tmp_path, monkeypatch)
+    reg.set_setting("scanner_trade", "on")
+    reg.set_setting("scanner_trade_entry_score", "65")
+    reg.set_setting("scanner_trade_risk_pct", "0.02")
+    for k, v in settings.items():
+        reg.set_setting(k, str(v))
+    trader = st.ScannerTrader.__new__(st.ScannerTrader)
+    trader.store = None
+    import app.engines.fills as F
+    trader._fee, trader._slip = F.FeeConfig(), F.SlippageConfig()
+    trader.book = {}
+    return reg, trader
+
+
+def test_step_gates_unconfirmed_qualifier_and_logs_why(tmp_path, monkeypatch):
+    """A name clearing the score bar but failing a quality gate must be (a)
+    not entered and (b) VISIBLY skipped — one 'entry gated' event naming the
+    reason, once per (symbol, reason) per day."""
+    reg, trader = _mk(tmp_path, monkeypatch)
+    hub, sc = _FakeHub(), _FakeScanner()
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    # score 80 but the move ran on ordinary volume -> surge gate blocks
+    sc.scores = {"RELIANCE": _score("RELIANCE", volume_surge=1.0)}
+
+    trader.step(hub, sc)
+    trader.step(hub, sc)                           # second cycle: same reason
+    assert trader.book == {}
+    today = datetime.now(st.IST).date().isoformat()
+    gated = [e for e in reg.events_for(today)
+             if "entry gated [RELIANCE]" in e["message"]]
+    assert len(gated) == 1                         # logged once, not per cycle
+    assert "volume" in gated[0]["message"]
+
+    # confirm the surge -> the same setup now enters
+    sc.scores = {"RELIANCE": _score("RELIANCE")}
+    trader.step(hub, sc)
+    assert "RELIANCE" in trader.book
+
+
+def test_wide_spread_blocks_the_fill_itself(tmp_path, monkeypatch):
+    """The chain screen can pass while THIS contract's quote is wide at fill
+    time — the per-contract spread cap must catch that."""
+    reg, trader = _mk(tmp_path, monkeypatch)
+    hub, sc = _FakeHub(), _FakeScanner()
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0, bid=18.0, ask=22.0)  # 20% wide
+    sc.scores = {"RELIANCE": _score("RELIANCE")}
+    trader.step(hub, sc)
+    assert trader.book == {}
+    today = datetime.now(st.IST).date().isoformat()
+    assert any("spread" in e["message"] and "entry gated [RELIANCE]" in e["message"]
+               for e in reg.events_for(today))
+    # a normal quote enters fine
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, sc)
+    assert "RELIANCE" in trader.book
+
+
+def test_daily_loss_stop_blocks_reentry_after_a_bad_day(tmp_path, monkeypatch):
+    """Circuit breaker end to end: a realized day loss past the stop keeps
+    the trader OUT for the rest of the day even when a fresh qualifying
+    setup appears (exits/management unaffected), and the halt is logged."""
+    reg, trader = _mk(tmp_path, monkeypatch)     # 2% of 5L = -10k halts
+    hub, sc = _FakeHub(), _FakeScanner()
+    sc.scores = {"RELIANCE": _score("RELIANCE")}
+
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, sc)
+    assert "RELIANCE" in trader.book             # 3 lots x 500 = 1500 units
+    hub.set_atm("RELIANCE", "CALL", ltp=10.0)    # hard stop, ~ -15k realized
+    trader.step(hub, sc)
+    assert "RELIANCE" not in trader.book
+
+    # the setup 'recovers' the same day — without the stop this re-enters
+    # (cooldown is off by default and the exit was a previous cycle)
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    trader.step(hub, sc)
+    assert trader.book == {}
+    today = datetime.now(st.IST).date().isoformat()
+    assert any("entry halt" in e["message"] and "daily-loss" in e["message"]
+               for e in reg.events_for(today))
+
+
+def test_max_trades_per_day_holds_across_cycles(tmp_path, monkeypatch):
+    """The per-day entry cap counts the JOURNAL, not memory — entries from
+    earlier cycles (or before a restart) still count."""
+    reg, trader = _mk(tmp_path, monkeypatch,
+                      scanner_trade_max_trades_per_day=1,
+                      scanner_trade_daily_loss_stop_pct=0)
+    hub, sc = _FakeHub(), _FakeScanner()
+    sc._universe["TCS"] = {"lot_size": 175, "spot_security_id": 11536}
+    sc.metrics["TCS"] = dict(sc.metrics["RELIANCE"])
+    sc.tier2["TCS"] = dict(sc.tier2["RELIANCE"])
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    hub.set_atm("TCS", "CALL", ltp=20.0)
+    sc.scores = {"RELIANCE": _score("RELIANCE"), "TCS": _score("TCS")}
+
+    trader.step(hub, sc)
+    assert len(trader.book) == 1                 # cap 1, not the 2 slots free
+    # close it out; the day's count is spent — no new entry this day
+    only = next(iter(trader.book))
+    hub.set_atm(only, "CALL", ltp=10.0)
+    trader.step(hub, sc)
+    assert trader.book == {}
+    hub.set_atm("RELIANCE", "CALL", ltp=20.0)
+    hub.set_atm("TCS", "CALL", ltp=20.0)
+    trader.step(hub, sc)
+    assert trader.book == {}
+    today = datetime.now(st.IST).date().isoformat()
+    assert any("trade cap" in e["message"] for e in reg.events_for(today))

@@ -382,8 +382,10 @@ def setup_score(t1: dict, t2: dict | None = None) -> dict:
             reasons.append("pressing the day's " + ("high" if bias == "CE" else "low"))
 
     # 5) Tier-2 chain quality (up to 15, and a hard liquidity veto)
+    liquidity_ok = None          # None = not deep-dived; True/False once checked
     if t2:
         liq = t2.get("liquidity") or {}
+        liquidity_ok = liq.get("ok")
         if liq.get("ok"):
             score += 8
             reasons.append("liquid chain")
@@ -405,9 +407,13 @@ def setup_score(t1: dict, t2: dict | None = None) -> dict:
                 f" @ {top['option_type']}{top['strike_offset']:+d}")
             score += 3
 
+    # range_pos + liquidity_ok ride along so ScannerTrader.entry_quality can
+    # gate on them without a second data path (ranked_scores() is THE trading
+    # surface — everything an entry decision needs must be on these dicts).
     return {"symbol": t1.get("symbol"), "score": round(min(score, 100.0), 1),
             "bias": bias, "buildup": buildup, "reasons": reasons,
             "price_change_pct": pc, "volume_surge": surge,
+            "range_pos": t1.get("range_pos"), "liquidity_ok": liquidity_ok,
             "deep_dived": bool(t2)}
 
 

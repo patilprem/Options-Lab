@@ -227,6 +227,18 @@ export default function ScannerView({ showToast, onDecision }) {
           {/* the open-positions table lives on the Dashboard now (unified
               with Strategy positions there) — this panel is just the
               on/off control + aggregate P&L, not a duplicate listing */}
+          {book.config && (
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)', marginTop: 8 }}>
+              entry criteria: score ≥ {book.config.entry_score}
+              {book.config.min_volume_surge > 0 ? ` · vol ≥ ${book.config.min_volume_surge}×` : ''}
+              {book.config.require_liquid_chain ? ' · liquid chain' : ''}
+              {book.config.min_range_align > 0 ? ` · range-aligned ≥ ${book.config.min_range_align}` : ''}
+              {book.config.index_align ? ' · not against market bias' : ''}
+              {book.config.max_entry_spread_pct > 0 ? ` · spread ≤ ${book.config.max_entry_spread_pct}%` : ''}
+              {book.config.max_trades_per_day > 0 ? ` · ≤ ${book.config.max_trades_per_day} trades/day` : ''}
+              {book.config.daily_loss_stop_pct > 0 ? ` · halt at −${(book.config.daily_loss_stop_pct * 100).toFixed(1)}% day loss` : ''}
+            </div>
+          )}
         </div>
       )}
 

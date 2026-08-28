@@ -128,7 +128,11 @@ def test_challenger_trades_virtually_only(tmp_path, monkeypatch):
          "started": "2026-07-01", "book": {}, "closed": []}))
     hub, sc = _FakeHub(), _FakeScanner()
     hub.set_atm("RELIANCE", "CALL", ltp=20.0)
-    sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE"}}
+    # passes every high-probability gate, so only entry_score separates the
+    # champion (90) from the challenger (65)
+    sc.scores = {"RELIANCE": {"symbol": "RELIANCE", "score": 80, "bias": "CE",
+                              "buildup": "long_buildup", "volume_surge": 2.0,
+                              "liquidity_ok": True, "range_pos": 0.9}}
 
     trader.step(hub, sc)
     assert trader.book == {}                     # champion stayed out
@@ -154,7 +158,7 @@ def test_persistence_starts_a_trial(tmp_path, monkeypatch):
     trader._daily_reflection(trader._cfg(), today)
     chal = json.loads(reg.setting(st.CHAL_SETTING))
     assert chal["rule"] == "raise_entry_score"
-    assert chal["overrides"] == {"entry_score": 70.0}     # one bounded step
+    assert chal["overrides"] == {"entry_score": 75.0}     # one bounded step
     assert chal["started"] == today.isoformat()
 
 
@@ -170,25 +174,25 @@ def test_winning_trial_becomes_proposal_then_apply_embargoes(tmp_path, monkeypat
     closed = [{"symbol": "BBB", "realized": 500.0, "reason": "trail_stop",
                "entry_ts": "2026-07-11T10:00:00", "ts": "2026-07-12T10:00:00"}] * 8
     reg.set_setting(st.CHAL_SETTING, json.dumps(
-        {"rule": "raise_entry_score", "overrides": {"entry_score": 70.0},
+        {"rule": "raise_entry_score", "overrides": {"entry_score": 75.0},
          "started": started, "book": {}, "closed": closed}))
 
     trader._advance_adaptation(trader._cfg(), today, [])
     assert reg.setting(st.CHAL_SETTING) == ""            # trial concluded
     prop = json.loads(reg.setting(st.PROPOSAL_SETTING))
-    assert prop["overrides"] == {"entry_score": 70.0}
+    assert prop["overrides"] == {"entry_score": 75.0}
     assert prop["comparison"]["better"] is True
-    assert prop["current"]["entry_score"] == 65.0
+    assert prop["current"]["entry_score"] == 70.0
 
     # human clicks Apply -> setting takes the bounded step, embargo starts
     res = trader.apply_proposal()
-    assert res["ok"] and trader._cfg().entry_score == 70.0
+    assert res["ok"] and trader._cfg().entry_score == 75.0
     assert reg.setting(st.PROPOSAL_SETTING) == ""
     embargo = reg.setting(st.EMBARGO_SETTING)
     assert embargo == (today + timedelta(days=A.EMBARGO_DAYS)).isoformat() \
         or embargo > today.isoformat()                    # applied "now" (IST)
     hist = json.loads(reg.setting(st.TUNE_HISTORY_SETTING))
-    assert hist[-1]["kind"] == "apply" and hist[-1]["from"] == {"entry_score": 65.0}
+    assert hist[-1]["kind"] == "apply" and hist[-1]["from"] == {"entry_score": 70.0}
 
     # during the embargo, even a persistent rule starts no new trial
     for d in ("2026-07-27", "2026-07-28", "2026-07-29"):
@@ -242,7 +246,8 @@ def test_every_scalar_insight_rule_is_adaptable():
     entry — is a state machine, not a scalar; documented human-only)."""
     all_rules = {"trail_giveback", "mfe_take_profit", "fast_hard_stops",
                  "raise_entry_score", "late_entries", "churn",
-                 "tighten_hard_stop", "fresh_buildup_only", "fee_drag"}
+                 "tighten_hard_stop", "fresh_buildup_only", "fee_drag",
+                 "low_surge_entries", "counter_trend_entries"}
     assert set(A.ADAPTABLE) == all_rules - {"fast_hard_stops"}
 
 
@@ -267,10 +272,18 @@ def test_behavioural_rule_overrides_step_and_clamp():
     assert A.challenger_overrides(cfg, "churn") == {"reentry_cooldown_min": 30.0}
     # late_entries: 935 (off) -> one hour earlier
     assert A.challenger_overrides(cfg, "late_entries") == {"entry_cutoff_min": 875}
+    # low_surge_entries: gate off -> one step arms it at the measured 1.5x
+    assert A.challenger_overrides({"min_volume_surge": 0.0},
+                                  "low_surge_entries") == {"min_volume_surge": 1.5}
+    # counter_trend_entries: off -> on; already on -> nothing left to trial
+    assert A.challenger_overrides({"index_align": 0},
+                                  "counter_trend_entries") == {"index_align": 1}
+    assert A.challenger_overrides({"index_align": 1},
+                                  "counter_trend_entries") is None
     # fresh filter: 0 -> 1
     assert A.challenger_overrides(cfg, "fresh_buildup_only") == {"fresh_buildup_only": 1}
-    # fee_drag shares the entry_score lever
-    assert A.challenger_overrides(cfg, "fee_drag") == {"entry_score": 70.0}
+    # fee_drag shares the entry_score lever (default is 70 now)
+    assert A.challenger_overrides(cfg, "fee_drag") == {"entry_score": 75.0}
     # clamped ends refuse a trial rather than stepping past the rail
     assert A.challenger_overrides({"reentry_cooldown_min": 60.0}, "churn") is None
     assert A.challenger_overrides({"fresh_buildup_only": 1}, "fresh_buildup_only") is None

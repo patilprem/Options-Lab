@@ -453,3 +453,25 @@ dark ones.
   without starving them, and that `daily_pnl` accumulates correctly across
   a full live session with real order volume (only unit-tested offline so
   far, see tests/test_scanner_trader.py / test_scanner_tier2.py).
+- Scanner auto-trader HIGH-PROBABILITY ENTRY GATES (2026-08-28, after the book
+  over-traded into heavy losses): entries now require CONFLUENCE, not just a
+  composite score — `entry_quality()` in scanner_trader.py demands score >=
+  entry_score (default raised 65→70) AND volume surge >= 1.5x (unknown = fail:
+  confirmation gates fail closed), a deep-dived chain that PASSED the
+  liquidity screen (a Tier-1-only score could previously buy an unvetted
+  chain), price pressing the day's range in the trade's direction
+  (min_range_align 0.6), not fighting a strong opposite NIFTY bias
+  (index_align; blocks only on |score|>0.3 contradiction), and a <= 2% bid-ask
+  on the actual contract at fill. Two day-level circuit breakers:
+  max_trades_per_day (4) and daily_loss_stop_pct (2% of capital, realized) —
+  both read PERSISTED state (journal / daily_pnl) so a restart can't reset
+  them; exits/management are never blocked. All knobs are TradeConfig fields
+  enforced in entry_quality()/pick_entries() (the champion+challenger choke
+  point) so the shadow-trial pipeline can tune them; each is disable-able (0)
+  via its scanner_trade_* setting (POST /scanner/trade-settings). Skips are
+  VISIBLE: 'entry gated [SYM]: <reason>' events once per (symbol, reason,
+  day), 'entry halt' once per day when a breaker engages. entry_ctx now
+  records market_bias; journal insights gained low_surge_entries +
+  counter_trend_entries (both ADAPTABLE). setup_score() carries
+  range_pos/liquidity_ok for the gates — ranked_scores() dicts are the ONLY
+  data path into entry decisions, keep it that way.

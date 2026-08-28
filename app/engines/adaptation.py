@@ -90,6 +90,17 @@ ADAPTABLE: dict[str, dict] = {
     "fee_drag":          {"param": "entry_score",   "step": 5.0,
                           "lo": 50.0, "hi": 85.0,
                           "label": "raise the entry score (cut fee churn)"},
+    # low_surge_entries: unconfirmed-volume entries losing -> one step arms
+    # the surge gate at exactly the level the insight measures (1.5x, the
+    # mfe_take_profit/churn precedent); a second step can tighten to 3.0x
+    "low_surge_entries": {"param": "min_volume_surge", "step": 1.5,
+                          "lo": 0.0, "hi": 3.0,
+                          "label": "require a volume surge at entry"},
+    # counter_trend_entries: fighting the index bias losing -> flip the
+    # market-alignment gate (0 -> 1)
+    "counter_trend_entries": {"param": "index_align", "step": 1,
+                              "lo": 0, "hi": 1,
+                              "label": "block entries against the market bias"},
 }
 
 

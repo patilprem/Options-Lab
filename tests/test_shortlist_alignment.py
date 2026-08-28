@@ -43,13 +43,17 @@ def test_shortlist_is_ranked_by_the_entry_formula():
 
 
 def test_every_name_pick_entries_returns_is_in_the_shortlist():
-    """End to end: what the trader selects must be priceable."""
+    """End to end: what the trader selects must be priceable. Quality gates
+    are off here — this test pins the RANKING alignment (Tier-1-only scores
+    on both sides); the gates have their own tests in test_scanner_trader."""
     metrics = {f"S{i}": _m(f"S{i}", 0.4 + i * 0.2, surge=1.0 + i * 0.15)
                for i in range(25)}
     shortlist = {d["symbol"] for d in rank_for_deep_dive(metrics)}
     ranked = sorted((setup_score(m, None) for m in metrics.values()),
                     key=lambda s: s.get("score") or 0, reverse=True)
-    picked = pick_entries(ranked, set(), TradeConfig())
+    cfg = TradeConfig(min_volume_surge=0, require_liquid_chain=0,
+                      min_range_align=0)
+    picked = pick_entries(ranked, set(), cfg)
     assert picked, "test needs at least one entry"
     assert all(p in shortlist for p in picked), (
         f"picked {picked} but shortlist is {sorted(shortlist)}")

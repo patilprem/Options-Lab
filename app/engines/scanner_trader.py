@@ -20,10 +20,15 @@ step just wires it to the live chain cache + ledger.
 
 Trade lifecycle
 ---------------
-ENTRY  a shortlisted setup scoring >= entry_score, with a CE/PE bias and a
-       liquid chain (the score already caps illiquid names), that we don't
-       already hold and have a free slot for → buy the ATM option of the bias
-       side, sized to risk a fixed % of capital.
+ENTRY  a shortlisted setup that passes EVERY entry_quality() gate — score >=
+       entry_score AND (by default) a real volume surge, a deep-dived chain
+       that passed the liquidity screen, price pressing the day's range in
+       the trade's direction, not fighting a strong opposite NIFTY bias, and
+       a tight enough bid-ask on the actual contract — while the day-level
+       circuit breakers (max_trades_per_day, daily_loss_stop_pct) still
+       allow new risk → buy the ATM option of the bias side, sized to risk a
+       fixed % of capital. High probability = independent signals agreeing;
+       one loud score component can no longer buy an unconfirmed setup.
 HOLD   marked to the live chain each cycle; the stop ratchets UP as the premium
        makes new highs (never down).
 EXIT   whichever fires first: hard stop, trailing stop, target, max holding
@@ -54,7 +59,10 @@ EMBARGO_SETTING = "scanner_tune_embargo_until"  # no new trials before this day
 class TradeConfig:
     capital: float = 500_000.0
     risk_pct: float = 0.01            # risk 1% of capital per trade
-    entry_score: float = 65.0        # min setup score to open
+    entry_score: float = 70.0        # min setup score to open (65 pre-2026-08:
+                                     # reachable on Tier-1 alone; with the
+                                     # liquid-chain gate below, entries carry
+                                     # the chain bonus, so the bar moved up)
     exit_score: float = 45.0         # setup decayed below this -> exit
     hard_stop_pct: float = 0.30      # initial stop: 30% below entry premium
     trail_pct: float = 0.25          # trail 25% below the high-water premium
@@ -74,6 +82,40 @@ class TradeConfig:
                                      # NO cutoff at all, which is the default
     fresh_buildup_only: int = 0      # 1 = only long/short buildup entries
                                      # (skip covering/unwinding-fuelled)
+    # -- high-probability entry gates (2026-08-28). The single composite
+    # score let one loud component (a big move) buy a setup nothing else
+    # confirmed — the book over-traded and bled. These gates demand
+    # CONFLUENCE: every independent signal recorded at entry (volume, chain
+    # liquidity, intraday structure, market regime) must agree before a rupee
+    # is risked, and two day-level circuit breakers cap how much one bad day
+    # can cost. Unlike the behavioural gates above these default ON — that IS
+    # the change — and each is individually disable-able (0/off) via its
+    # scanner_trade_* setting. All are enforced in entry_quality()/
+    # pick_entries(), the shared choke point, so the shadow challenger can
+    # trial different levels with no extra wiring. ------------------------
+    min_volume_surge: float = 1.5    # require >= this x usual volume at entry;
+                                     # no baseline = no confirmation = skip
+                                     # (0 = off)
+    require_liquid_chain: int = 1    # 1 = only names deep-dived THIS Tier-2
+                                     # cycle whose chain passed the liquidity
+                                     # screen (closes the hole where a Tier-1-
+                                     # only score bought an unvetted chain)
+    min_range_align: float = 0.6     # LTP must sit this far into the day's
+                                     # range in the trade's direction (CE near
+                                     # the high, PE near the low); unknown
+                                     # range = skip (0 = off)
+    index_align: int = 1             # 1 = block entries fighting a STRONG
+                                     # opposite NIFTY bias (|score| > 0.3);
+                                     # neutral/no reading blocks nothing
+    max_trades_per_day: int = 4      # hard cap on NEW entries per day
+                                     # (0 = off)
+    daily_loss_stop_pct: float = 0.02  # realized day loss >= this fraction of
+                                     # capital -> no new entries today; exits/
+                                     # management unaffected (0 = off)
+    max_entry_spread_pct: float = 2.0  # skip if the actual contract's bid-ask
+                                     # spread exceeds this % of mid at fill
+                                     # time — or has no two-sided quote at all
+                                     # (0 = off)
 
 
 @dataclass
@@ -161,19 +203,92 @@ def _minutes_of_day(ts) -> int:
 _NO_ENTRY_CUTOFF_MIN = 935
 
 
-def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig,
-                 now=None, last_exits: dict | None = None) -> list:
-    """Symbols to open this cycle: highest-scoring setups above entry_score,
-    with a bias, not already held, up to the free-slot count.
+def quote_spread_pct(q) -> float | None:
+    """Bid-ask spread as % of mid for one option quote; None without a real
+    two-sided quote (and an option you can't see both sides of is not one to
+    buy under the high-probability profile)."""
+    bid, ask = getattr(q, "bid", None), getattr(q, "ask", None)
+    if bid and ask and (bid + ask) > 0:
+        return round((ask - bid) / ((ask + bid) / 2) * 100.0, 2)
+    return None
 
-    The behavioural gates (entry cutoff, re-entry cooldown, fresh-buildup
-    filter) live HERE — the single choke point both the champion and the
-    shadow challenger enter through — so any TradeConfig knob is trialable
-    by the adaptation pipeline with no extra wiring. All three default to
-    off/no-op; `now` and `last_exits` ({symbol: exit datetime or ISO str})
-    are optional so pure-logic callers and old tests are unaffected."""
+
+def entry_quality(sc: dict, cfg: TradeConfig,
+                  market_bias: float | None = None) -> tuple[bool, str | None]:
+    """The per-candidate entry criteria, in one pure function: (ok, reason).
+
+    A high-probability trade is one where INDEPENDENT signals agree, so each
+    gate must pass on its own — a huge score cannot buy back a missing volume
+    surge. `sc` is a setup_score() dict off ranked_scores(); `market_bias` is
+    the NIFTY index-bias score in [-1, 1] (or None when unread). Confirmation
+    gates (surge, liquidity, range) treat missing data as a FAIL when armed —
+    "unknown" is not confirmation — while the regime gate only blocks on a
+    positively contradicting reading. The returned reason is short and
+    log-ready so a skipped qualifier is never invisible (the 07-28 lesson)."""
+    bias = sc.get("bias")
+    if not bias:
+        return False, "no bias"
+    score = sc.get("score") or 0
+    if score < cfg.entry_score:
+        return False, f"score {score:g} < {cfg.entry_score:g}"
+    # covering/unwinding-fuelled setups when fresh-only is on (unknown
+    # buildup stays allowed — this gate is a filter on known-weak fuel)
+    if cfg.fresh_buildup_only and sc.get("buildup") in (
+            "short_covering", "long_unwinding"):
+        return False, f"{sc.get('buildup')} fuel (fresh-buildup-only)"
+    if cfg.min_volume_surge:
+        surge = sc.get("volume_surge")
+        if surge is None:
+            return False, "volume surge unknown (no baseline)"
+        if surge < cfg.min_volume_surge:
+            return False, (f"volume {surge:.1f}x < "
+                           f"{cfg.min_volume_surge:g}x required")
+    if cfg.require_liquid_chain:
+        liq = sc.get("liquidity_ok")
+        if liq is False:
+            return False, "chain failed the liquidity screen"
+        if liq is not True:
+            return False, "not deep-dived this cycle (chain unvetted)"
+    if cfg.min_range_align:
+        rp = sc.get("range_pos")
+        aligned = None if rp is None else (rp if bias == "CE" else 1.0 - rp)
+        if aligned is None:
+            return False, "day-range position unknown"
+        if aligned < cfg.min_range_align:
+            return False, (f"range align {aligned:.2f} < "
+                           f"{cfg.min_range_align:g} (not pressing the "
+                           + ("high" if bias == "CE" else "low") + ")")
+    if cfg.index_align and market_bias is not None:
+        if (bias == "CE" and market_bias < -0.3) or \
+                (bias == "PE" and market_bias > 0.3):
+            return False, f"{bias} against market bias {market_bias:+.2f}"
+    return True, None
+
+
+def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig,
+                 now=None, last_exits: dict | None = None,
+                 market_bias: float | None = None,
+                 entries_today: int = 0, day_realized: float = 0.0) -> list:
+    """Symbols to open this cycle: highest-scoring setups that pass EVERY
+    entry_quality() gate, not already held, up to the free-slot count.
+
+    ALL entry gating lives HERE (+ entry_quality above) — the single choke
+    point both the champion and the shadow challenger enter through — so any
+    TradeConfig knob is trialable by the adaptation pipeline with no extra
+    wiring. `now`, `last_exits` ({symbol: exit datetime or ISO str}),
+    `market_bias`, `entries_today` (entries already opened today) and
+    `day_realized` (today's realized P&L so far) are optional so pure-logic
+    callers stay simple."""
     slots = cfg.max_positions - len(held)
+    # day-level circuit breakers: a cap on how many NEW trades a day may open,
+    # and a realized-loss stop that ends the day's entries outright. Exits and
+    # position management are never affected — these only stop new risk.
+    if cfg.max_trades_per_day:
+        slots = min(slots, cfg.max_trades_per_day - int(entries_today))
     if slots <= 0:
+        return []
+    if cfg.daily_loss_stop_pct and \
+            day_realized <= -abs(cfg.daily_loss_stop_pct) * cfg.capital:
         return []
     # no NEW entries at/after the cutoff (exits/management are unaffected)
     if now is not None and cfg.entry_cutoff_min < _NO_ENTRY_CUTOFF_MIN and \
@@ -182,14 +297,10 @@ def pick_entries(ranked_scores: list, held: set, cfg: TradeConfig,
     out = []
     for sc in ranked_scores:
         sym = sc.get("symbol")
-        if not sym or sym in held or not sc.get("bias"):
+        if not sym or sym in held:
             continue
-        if (sc.get("score") or 0) < cfg.entry_score:
-            continue
-        # skip covering/unwinding-fuelled setups when fresh-only is on
-        # (unknown buildup stays allowed — absence of data is not evidence)
-        if cfg.fresh_buildup_only and sc.get("buildup") in (
-                "short_covering", "long_unwinding"):
+        ok, _why = entry_quality(sc, cfg, market_bias)
+        if not ok:
             continue
         # re-entry cooldown: don't re-buy a symbol within N min of its exit
         if cfg.reentry_cooldown_min and now is not None and last_exits:
@@ -241,7 +352,7 @@ class ScannerTrader:
         return TradeConfig(
             capital=_f("scanner_trade_capital", 500_000.0),
             risk_pct=_f("scanner_trade_risk_pct", 0.01),
-            entry_score=_f("scanner_trade_entry_score", 65.0),
+            entry_score=_f("scanner_trade_entry_score", 70.0),
             exit_score=_f("scanner_trade_exit_score", 45.0),
             hard_stop_pct=_f("scanner_trade_hard_stop_pct", 0.30),
             trail_pct=_f("scanner_trade_trail_pct", 0.25),
@@ -252,6 +363,14 @@ class ScannerTrader:
             reentry_cooldown_min=_f("scanner_trade_reentry_cooldown_min", 0.0),
             entry_cutoff_min=int(_f("scanner_trade_entry_cutoff_min", 935)),
             fresh_buildup_only=int(_f("scanner_trade_fresh_buildup_only", 0)),
+            min_volume_surge=_f("scanner_trade_min_volume_surge", 1.5),
+            require_liquid_chain=int(
+                _f("scanner_trade_require_liquid_chain", 1)),
+            min_range_align=_f("scanner_trade_min_range_align", 0.6),
+            index_align=int(_f("scanner_trade_index_align", 1)),
+            max_trades_per_day=int(_f("scanner_trade_max_trades_per_day", 4)),
+            daily_loss_stop_pct=_f("scanner_trade_daily_loss_stop_pct", 0.02),
+            max_entry_spread_pct=_f("scanner_trade_max_entry_spread_pct", 2.0),
         )
 
     def _persist(self) -> None:
@@ -293,6 +412,78 @@ class ScannerTrader:
     def _lot_size(self, scanner, symbol: str) -> int:
         u = scanner._universe.get(symbol) or {}
         return int(u.get("lot_size") or 0)
+
+    @staticmethod
+    def _market_bias(scanner) -> float | None:
+        """The scanner's live NIFTY index-bias score in [-1, 1] — the broad-
+        market regime read the index_align gate judges stock entries against.
+        None when unread (scanner warming up / bias not computed)."""
+        reading = (getattr(scanner, "index_bias", None) or {}).get("NIFTY")
+        return (reading or {}).get("score")
+
+    def _day_entry_state(self, day) -> tuple[int, float]:
+        """(entries opened today, today's realized P&L) feeding the day-level
+        circuit breakers. Both come from PERSISTED state (journal / daily_pnl)
+        rather than in-memory counters, so a mid-day restart can't reset the
+        trades-per-day cap or the loss stop. Best-effort: on any read failure
+        the gates see (0, 0.0) — i.e. they fail OPEN, never wedge trading on
+        a broken read."""
+        from app.core import registry
+        prefix = day.isoformat()
+        entries = 0
+        try:
+            entries = sum(
+                1 for r in registry.journal_rows(limit=300, kind="entry")
+                if (r.get("ts") or "").startswith(prefix))
+        except Exception:
+            pass
+        realized = 0.0
+        try:
+            row = next((r for r in registry.performance_rows(STRATEGY_ID, "PAPER")
+                        if r["trade_date"] == prefix), None)
+            realized = (row["realized"] if row else 0.0) or 0.0
+        except Exception:
+            pass
+        return entries, realized
+
+    def _log_entry_halt(self, cfg: TradeConfig, day,
+                        entries_today: int, day_realized: float) -> None:
+        """One visible event per day when a day-level circuit breaker engages
+        — an entry-less afternoon must be readable as 'halted, working as
+        designed', not as a scanner failure."""
+        from app.core import registry
+        halt = None
+        if cfg.daily_loss_stop_pct and \
+                day_realized <= -abs(cfg.daily_loss_stop_pct) * cfg.capital:
+            halt = ("daily-loss stop: realized "
+                    f"₹{round(day_realized)} breaches "
+                    f"{cfg.daily_loss_stop_pct:.1%} of capital — no new "
+                    "entries today (exits still managed)")
+        elif cfg.max_trades_per_day and \
+                entries_today >= cfg.max_trades_per_day:
+            halt = (f"trade cap: {entries_today} entries today reached "
+                    f"max_trades_per_day={cfg.max_trades_per_day} — no new "
+                    "entries today")
+        if not halt:
+            return
+        marker = (day.isoformat(), halt[:10])
+        if getattr(self, "_halt_logged", None) != marker:
+            self._halt_logged = marker
+            registry.record_event("info", "scanner", f"entry halt — {halt}")
+
+    def _log_gated(self, sym: str, now, detail: str) -> None:
+        """Once per (symbol, day, reason): why a qualifying setup was NOT
+        entered. Same discipline as _noquote — the loop runs every cycle, the
+        log must not flood, but a skip must never be silent."""
+        from app.core import registry
+        gated = getattr(self, "_gated", None)
+        if gated is None:
+            gated = self._gated = {}
+        key = f"{now.date().isoformat()}:{detail}"
+        if gated.get(sym) != key:
+            gated[sym] = key
+            registry.record_event("info", "scanner",
+                                  f"entry gated [{sym}]: {detail}")
 
     def _sample_candidates(self, hub, scanner, now) -> int:
         """Record the ATM premium of every scored candidate (any symbol the
@@ -463,8 +654,30 @@ class ScannerTrader:
         # which used to null the bias and silently kill the entry.
         ranked = scanner.ranked_scores()
         by_sym = {r.get("symbol"): r for r in ranked}
-        for sym in pick_entries(ranked, held, cfg,
-                                now=now, last_exits=getattr(self, "_last_exit", None)):
+        market_bias = self._market_bias(scanner)
+        entries_today, day_realized = self._day_entry_state(day)
+        self._log_entry_halt(cfg, day, entries_today, day_realized)
+        picks = pick_entries(ranked, held, cfg,
+                             now=now,
+                             last_exits=getattr(self, "_last_exit", None),
+                             market_bias=market_bias,
+                             entries_today=entries_today,
+                             day_realized=day_realized)
+        # Visibility for the quality gates: a name clearing the score bar but
+        # failing a gate is logged once per (symbol, reason) per day. Without
+        # this, a gated qualifier looks exactly like a quiet market — the same
+        # silence that hid the 07-28 no-quote drops.
+        for sc in ranked:
+            g_sym = sc.get("symbol")
+            if not g_sym or g_sym in held or g_sym in picks \
+                    or not sc.get("bias") \
+                    or (sc.get("score") or 0) < cfg.entry_score:
+                continue
+            ok, why = entry_quality(sc, cfg, market_bias)
+            if not ok and why:
+                self._log_gated(g_sym, now,
+                                f"score {sc.get('score')} qualifies but {why}")
+        for sym in picks:
             sc = by_sym.get(sym) or scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
@@ -484,6 +697,18 @@ class ScannerTrader:
                         f"entry skipped [{sym}]: qualified (score="
                         f"{sc.get('score')}) but no chain quote — not "
                         f"deep-dived this cycle")
+                continue
+            # the actual contract must be exitable: cap the bid-ask spread at
+            # the moment of fill (the chain-level screen vetted near-ATM
+            # strikes minutes ago; this vets THIS contract NOW)
+            spread = quote_spread_pct(q)
+            if cfg.max_entry_spread_pct and \
+                    (spread is None or spread > cfg.max_entry_spread_pct):
+                self._log_gated(
+                    sym, now,
+                    "spread " + ("unknown (one-sided quote)" if spread is None
+                                 else f"{spread:.1f}%") +
+                    f" exceeds the {cfg.max_entry_spread_pct:g}% entry cap")
                 continue
             # (no _sample_premium here — _sample_candidates() above already
             # sampled every ranked candidate this cycle; sampling again would
@@ -530,9 +755,7 @@ class ScannerTrader:
         closed trade is a self-contained record for later analysis."""
         t1 = (getattr(scanner, "metrics", None) or {}).get(sym) or {}
         t2 = (getattr(scanner, "tier2", None) or {}).get(sym) or {}
-        spread_pct = None
-        if q.bid and q.ask and (q.bid + q.ask) > 0:
-            spread_pct = round((q.ask - q.bid) / ((q.ask + q.bid) / 2) * 100, 2)
+        spread_pct = quote_spread_pct(q)
         # How "cheap" is this premium relative to its OWN session so far —
         # we only ever buy premium (CE or PE), so a good entry is one near
         # the option's own VWAP / lower Bollinger band, same test both ways.
@@ -572,6 +795,9 @@ class ScannerTrader:
             "range_pos": t1.get("range_pos"),
             "pcr_oi": t2.get("pcr_oi"), "atm_iv": t2.get("atm_iv"),
             "iv_skew": t2.get("iv_skew"),
+            # market regime at entry — lets the journal prove/disprove the
+            # counter-trend hypothesis (rule: counter_trend_entries)
+            "market_bias": self._market_bias(scanner),
             "worst_spread_pct": (t2.get("liquidity") or {}).get("worst_spread_pct"),
             "opt_bid": q.bid, "opt_ask": q.ask, "opt_ltp": q.ltp,
             "opt_iv": getattr(q, "iv", None), "opt_oi": q.oi,
@@ -585,7 +811,14 @@ class ScannerTrader:
                        "hard_stop_pct": cfg.hard_stop_pct,
                        "trail_pct": cfg.trail_pct,
                        "target_pct": cfg.target_pct,
-                       "risk_pct": cfg.risk_pct},
+                       "risk_pct": cfg.risk_pct,
+                       "min_volume_surge": cfg.min_volume_surge,
+                       "require_liquid_chain": cfg.require_liquid_chain,
+                       "min_range_align": cfg.min_range_align,
+                       "index_align": cfg.index_align,
+                       "max_trades_per_day": cfg.max_trades_per_day,
+                       "daily_loss_stop_pct": cfg.daily_loss_stop_pct,
+                       "max_entry_spread_pct": cfg.max_entry_spread_pct},
         }
 
     def _journal_entry(self, sym: str, pos: SPosition, q, now) -> None:
@@ -850,13 +1083,32 @@ class ScannerTrader:
                 chal_last_exit[s] = ts
         chal_ranked = scanner.ranked_scores()
         chal_by_sym = {r.get("symbol"): r for r in chal_ranked}
+        # the challenger's own day-state (its virtual entries/realized today,
+        # not the champion's) feeds its day-level circuit breakers, so a
+        # trial of max_trades_per_day / daily_loss_stop_pct is honest
+        day_prefix = day.isoformat()
+        chal_entries_today = (
+            sum(1 for c in closed
+                if (c.get("entry_ts") or "").startswith(day_prefix))
+            + sum(1 for p in book.values()
+                  if (p.entry_ts or "").startswith(day_prefix)))
+        chal_day_realized = sum(
+            c.get("realized") or 0 for c in closed
+            if (c.get("ts") or "").startswith(day_prefix))
         for sym in pick_entries(chal_ranked, held, chal_cfg,
-                                now=now, last_exits=chal_last_exit):
+                                now=now, last_exits=chal_last_exit,
+                                market_bias=self._market_bias(scanner),
+                                entries_today=chal_entries_today,
+                                day_realized=chal_day_realized):
             sc = chal_by_sym.get(sym) or scanner.scores.get(sym) or {}
             side = self._side_for(sc.get("bias"))
             q = self._atm_quote(hub, sym, side)
             if q is None or not (q.ask or q.ltp):
                 continue
+            spread = quote_spread_pct(q)
+            if chal_cfg.max_entry_spread_pct and \
+                    (spread is None or spread > chal_cfg.max_entry_spread_pct):
+                continue                      # same fill-time gate, silent
             lot_size = self._lot_size(scanner, sym)
             probe = F.fill_live(q, Action.BUY, lot_size or 1,
                                 self._fee, self._slip)
@@ -991,5 +1243,12 @@ class ScannerTrader:
                        "target_pct": cfg.target_pct, "risk_pct": cfg.risk_pct,
                        "reentry_cooldown_min": cfg.reentry_cooldown_min,
                        "entry_cutoff_min": cfg.entry_cutoff_min,
-                       "fresh_buildup_only": cfg.fresh_buildup_only},
+                       "fresh_buildup_only": cfg.fresh_buildup_only,
+                       "min_volume_surge": cfg.min_volume_surge,
+                       "require_liquid_chain": cfg.require_liquid_chain,
+                       "min_range_align": cfg.min_range_align,
+                       "index_align": cfg.index_align,
+                       "max_trades_per_day": cfg.max_trades_per_day,
+                       "daily_loss_stop_pct": cfg.daily_loss_stop_pct,
+                       "max_entry_spread_pct": cfg.max_entry_spread_pct},
         }

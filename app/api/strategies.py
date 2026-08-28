@@ -1863,6 +1863,13 @@ class TraderSettingsReq(BaseModel):
     reentry_cooldown_min: float | None = None
     entry_cutoff_min: int | None = None
     fresh_buildup_only: int | None = None
+    min_volume_surge: float | None = None
+    require_liquid_chain: int | None = None
+    min_range_align: float | None = None
+    index_align: int | None = None
+    max_trades_per_day: int | None = None
+    daily_loss_stop_pct: float | None = None
+    max_entry_spread_pct: float | None = None
 
 
 @scanner_router.post("/scanner/trade-settings")
@@ -1881,6 +1888,13 @@ def set_trader(req: TraderSettingsReq):
         ("scanner_trade_reentry_cooldown_min", req.reentry_cooldown_min, 0.0, 120.0),
         ("scanner_trade_entry_cutoff_min", req.entry_cutoff_min, 780, 935),
         ("scanner_trade_fresh_buildup_only", req.fresh_buildup_only, 0, 1),
+        ("scanner_trade_min_volume_surge", req.min_volume_surge, 0.0, 10.0),
+        ("scanner_trade_require_liquid_chain", req.require_liquid_chain, 0, 1),
+        ("scanner_trade_min_range_align", req.min_range_align, 0.0, 1.0),
+        ("scanner_trade_index_align", req.index_align, 0, 1),
+        ("scanner_trade_max_trades_per_day", req.max_trades_per_day, 0, 50),
+        ("scanner_trade_daily_loss_stop_pct", req.daily_loss_stop_pct, 0.0, 0.5),
+        ("scanner_trade_max_entry_spread_pct", req.max_entry_spread_pct, 0.0, 10.0),
     ]:
         if val is not None:
             registry.set_setting(key, str(max(lo, min(hi, val))))

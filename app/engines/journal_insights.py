@@ -89,6 +89,33 @@ def _hour_band(h) -> str:
     return "13+"
 
 
+SURGE_CONFIRM = 1.5     # volume-surge level the low_surge_entries rule tests
+                        # (== TradeConfig.min_volume_surge's default, so the
+                        # rule's one adaptation step arms the gate exactly at
+                        # the level the evidence measured)
+
+
+def _surge_band(t: dict) -> str:
+    s = (t.get("entry_ctx") or {}).get("volume_surge")
+    if s is None:
+        return "unknown"
+    return f"{SURGE_CONFIRM:g}+" if s >= SURGE_CONFIRM else f"<{SURGE_CONFIRM:g}"
+
+
+def _market_align_band(t: dict) -> str:
+    """Was the trade WITH or AGAINST the index bias recorded at entry?
+    entry_ctx.market_bias is the NIFTY bias score in [-1, 1] (recorded from
+    2026-08-28; older rows -> 'unknown'). |score| <= 0.3 is the same
+    neutral band the live index_align gate uses."""
+    mb = (t.get("entry_ctx") or {}).get("market_bias")
+    bias = t.get("bias")
+    if mb is None or bias not in ("CE", "PE"):
+        return "unknown"
+    if abs(mb) <= 0.3:
+        return "neutral"
+    return "aligned" if (bias == "CE") == (mb > 0) else "counter"
+
+
 def find_churn(exits: list[dict], window_min: int = CHURN_MINUTES) -> list[dict]:
     """Round trips whose ENTRY came within `window_min` minutes of the SAME
     symbol's previous exit — the stopped-out-then-rebought pattern. Works on
@@ -262,6 +289,38 @@ def suggestions_from(stats: dict, exits: list[dict]) -> list[dict]:
                           "entry_score, longer holds) would keep more of it.",
             "evidence": f"₹{_r(total_fees)} total fees vs ₹{_r(gross_wins)} "
                         f"from winners."})
+
+    # 9) unconfirmed-volume entries losing while surge-confirmed entries win
+    # -> arm the min_volume_surge gate at the measured level
+    su = stats.get("by_volume_surge") or {}
+    lo_s, hi_s = su.get(f"<{SURGE_CONFIRM:g}"), su.get(f"{SURGE_CONFIRM:g}+")
+    if lo_s and hi_s and lo_s["n"] >= MIN_BUCKET and hi_s["n"] >= MIN_BUCKET \
+            and (lo_s["avg"] or 0) < 0 < (hi_s["avg"] or 0):
+        out.append({
+            "rule": "low_surge_entries",
+            "suggestion": f"Entries without a volume surge (< {SURGE_CONFIRM}x "
+                          "usual) lose while surge-confirmed entries win — "
+                          "consider requiring min_volume_surge "
+                          f"{SURGE_CONFIRM}x at entry.",
+            "evidence": f"<{SURGE_CONFIRM:g}x: avg ₹{lo_s['avg']} over "
+                        f"{lo_s['n']} trades; {SURGE_CONFIRM:g}x+: avg "
+                        f"₹{hi_s['avg']} over {hi_s['n']}."})
+
+    # 10) counter-trend entries (against the index bias at entry) losing
+    # while aligned entries win -> arm the index_align gate
+    ma = stats.get("by_market_align") or {}
+    counter, aligned = ma.get("counter"), ma.get("aligned")
+    if counter and aligned and counter["n"] >= MIN_BUCKET \
+            and aligned["n"] >= MIN_BUCKET \
+            and (counter["avg"] or 0) < 0 < (aligned["avg"] or 0):
+        out.append({
+            "rule": "counter_trend_entries",
+            "suggestion": "Entries fighting the index bias lose while "
+                          "market-aligned entries win — consider blocking "
+                          "counter-trend entries (index_align).",
+            "evidence": f"counter: avg ₹{counter['avg']} over {counter['n']} "
+                        f"trades; aligned: avg ₹{aligned['avg']} over "
+                        f"{aligned['n']}."})
     return out
 
 
@@ -279,12 +338,16 @@ def analyze(exits: list[dict], config: dict | None = None) -> dict:
     by_band: dict[str, list] = {}
     by_hour: dict[str, list] = {}
     by_buildup: dict[str, list] = {}
+    by_surge: dict[str, list] = {}
+    by_align: dict[str, list] = {}
     for t in exits:
         by_reason.setdefault(t.get("reason") or "unknown", []).append(t)
         by_band.setdefault(_score_band(t.get("entry_score")), []).append(t)
         by_hour.setdefault(_hour_band(_entry_hour(t)), []).append(t)
         bu = (t.get("entry_ctx") or {}).get("buildup") or "unknown"
         by_buildup.setdefault(bu, []).append(t)
+        by_surge.setdefault(_surge_band(t), []).append(t)
+        by_align.setdefault(_market_align_band(t), []).append(t)
 
     profit_factor = None
     if losses and sum(losses) != 0:
@@ -308,6 +371,8 @@ def analyze(exits: list[dict], config: dict | None = None) -> dict:
         "by_score_band": {k: _bucket_stats(v) for k, v in by_band.items()},
         "by_entry_hour": {k: _bucket_stats(v) for k, v in by_hour.items()},
         "by_buildup": {k: _bucket_stats(v) for k, v in by_buildup.items()},
+        "by_volume_surge": {k: _bucket_stats(v) for k, v in by_surge.items()},
+        "by_market_align": {k: _bucket_stats(v) for k, v in by_align.items()},
         "config": config or {},
     }
     if len(exits) < MIN_TRADES:
