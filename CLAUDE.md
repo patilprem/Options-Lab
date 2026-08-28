@@ -424,6 +424,14 @@ is the answer six incidents never captured. `--probe` uses its own client, so
 its requests are OUTSIDE MarketHub's 3s gate and count against the same
 per-account budget: it spaces them 5s and takes `--names` to probe only the
 dark ones.
+For "would the NEW entry gates have taken my past trades?" run
+`scripts/entry_gate_replay.py` (read-only: temp copies of both DBs — never
+get_store(), whose SyntheticStore fallback under the service's DuckDB lock
+would report 100% blocked; imports entry_quality rather than restating it;
+recomputes the technical read point-in-time from stock_snapshots truncated
+at each entry_ts; proxies never-journaled liquidity_ok from
+worst_spread_pct; separates signal-blocks from missing-instrumentation
+blocks and prints the in-sample caveat).
 - Index-futures VOLUME companion (engines/feed.py + paper.py, gated behind the
   `index_futures_volume` setting, default OFF). VERIFIED against the installed
   dhanhq SDK: feed-mode/segment ints (Ticker15/Full21/IDX0/NSE_FNO2/BSE_FNO8),
