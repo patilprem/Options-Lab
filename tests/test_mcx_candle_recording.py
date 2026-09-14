@@ -110,11 +110,13 @@ def _mcx_is_resolved() -> bool:
 
 
 def _at(hh, mm):
-    """A weekday timestamp at hh:mm, fresh relative to the freshness check."""
-    base = datetime.now(IST).replace(tzinfo=None)
-    while base.weekday() >= 5:
-        base -= timedelta(days=1)
-    return base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    """A weekday timestamp at hh:mm on a fixed, ordinary trading day.
+
+    Deliberately NOT datetime.now(IST): app.data.sessions.SESSION_OVERRIDES
+    can mark "today" a holiday or a modified session (it does for
+    2026-09-14), and this test is about the regular window, not whatever the
+    calendar happens to say when it runs."""
+    return datetime(2026, 7, 27, hh, mm)         # a plain Monday, no overrides
 
 
 def test_nse_window_still_rejects_out_of_session_ticks():

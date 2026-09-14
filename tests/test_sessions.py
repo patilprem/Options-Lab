@@ -53,6 +53,32 @@ def test_unknown_underlying_gets_the_stricter_window():
     assert not in_session(_ts("17:00"), "NOT_A_REAL_SYMBOL")
 
 
+# --- dated overrides: holidays / modified sessions --------------------------
+# 2026-09-14 is a Monday, so the regular weekly window would otherwise apply.
+
+HOLIDAY = "2026-09-14"
+
+
+def test_holiday_closes_nse_all_day():
+    for hhmm in ("00:00", "09:15", "12:00", "15:30", "23:59"):
+        assert not in_session(_ts(hhmm, HOLIDAY), segment="NSE"), hhmm
+
+
+def test_holiday_delays_mcx_open_but_keeps_its_close():
+    # MCX's regular 09:00 open doesn't apply today -- trading starts at 17:00.
+    for hhmm in ("09:00", "12:00", "16:59"):
+        assert not in_session(_ts(hhmm, HOLIDAY), segment="MCX"), hhmm
+    for hhmm in ("17:00", "20:00", "23:30"):
+        assert in_session(_ts(hhmm, HOLIDAY), segment="MCX"), hhmm
+    assert not in_session(_ts("23:31", HOLIDAY), segment="MCX")
+
+
+def test_a_non_overridden_date_is_unaffected():
+    """The override table must not leak into any other date."""
+    assert in_session(_ts("09:00", MON), segment="MCX")
+    assert in_session(_ts("09:15", MON), segment="NSE")
+
+
 def test_segment_resolved_from_underlyings_table():
     assert in_session(_ts("11:00"), "NIFTY")
     assert not in_session(_ts("17:00"), "NIFTY")

@@ -73,6 +73,20 @@ def test_off_hours_and_synthetic_never_alert():
     assert wd2.state == "ok"
 
 
+def test_session_open_for_honours_dated_overrides():
+    """2026-09-14: NSE holiday, MCX delayed to a 17:00 open. The watchdog
+    must read the same override table as the underlying_bars write gate
+    (app.data.sessions) or a holiday would need teaching twice."""
+    from app.engines.watchdog import session_elapsed_s
+    holiday = datetime(2026, 9, 14, 0, 0)
+    assert not session_open_for({"NSE"}, holiday.replace(hour=11))
+    assert not session_open_for({"MCX"}, holiday.replace(hour=9, minute=30))
+    assert session_open_for({"MCX"}, holiday.replace(hour=17, minute=5))
+    assert session_elapsed_s("NSE", holiday.replace(hour=12)) == 0.0
+    assert session_elapsed_s("MCX", holiday.replace(hour=9)) == 0.0
+    assert session_elapsed_s("MCX", holiday.replace(hour=18)) == 3600.0
+
+
 def test_session_windows_and_open_grace():
     wed = datetime(2026, 7, 15, 0, 0)
     def at(h, m):

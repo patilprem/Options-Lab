@@ -21,13 +21,15 @@ candle to `store.underlying_bars()`, so indicator warmup, VWAP, and any
 backtest replaying that day consume it as truth.
 
 Windows are deliberately the REGULAR session only. Special sessions (NSE's
-Muhurat evening trade) are excluded; if one is ever needed, add it here so
-both the tick path and the write path learn about it at once.
+Muhurat evening trade) and holidays/modified sessions (a full closure, or
+MCX opening late) are handled as dated exceptions in SESSION_OVERRIDES below
+so both the tick path and the write path learn about them at once — and so
+does every watchdog, via session_window()/watchdog.session_open_for().
 """
 
 from __future__ import annotations
 
-from datetime import time as dtime
+from datetime import date as ddate, time as dtime
 
 # Regular-session windows, inclusive at both ends. Bucket-start labelling
 # means a 15:30 bar is the last NSE bar of the day.
@@ -39,6 +41,33 @@ SESSION_WINDOW: dict[str, tuple[dtime, dtime]] = {
 # Unknown underlyings get the STRICTER window: letting junk in is worse than
 # dropping a bar for a name nobody configured.
 DEFAULT_SEGMENT = "NSE"
+
+# Dated exceptions to the regular weekly window: exchange holidays (segment
+# doesn't trade at all -> None) and modified/special sessions (a one-off
+# window that isn't the usual open/close), keyed by (segment, "YYYY-MM-DD").
+# There is no holiday-calendar API (see CLAUDE.md) so this is maintained by
+# hand, the same dated-table pattern as backtest.py's LOT_HISTORY. Every
+# session-window consumer (in_session() here, and watchdog.session_open_for /
+# session_elapsed_s) must read through session_window() so an entry added
+# here is honoured everywhere at once — a duplicate hardcoded window is
+# exactly the class of bug the 2026-07-27 incident was about.
+SESSION_OVERRIDES: dict[tuple[str, str], tuple[dtime, dtime] | None] = {
+    # 2026-09-14: NSE/BSE holiday (closed all day); MCX runs a delayed
+    # evening-only session instead of its usual 09:00 open.
+    ("NSE", "2026-09-14"): None,
+    ("MCX", "2026-09-14"): (dtime(17, 0), dtime(23, 30)),
+}
+
+
+def session_window(seg: str, on_date: ddate) -> tuple[dtime, dtime] | None:
+    """The (open, close) window for `seg` on `on_date`, or None if the
+    segment doesn't trade at all that day. Checks SESSION_OVERRIDES first,
+    else falls back to the regular window. Callers still own the Mon-Fri
+    weekend check."""
+    override_key = (seg, on_date.isoformat())
+    if override_key in SESSION_OVERRIDES:
+        return SESSION_OVERRIDES[override_key]
+    return SESSION_WINDOW.get(seg, SESSION_WINDOW[DEFAULT_SEGMENT])
 
 
 def segment_for(underlying: str) -> str:
@@ -64,5 +93,8 @@ def in_session(ts, underlying: str = "", segment: str | None = None) -> bool:
     if ts.weekday() >= 5:
         return False
     seg = segment or segment_for(underlying)
-    lo, hi = SESSION_WINDOW.get(seg, SESSION_WINDOW[DEFAULT_SEGMENT])
+    window = session_window(seg, ts.date())
+    if window is None:
+        return False
+    lo, hi = window
     return lo <= ts.time() <= hi

@@ -16,15 +16,22 @@ mode never alert.
 from __future__ import annotations
 
 import os
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta
 from typing import Callable, Iterable, Optional
 
 QUIET_AFTER_S = 180        # connected but no tick for this long = "quiet"
 REALERT_MIN = 15           # minutes between repeat pushes while still broken
 GRACE_MIN = 5              # ignore the first minutes after open (slow first tick)
 
-NSE_SESSION = (dtime(9, 15), dtime(15, 30))
-MCX_SESSION = (dtime(9, 0), dtime(23, 30))
+
+def _window_for(seg: str, on_date) -> Optional[tuple]:
+    """The regular window for `seg`, unless app.data.sessions.SESSION_OVERRIDES
+    has a dated exception (a holiday closure or a modified session) for
+    `on_date`. app.data.sessions is the single source of truth for both this
+    watchdog and the underlying_bars write gate, so a holiday never has to be
+    taught to two places."""
+    from app.data.sessions import session_window
+    return session_window(seg, on_date)
 
 
 def feed_broken(status: dict, market_open: bool) -> bool:
@@ -49,7 +56,10 @@ def session_open_for(segments: Iterable[str], now: datetime,
     if now.weekday() >= 5:
         return False
     for seg in segments:
-        start, end = MCX_SESSION if seg == "MCX" else NSE_SESSION
+        window = _window_for(seg, now.date())
+        if window is None:
+            continue
+        start, end = window
         start_dt = datetime.combine(now.date(), start) + timedelta(minutes=grace_min)
         end_dt = datetime.combine(now.date(), end)
         if start_dt <= now <= end_dt:
@@ -62,7 +72,10 @@ def session_elapsed_s(segment: str, now: datetime) -> float:
     capped at the close). Used to turn a row COUNT into an average write
     interval, which is how a sparse instrument gets judged on its own cadence
     instead of a flat clock."""
-    start, end = MCX_SESSION if segment == "MCX" else NSE_SESSION
+    window = _window_for(segment, now.date())
+    if window is None:
+        return 0.0
+    start, end = window
     start_dt = datetime.combine(now.date(), start)
     end_dt = datetime.combine(now.date(), end)
     return max(0.0, (min(now, end_dt) - start_dt).total_seconds())
