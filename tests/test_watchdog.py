@@ -87,6 +87,20 @@ def test_session_open_for_honours_dated_overrides():
     assert session_elapsed_s("MCX", holiday.replace(hour=18)) == 3600.0
 
 
+def test_gandhi_jayanti_2026_closes_both_segments():
+    """2026-10-02: NSE/BSE and MCX (both sessions) shut — no watchdog may
+    treat any time of that day as market hours."""
+    from app.data.sessions import in_session
+    day = datetime(2026, 10, 2, 0, 0)
+    for hour in (9, 11, 15, 18, 21, 23):
+        t = day.replace(hour=hour, minute=30)
+        assert not session_open_for({"NSE", "MCX"}, t)
+        assert not in_session(t, segment="NSE")
+        assert not in_session(t, segment="MCX")
+    # the next trading day is unaffected
+    assert session_open_for({"NSE"}, datetime(2026, 10, 5, 11, 0))
+
+
 def test_session_windows_and_open_grace():
     wed = datetime(2026, 7, 15, 0, 0)
     def at(h, m):

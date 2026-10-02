@@ -56,6 +56,11 @@ SESSION_OVERRIDES: dict[tuple[str, str], tuple[dtime, dtime] | None] = {
     # evening-only session instead of its usual 09:00 open.
     ("NSE", "2026-09-14"): None,
     ("MCX", "2026-09-14"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-10-02 (Fri): Gandhi Jayanti — NSE/BSE AND MCX closed all day (MCX's
+    # morning and evening sessions both). Missing this made the feed/recording
+    # watchdogs push "NOT RECEIVING" to ntfy all day on a holiday.
+    ("NSE", "2026-10-02"): None,
+    ("MCX", "2026-10-02"): None,
 }
 
 
