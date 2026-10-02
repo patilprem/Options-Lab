@@ -51,16 +51,73 @@ DEFAULT_SEGMENT = "NSE"
 # session_elapsed_s) must read through session_window() so an entry added
 # here is honoured everywhere at once — a duplicate hardcoded window is
 # exactly the class of bug the 2026-07-27 incident was about.
+# 2026 calendar: NSE's official holiday-master (the FO list for NSE/BSE, the
+# COM list for MCX's morning/evening sessions), fetched 2026-10-02. Rules it
+# encodes: NSE/BSE close all day on a holiday; MCX either closes both sessions
+# (None), loses only the morning session (window starts 17:00), or — New Year's
+# Day — loses only the evening (window ends at the 17:00 session break; the
+# close is 16:59:59 because the 17:00 bar belongs to the evening session).
+# Weekend holidays (2026-02-15, 03-21, 08-15, 11-08) are omitted: in_session()
+# rejects weekends before it ever consults this table. 2026-11-08 (Sun) is
+# Diwali Laxmi Pujan, where NSE/MCX hold a Muhurat evening session whose
+# timings are announced late — add a dated entry here once published, and lift
+# the weekend check for it. Refresh this table each December from
+# https://www.nseindia.com/api/holiday-master?type=trading (needs a browser
+# User-Agent and a nseindia.com Referer); MCX's own page blocks scripts.
 SESSION_OVERRIDES: dict[tuple[str, str], tuple[dtime, dtime] | None] = {
-    # 2026-09-14: NSE/BSE holiday (closed all day); MCX runs a delayed
-    # evening-only session instead of its usual 09:00 open.
+    # 2026-01-01 (Thu): New year
+    # (NSE/BSE trade normally)
+    ("MCX", "2026-01-01"): (dtime(9, 0), dtime(16, 59, 59)),
+    # 2026-01-15 (Thu): Municipal Corporation Election - Maharashtra
+    ("NSE", "2026-01-15"): None,
+    ("MCX", "2026-01-15"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-01-26 (Mon): Republic Day
+    ("NSE", "2026-01-26"): None,
+    ("MCX", "2026-01-26"): None,
+    # 2026-03-03 (Tue): Holi
+    ("NSE", "2026-03-03"): None,
+    ("MCX", "2026-03-03"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-03-26 (Thu): Shri Ram Navami
+    ("NSE", "2026-03-26"): None,
+    ("MCX", "2026-03-26"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-03-31 (Tue): Shri Mahavir Jayanti
+    ("NSE", "2026-03-31"): None,
+    ("MCX", "2026-03-31"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-04-03 (Fri): Good Friday
+    ("NSE", "2026-04-03"): None,
+    ("MCX", "2026-04-03"): None,
+    # 2026-04-14 (Tue): Dr. Baba Saheb Ambedkar Jayanti
+    ("NSE", "2026-04-14"): None,
+    ("MCX", "2026-04-14"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-05-01 (Fri): Maharashtra Day
+    ("NSE", "2026-05-01"): None,
+    ("MCX", "2026-05-01"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-05-28 (Thu): Bakri Id
+    ("NSE", "2026-05-28"): None,
+    ("MCX", "2026-05-28"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-06-26 (Fri): Muharram
+    ("NSE", "2026-06-26"): None,
+    ("MCX", "2026-06-26"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-09-14 (Mon): Ganesh Chaturthi
     ("NSE", "2026-09-14"): None,
     ("MCX", "2026-09-14"): (dtime(17, 0), dtime(23, 30)),
-    # 2026-10-02 (Fri): Gandhi Jayanti — NSE/BSE AND MCX closed all day (MCX's
-    # morning and evening sessions both). Missing this made the feed/recording
-    # watchdogs push "NOT RECEIVING" to ntfy all day on a holiday.
+    # 2026-10-02 (Fri): Mahatma Gandhi Jayanti — MCX's morning AND evening
+    # sessions both closed. Missing this made the feed/recording watchdogs push
+    # "NOT RECEIVING" to ntfy all day on a holiday.
     ("NSE", "2026-10-02"): None,
     ("MCX", "2026-10-02"): None,
+    # 2026-10-20 (Tue): Dussehra
+    ("NSE", "2026-10-20"): None,
+    ("MCX", "2026-10-20"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-11-10 (Tue): Diwali-Balipratipada
+    ("NSE", "2026-11-10"): None,
+    ("MCX", "2026-11-10"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-11-24 (Tue): Prakash Gurpurb Sri Guru Nanak Dev
+    ("NSE", "2026-11-24"): None,
+    ("MCX", "2026-11-24"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-12-25 (Fri): Christmas
+    ("NSE", "2026-12-25"): None,
+    ("MCX", "2026-12-25"): None,
 }
 
 

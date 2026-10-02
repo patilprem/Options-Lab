@@ -163,3 +163,63 @@ def test_live_bar_write_is_gated_too():
     store.upsert_live_bar("NIFTY", bar(_ts("16:10")))    # phantom
     n = store.con.execute("SELECT count(*) FROM underlying_bars").fetchone()[0]
     assert n == 1
+
+
+# --- the rest of the 2026 NSE holiday-master ---------------------------------
+# Source: NSE holiday-master (FO list for NSE/BSE, COM list for MCX).
+
+from datetime import date  # noqa: E402
+
+from app.data.sessions import SESSION_OVERRIDES, session_window  # noqa: E402
+
+# NSE/BSE closed all day AND both MCX sessions closed.
+FULL_CLOSURE = ["2026-01-26", "2026-04-03", "2026-10-02", "2026-12-25"]
+# NSE/BSE closed all day; MCX loses only its morning session (opens 17:00).
+MCX_EVENING_ONLY = ["2026-01-15", "2026-03-03", "2026-03-26", "2026-03-31",
+                    "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26",
+                    "2026-09-14", "2026-10-20", "2026-11-10", "2026-11-24"]
+
+
+def test_full_closures_close_both_segments_all_day():
+    for day in FULL_CLOSURE:
+        for seg in ("NSE", "MCX"):
+            for hhmm in ("09:00", "11:00", "17:00", "20:00", "23:30"):
+                assert not in_session(_ts(hhmm, day), segment=seg), (day, seg, hhmm)
+
+
+def test_mcx_evening_only_holidays():
+    for day in MCX_EVENING_ONLY:
+        for hhmm in ("09:15", "12:00", "16:59"):
+            assert not in_session(_ts(hhmm, day), segment="NSE"), (day, hhmm)
+            assert not in_session(_ts(hhmm, day), segment="MCX"), (day, hhmm)
+        assert not in_session(_ts("19:00", day), segment="NSE"), day
+        assert in_session(_ts("17:00", day), segment="MCX"), day
+        assert in_session(_ts("23:30", day), segment="MCX"), day
+        assert not in_session(_ts("23:31", day), segment="MCX"), day
+
+
+def test_new_year_mcx_morning_only_nse_normal():
+    """2026-01-01 (Thu): NSE trades normally, MCX's evening session is shut."""
+    day = "2026-01-01"
+    assert in_session(_ts("09:15", day), segment="NSE")
+    assert in_session(_ts("15:30", day), segment="NSE")
+    assert in_session(_ts("09:00", day), segment="MCX")
+    assert in_session(_ts("16:55", day), segment="MCX")
+    assert not in_session(_ts("17:00", day), segment="MCX")
+    assert not in_session(_ts("20:00", day), segment="MCX")
+
+
+def test_every_override_is_a_weekday_with_a_sane_window():
+    """A weekend entry is dead weight (in_session rejects weekends first) and
+    a window with open >= close would silently close the segment."""
+    for (seg, iso), window in SESSION_OVERRIDES.items():
+        assert seg in ("NSE", "MCX"), (seg, iso)
+        assert date.fromisoformat(iso).weekday() < 5, (seg, iso)
+        if window is not None:
+            assert window[0] < window[1], (seg, iso)
+
+
+def test_holiday_table_agrees_with_session_window():
+    for day in FULL_CLOSURE:
+        assert session_window("NSE", date.fromisoformat(day)) is None
+        assert session_window("MCX", date.fromisoformat(day)) is None
