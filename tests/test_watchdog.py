@@ -101,6 +101,23 @@ def test_gandhi_jayanti_2026_closes_both_segments():
     assert session_open_for({"NSE"}, datetime(2026, 10, 5, 11, 0))
 
 
+def test_dussehra_2026_nse_closed_mcx_evening_only():
+    """2026-10-20: NSE/BSE shut all day; MCX skips its morning session and
+    opens 17:00. Nothing may alert before the MCX evening open."""
+    from app.data.sessions import in_session
+    day = datetime(2026, 10, 20, 0, 0)
+    for hour in (9, 11, 13, 15, 16):
+        t = day.replace(hour=hour, minute=30)
+        assert not session_open_for({"NSE", "MCX"}, t)
+        assert not in_session(t, segment="NSE")
+        assert not in_session(t, segment="MCX")
+    assert not session_open_for({"NSE"}, day.replace(hour=18))
+    assert session_open_for({"MCX"}, day.replace(hour=17, minute=10))
+    assert in_session(day.replace(hour=21), segment="MCX")
+    # the next trading day is unaffected
+    assert session_open_for({"NSE"}, datetime(2026, 10, 21, 11, 0))
+
+
 def test_session_windows_and_open_grace():
     wed = datetime(2026, 7, 15, 0, 0)
     def at(h, m):

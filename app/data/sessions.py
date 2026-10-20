@@ -61,6 +61,13 @@ SESSION_OVERRIDES: dict[tuple[str, str], tuple[dtime, dtime] | None] = {
     # watchdogs push "NOT RECEIVING" to ntfy all day on a holiday.
     ("NSE", "2026-10-02"): None,
     ("MCX", "2026-10-02"): None,
+    # 2026-10-20 (Tue): Dussehra — NSE/BSE closed all day. MCX follows its
+    # usual Dussehra pattern: morning session shut, evening session 17:00 on.
+    # Deliberately NOT None for MCX: a wrong closure would make in_session()
+    # discard real MCX ticks, and MCX data can never be re-fetched — an
+    # unneeded alert at 17:05 is the cheaper mistake.
+    ("NSE", "2026-10-20"): None,
+    ("MCX", "2026-10-20"): (dtime(17, 0), dtime(23, 30)),
 }
 
 
