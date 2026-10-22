@@ -68,6 +68,18 @@ SESSION_OVERRIDES: dict[tuple[str, str], tuple[dtime, dtime] | None] = {
     # unneeded alert at 17:05 is the cheaper mistake.
     ("NSE", "2026-10-20"): None,
     ("MCX", "2026-10-20"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-11-10 (Tue): Diwali Balipratipada — NSE/BSE closed; MCX morning
+    # shut, evening session 17:00 on.
+    ("NSE", "2026-11-10"): None,
+    ("MCX", "2026-11-10"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-11-24 (Tue): Guru Nanak Jayanti — same shape as Balipratipada.
+    ("NSE", "2026-11-24"): None,
+    ("MCX", "2026-11-24"): (dtime(17, 0), dtime(23, 30)),
+    # 2026-12-25 (Fri): Christmas — NSE/BSE AND MCX closed all day.
+    ("NSE", "2026-12-25"): None,
+    ("MCX", "2026-12-25"): None,
+    # (Muhurat trading, Sun 2026-11-08, is deliberately NOT handled: the
+    # weekend check keeps it closed, so nothing records and nothing alerts.)
 }
 
 

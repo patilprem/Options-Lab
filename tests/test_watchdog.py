@@ -118,6 +118,32 @@ def test_dussehra_2026_nse_closed_mcx_evening_only():
     assert session_open_for({"NSE"}, datetime(2026, 10, 21, 11, 0))
 
 
+def test_remaining_2026_holidays():
+    """Balipratipada (11-10) and Guru Nanak Jayanti (11-24): NSE shut, MCX
+    evening-only from 17:00. Christmas (12-25): both segments shut."""
+    from app.data.sessions import in_session
+    for d in (10, 24):
+        day = datetime(2026, 11, d, 0, 0)
+        for hour in (9, 11, 15, 16):
+            t = day.replace(hour=hour, minute=30)
+            assert not session_open_for({"NSE", "MCX"}, t)
+            assert not in_session(t, segment="MCX")
+        assert not session_open_for({"NSE"}, day.replace(hour=18))
+        assert session_open_for({"MCX"}, day.replace(hour=17, minute=10))
+        assert in_session(day.replace(hour=21), segment="MCX")
+    xmas = datetime(2026, 12, 25, 0, 0)
+    for hour in (9, 11, 15, 18, 21, 23):
+        t = xmas.replace(hour=hour, minute=30)
+        assert not session_open_for({"NSE", "MCX"}, t)
+        assert not in_session(t, segment="NSE")
+        assert not in_session(t, segment="MCX")
+    # Muhurat Sunday stays closed (weekend), by choice
+    assert not session_open_for({"NSE", "MCX"}, datetime(2026, 11, 8, 18, 30))
+    # neighbouring trading days unaffected
+    assert session_open_for({"NSE"}, datetime(2026, 11, 11, 11, 0))
+    assert session_open_for({"NSE"}, datetime(2026, 12, 24, 11, 0))
+
+
 def test_session_windows_and_open_grace():
     wed = datetime(2026, 7, 15, 0, 0)
     def at(h, m):
